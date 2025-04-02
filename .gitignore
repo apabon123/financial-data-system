@@ -12,6 +12,7 @@ env/
 # DuckDB
 *.duckdb
 *.duckdb.wal
+data/
 
 # IDE files
 .idea/
