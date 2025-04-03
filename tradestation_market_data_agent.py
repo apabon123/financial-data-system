@@ -253,69 +253,24 @@ class TradeStationMarketDataAgent:
         return params
     
     def authenticate(self) -> bool:
-        """Authenticate with the TradeStation API.
-        
-        Obtains an access token from the TradeStation API using the
-        client credentials flow. Stores the token and its expiry time.
-        
-        Returns:
-            True if authentication was successful, False otherwise
-        """
-        logger.debug("Authenticating with TradeStation API")
-        
-        # Check if we already have a valid token
-        if self.access_token and self.token_expiry and datetime.now() < self.token_expiry:
-            logger.debug("Using existing access token")
-            return True
-        
-        # Use refresh token if available
-        if self.refresh_token:
-            try:
-                logger.debug("Attempting to refresh access token")
-                payload = {
-                    'grant_type': 'refresh_token',
-                    'refresh_token': self.refresh_token,
-                    'client_id': os.getenv('TRADESTATION_API_KEY'),
-                    'client_secret': os.getenv('TRADESTATION_API_SECRET')
-                }
-                
-                response = requests.post(TRADESTATION_AUTH_URL, data=payload)
-                
-                if response.status_code == 200:
-                    data = response.json()
-                    self.access_token = data.get('access_token')
-                    expires_in = data.get('expires_in', 3600)
-                    self.token_expiry = datetime.now() + timedelta(seconds=expires_in - 60)  # Buffer of 60 seconds
-                    self.refresh_token = data.get('refresh_token')
-                    logger.debug("Successfully refreshed access token")
-                    return True
-                else:
-                    logger.debug("Token refresh failed, getting new token")
-                    self.refresh_token = None
-            except Exception as e:
-                logger.error(f"Error refreshing token: {e}")
-                self.refresh_token = None
-        
-        # Get new token with client credentials
+        """Authenticate with TradeStation API using refresh token."""
         try:
-            client_id = os.getenv('TRADESTATION_API_KEY')
-            client_secret = os.getenv('TRADESTATION_API_SECRET')
+            client_id = os.getenv('CLIENT_ID')
+            client_secret = os.getenv('CLIENT_SECRET')
+            refresh_token = os.getenv('TRADESTATION_REFRESH_TOKEN')
             
-            if not client_id or not client_secret:
+            if not all([client_id, client_secret, refresh_token]):
                 logger.error("Missing TradeStation API credentials in environment variables")
-                logger.error("Please set TRADESTATION_API_KEY and TRADESTATION_API_SECRET")
+                logger.error("Please set CLIENT_ID, CLIENT_SECRET, and TRADESTATION_REFRESH_TOKEN")
                 return False
             
-            # API credentials authentication
-            payload = {
-                'grant_type': 'client_credentials',
-                'client_id': client_id,
-                'client_secret': client_secret,
-                'scope': 'MarketData'
-            }
+            # API credentials authentication using refresh token
+            url = "https://signin.tradestation.com/oauth/token"
+            payload = f"grant_type=refresh_token&client_id={client_id}&client_secret={client_secret}&refresh_token={refresh_token}"
+            headers = {'Content-Type': 'application/x-www-form-urlencoded'}
             
             logger.debug("Requesting access token")
-            response = requests.post(TRADESTATION_AUTH_URL, data=payload)
+            response = requests.post(url, headers=headers, data=payload)
             
             if response.status_code == 200:
                 data = response.json()
@@ -377,20 +332,57 @@ class TradeStationMarketDataAgent:
                             
                     else:  # daily, weekly, monthly
                         endpoint = f"{TRADESTATION_API_URL}/marketdata/barcharts/{symbol}"
+                        
+                        # Calculate required bars based on timeframe and date range
+                        if params["start_date"] and params["end_date"]:
+                            days_diff = (params["end_date"] - params["start_date"]).days
+                            
+                            # Calculate base bars needed based on interval unit and value
+                            if params["interval_unit"] == "minute":
+                                # For intraday data, calculate based on trading hours
+                                # Assuming 6.5 hours of trading per day (9:30 AM - 4:00 PM ET)
+                                trading_minutes_per_day = 390  # 6.5 hours * 60 minutes
+                                bars_per_day = trading_minutes_per_day // params["interval_value"]
+                                base_bars = bars_per_day * days_diff
+                            elif params["interval_unit"] == "hour":
+                                # For hourly data, calculate based on trading hours
+                                trading_hours_per_day = 6.5  # 9:30 AM - 4:00 PM ET
+                                bars_per_day = trading_hours_per_day // params["interval_value"]
+                                base_bars = bars_per_day * days_diff
+                            elif params["interval_unit"] == "day":
+                                base_bars = days_diff
+                            elif params["interval_unit"] == "week":
+                                base_bars = days_diff // 7
+                            elif params["interval_unit"] == "month":
+                                base_bars = (days_diff // 30)  # Approximate
+                            else:
+                                base_bars = days_diff
+                            
+                            # Add buffer for holidays/weekends
+                            # For intraday data, we need more buffer due to market hours
+                            if params["interval_unit"] in ["minute", "hour"]:
+                                buffer_multiplier = 1.2  # 20% buffer for intraday
+                            else:
+                                buffer_multiplier = 1.1  # 10% buffer for daily and above
+                            
+                            bars_back = int(base_bars * buffer_multiplier) + 1
+                            logger.debug(f"Calculated bars_back: {bars_back} (base: {base_bars}, days: {days_diff}, interval: {params['interval_value']} {params['interval_unit']})")
+                        else:
+                            # Default to 30 bars if no date range specified
+                            bars_back = 30
+                        
                         api_params = {
-                            "interval": 1,
+                            "interval": params["interval_value"],
                             "unit": "daily" if params["interval_unit"] == "day" else params["interval_unit"],
-                            "barsback": 1000  # Default if no date range specified
+                            "barsback": bars_back,
+                            "lastdate": params["end_date"].strftime("%Y-%m-%dT23:59:59Z")  # Use end date as lastdate
                         }
                         
-                        # Add date range if specified
-                        if params["start_date"] and params["end_date"]:
-                            # Convert to format expected by API
-                            start_str = params["start_date"].strftime("%Y-%m-%dT00:00:00Z")
-                            end_str = params["end_date"].strftime("%Y-%m-%dT23:59:59Z")
-                            api_params["startdate"] = start_str
-                            api_params["enddate"] = end_str
-                            del api_params["barsback"]  # Remove barsback when using date range
+                        # Remove startdate and enddate parameters as we'll use lastdate instead
+                        if "startdate" in api_params:
+                            del api_params["startdate"]
+                        if "enddate" in api_params:
+                            del api_params["enddate"]
                     
                     # Add session template for intraday data
                     if params["interval_unit"] == "minute":
@@ -427,16 +419,25 @@ class TradeStationMarketDataAgent:
                         data = response.json()
                         
                         if 'Bars' in data and data['Bars']:
+                            # Log the columns we received
+                            logger.debug(f"Received columns: {list(data['Bars'][0].keys())}")
+                            # Log the full response for debugging
+                            logger.debug(f"API Response: {json.dumps(data, indent=2)}")
                             df = self._process_market_data(data['Bars'], symbol, params)
                             all_data.append(df)
                             logger.debug(f"Fetched {len(df)} bars for {symbol}")
                         else:
                             logger.warning(f"No data returned for {symbol}")
+                            # Log the full response even when no bars
+                            logger.debug(f"API Response: {json.dumps(data, indent=2)}")
                     else:
                         logger.error(f"API error for {symbol}: {response.status_code} - {response.text}")
                     
                 except Exception as e:
                     logger.error(f"Error fetching data for {symbol}: {e}")
+                    if self.verbose:
+                        import traceback
+                        logger.error(traceback.format_exc())
                 
                 # Sleep briefly to avoid hammering the API
                 time.sleep(0.2)
@@ -466,13 +467,39 @@ class TradeStationMarketDataAgent:
         # Convert to DataFrame
         df = pd.DataFrame(data)
         
+        # Convert timestamp to datetime for filtering
+        df['TimeStamp'] = pd.to_datetime(df['TimeStamp'])
+        
+        # Sort by timestamp in descending order (newest first)
+        df = df.sort_values('TimeStamp', ascending=False)
+        
+        # Filter data within the requested date range
+        if params.get('start_date') and params.get('end_date'):
+            # Convert start and end dates to UTC timestamps
+            start_date = pd.Timestamp(params['start_date']).tz_localize('UTC')
+            end_date = pd.Timestamp(params['end_date']).tz_localize('UTC') + pd.Timedelta(days=1)  # Include the end date
+            
+            # Log the date range we're filtering for
+            logger.debug(f"Filtering data between {start_date} and {end_date}")
+            logger.debug(f"Data range before filtering: {df['TimeStamp'].min()} to {df['TimeStamp'].max()}")
+            
+            # Filter the data
+            df = df[(df['TimeStamp'] >= start_date) & (df['TimeStamp'] < end_date)]
+            
+            # Log the filtered data range
+            if not df.empty:
+                logger.debug(f"Data range after filtering: {df['TimeStamp'].min()} to {df['TimeStamp'].max()}")
+            else:
+                logger.warning(f"No data found within the specified date range for {symbol}")
+                return pd.DataFrame()
+        
         # Rename columns to match our schema
         column_mapping = {
             'Open': 'open',
             'High': 'high',
             'Low': 'low',
             'Close': 'close',
-            'Volume': 'volume',
+            'TotalVolume': 'volume',
             'TimeStamp': 'timestamp',
             'DownVolume': 'down_volume',
             'UpVolume': 'up_volume'
@@ -494,9 +521,6 @@ class TradeStationMarketDataAgent:
         df['adjusted'] = params['adjusted']
         df['source'] = 'TradeStation API'
         df['quality'] = 100  # Default quality score
-        
-        # Convert timestamp to datetime
-        df['timestamp'] = pd.to_datetime(df['timestamp'])
         
         # Keep only the columns we need
         columns = [
