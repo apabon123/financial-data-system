@@ -15,6 +15,7 @@ A comprehensive data management system that retrieves, processes, stores, and an
 - **Data Analysis**: Calculate technical indicators and perform financial analysis
 - **Modular Design**: Built with single-file agents for maximum flexibility and maintainability
 - **Command-Line Interface**: Interact with the system through intuitive natural language queries
+- **Data Validation**: Check for data gaps and inconsistencies with built-in validation tools
 
 ## Getting Started
 
@@ -160,3 +161,57 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 ## Support
 
 For issues, questions, or feedback, please create an issue in the GitHub repository.
+
+## Command-Line Tools
+
+The system includes several command-line tools for data management:
+
+### Fetch Market Data
+
+```bash
+# Fetch data for a specific symbol
+python src/scripts/fetch_market_data.py --symbol ES
+
+# Fetch data for all symbols defined in the config
+python src/scripts/fetch_market_data.py
+
+# Use a custom configuration file
+python src/scripts/fetch_market_data.py --config path/to/custom_config.yaml
+```
+
+### Check Market Data
+
+```bash
+# List all available symbols
+python src/scripts/check_market_data.py --list-symbols
+
+# Analyze a specific symbol
+python src/scripts/check_market_data.py --symbol ES
+
+# Check for gaps with a custom threshold
+python src/scripts/check_market_data.py --symbol ES --max-gap-days 5
+
+# Analyze all symbols
+python src/scripts/check_market_data.py
+```
+
+### Generate Futures Symbols
+
+```bash
+# Generate symbols for ES starting from 2020
+python src/scripts/generate_futures_symbols.py --base-symbol ES --start-year 2020
+
+# Generate symbols for NQ starting from March 2021
+python src/scripts/generate_futures_symbols.py --base-symbol NQ --start-year 2021 --start-month 3
+
+# Use an existing config file and save to a custom path
+python src/scripts/generate_futures_symbols.py --base-symbol CL --start-year 2020 --config existing_config.yaml --output custom_output.yaml
+```
+
+For more detailed information about each tool, use the `--help` flag:
+
+```bash
+python src/scripts/fetch_market_data.py --help
+python src/scripts/check_market_data.py --help
+python src/scripts/generate_futures_symbols.py --help
+```

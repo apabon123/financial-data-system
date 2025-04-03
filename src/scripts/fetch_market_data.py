@@ -13,17 +13,21 @@ import time
 import logging
 import argparse
 from datetime import datetime, timedelta
+from dateutil.relativedelta import relativedelta
 import pandas as pd
 import requests
 import duckdb
 from pathlib import Path
 from dotenv import load_dotenv
+from typing import List, Dict, Any, Optional
 
 # Load environment variables
 load_dotenv(os.path.join(os.path.dirname(os.path.dirname(__file__)), 'config', '.env'))
 
-# Add the parent directory to the path so we can import from src
-sys.path.append(str(Path(__file__).parent.parent.parent))
+# Add the project root directory to the Python path
+project_root = str(Path(__file__).resolve().parent.parent.parent)
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
 
 # Import from our project
 from src.agents.tradestation_market_data_agent import TradeStationMarketDataAgent
@@ -31,11 +35,8 @@ from src.agents.tradestation_market_data_agent import TradeStationMarketDataAgen
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.StreamHandler(),
-        logging.FileHandler('market_data_fetch.log')
-    ]
+    format='[%(asctime)s] %(levelname)-8s %(message)s',
+    datefmt='%H:%M:%S'
 )
 logger = logging.getLogger(__name__)
 
@@ -67,6 +68,11 @@ class MarketDataFetcher:
         # Add VALID_UNITS attribute to the ts_agent if it doesn't exist
         if not hasattr(self.ts_agent, 'VALID_UNITS'):
             self.ts_agent.VALID_UNITS = ['daily', 'minute', 'weekly', 'monthly']
+            
+        # Create a requests session for reuse
+        self.session = requests.Session()
+        self.max_retries = 3
+        self.retry_delay = 1  # seconds
             
     def _connect_database(self):
         """Connect to the DuckDB database."""
@@ -118,51 +124,142 @@ class MarketDataFetcher:
             logger.error(f"Error getting latest date for {symbol}: {e}")
             return None
     
-    def fetch_data_since(self, symbol, interval, unit, start_date):
+    def fetch_data_since(self, symbol: str, interval: int = 1, unit: str = 'daily', start_date: str = None, end_date: str = None) -> pd.DataFrame:
         """
-        Fetch data since a specific timestamp.
+        Fetch historical market data since a given date.
         
         Args:
-            symbol: The ticker symbol
-            interval: Interval of data
-            unit: Time unit ('Minute', 'Daily', etc.)
-            start_date: The timestamp to start fetching data from
+            symbol: The symbol to fetch data for
+            interval: The interval value (e.g. 1 for 1-minute or 1-day)
+            unit: The interval unit (daily, minute, weekly, monthly)
+            start_date: The start date in YYYY-MM-DD format
+            end_date: The end date in YYYY-MM-DD format
             
         Returns:
-            List of bars
+            DataFrame with the fetched data
         """
-        if unit not in self.ts_agent.VALID_UNITS:
-            raise ValueError(f"Invalid unit '{unit}'. Valid units are: {', '.join(self.ts_agent.VALID_UNITS)}")
-
-        all_bars = []
-        last_date = start_date or datetime.now().strftime('%Y-%m-%dT%H:%M:%SZ')
-
-        logger.info(f"Fetching data for {symbol} from {last_date} onward...")
-        bars_back = 50000  # Increased from 10000 to 50000 for efficiency
-        min_chunk_size = 1000  # Increased minimum chunk size
+        if start_date:
+            # Convert start_date to datetime
+            start_dt = pd.to_datetime(start_date)
+            # Ensure start_dt is timezone-naive
+            if start_dt.tz is not None:
+                start_dt = start_dt.tz_localize(None)
+            # Calculate days between start_date and today
+            days_diff = (pd.Timestamp.now() - start_dt).days
+            # Set bars_back based on days_diff, with a minimum of 1000
+            bars_back = max(days_diff, 1000)
+        else:
+            bars_back = 10000
+            
+        # Ensure bars_back doesn't exceed 50000 (API limit)
+        bars_back = min(bars_back, 50000)
         
-        while bars_back > 0:
-            # Calculate chunk size - start with 10000, but don't go below min_chunk_size
-            chunk_size = max(min(bars_back, 10000), min_chunk_size)
-            chunk = self.fetch_data(symbol, interval, unit, chunk_size, last_date)
-            if not chunk:
+        # Initialize empty list to store all data
+        all_data = []
+        total_bars = 0
+        last_bar_count = None
+        
+        while True:
+            try:
+                # Construct the API endpoint
+                endpoint = f"{self.ts_agent.base_url}/marketdata/barcharts/{symbol}"
+                
+                # Prepare query parameters
+                params = {
+                    'interval': interval,
+                    'unit': unit,
+                    'barsback': bars_back
+                }
+                
+                # Add lastdate parameter if end_date is provided
+                if end_date:
+                    params['lastdate'] = f"{end_date}T00:00:00Z"
+                
+                # Make the API request with retries
+                data = self.make_request_with_retry(endpoint, params)
+                
+                if not data:
+                    break
+                    
+                # Convert to DataFrame
+                df = pd.DataFrame(data)
+                
+                # Break if we got less than requested bars (means we hit the start)
+                if len(df) < bars_back:
+                    all_data.append(df)
+                    break
+                    
+                # Check if we're getting the same number of bars repeatedly
+                if last_bar_count == len(df):
+                    logger.warning(f"Got same number of bars ({len(df)}) twice in a row, stopping to avoid infinite loop")
+                    break
+                    
+                last_bar_count = len(df)
+                
+                # Add to our collection
+                all_data.append(df)
+                total_bars += len(df)
+                
+                logger.info(f"Retrieved {len(df)} bars. Remaining: {bars_back - len(df)}.")
+                
+                # Get the earliest timestamp
+                earliest_ts = pd.to_datetime(df['TimeStamp'].min())
+                # Ensure earliest_ts is timezone-naive for comparison
+                if earliest_ts.tz is not None:
+                    earliest_ts = earliest_ts.tz_localize(None)
+                
+                # If we've gone back far enough, break
+                if start_date and earliest_ts <= start_dt:
+                    break
+                    
+                # Update lastdate for next request
+                params['lastdate'] = earliest_ts.strftime('%Y-%m-%dT%H:%M:%SZ')
+                
+            except Exception as e:
+                logger.error(f"Error fetching data: {e}")
                 break
-
-            all_bars.extend(chunk)
-            logger.info(f"Retrieved {len(chunk)} bars. Remaining: {bars_back - len(chunk)}.")
-
-            # Update last_date to the last retrieved bar
-            last_date = chunk[-1]['TimeStamp']
-
-            # Reduce bars_back by the number of bars fetched
-            bars_back -= len(chunk)
-
-            # Add a safeguard: If the API returns only 1 bar repeatedly, stop fetching
-            if len(chunk) == 1:
-                logger.warning("Only 1 bar returned. Stopping further requests to avoid infinite loop.")
-                break
-
-        return all_bars
+                
+        # Combine all data
+        if all_data:
+            combined_df = pd.concat(all_data, ignore_index=True)
+            
+            # Filter by date range if start_date is provided
+            if start_date:
+                combined_df['TimeStamp'] = pd.to_datetime(combined_df['TimeStamp'])
+                # Ensure timestamps are timezone-naive for comparison
+                if combined_df['TimeStamp'].dt.tz is not None:
+                    combined_df['TimeStamp'] = combined_df['TimeStamp'].dt.tz_localize(None)
+                combined_df = combined_df[combined_df['TimeStamp'] >= start_dt]
+                
+            # Rename columns to match schema
+            column_mapping = {
+                'TimeStamp': 'timestamp',
+                'Open': 'open',
+                'High': 'high',
+                'Low': 'low',
+                'Close': 'close',
+                'TotalVolume': 'volume'
+            }
+            combined_df = combined_df.rename(columns=column_mapping)
+            
+            # Add required columns
+            combined_df['symbol'] = symbol
+            combined_df['interval_value'] = interval
+            combined_df['interval_unit'] = unit
+            combined_df['up_volume'] = 0  # TradeStation doesn't provide this
+            combined_df['down_volume'] = 0  # TradeStation doesn't provide this
+            combined_df['adjusted'] = False
+            combined_df['quality'] = 100
+            
+            # Sort by timestamp
+            combined_df = combined_df.sort_values('timestamp')
+            
+            # Remove duplicates
+            combined_df = combined_df.drop_duplicates(subset=['timestamp'], keep='first')
+            
+            return combined_df
+            
+        return pd.DataFrame()
 
     def fetch_data(self, symbol, interval, unit, bars_back=10000, last_date=None):
         """
@@ -171,7 +268,7 @@ class MarketDataFetcher:
         Args:
             symbol: The ticker symbol
             interval: Interval of data
-            unit: Time unit ('Minute', 'Daily', etc.)
+            unit: Time unit ('daily', 'minute', etc.)
             bars_back: Number of bars to fetch
             last_date: The last date to fetch data from
             
@@ -328,73 +425,137 @@ class MarketDataFetcher:
             self.conn.rollback()
             raise
     
-    def process_symbol(self, symbol: str, update_frequency: str = 'daily') -> None:
-        """Process a single symbol."""
+    def make_request_with_retry(self, endpoint: str, params: Dict[str, Any]) -> Optional[List[Dict[str, Any]]]:
+        """Make an API request with retries and exponential backoff.
+        
+        Args:
+            endpoint: The API endpoint URL
+            params: Query parameters for the request
+            
+        Returns:
+            List of bar data if successful, None otherwise
+        """
+        headers = {'Authorization': f'Bearer {self.ts_agent.access_token}'}
+        
+        for attempt in range(self.max_retries):
+            try:
+                response = self.session.get(endpoint, params=params, headers=headers)
+                
+                # Handle rate limiting
+                if response.status_code == 429:
+                    retry_after = int(response.headers.get('Retry-After', 60))
+                    logger.warning(f"Rate limit hit. Waiting {retry_after} seconds...")
+                    time.sleep(retry_after)
+                    continue
+                
+                response.raise_for_status()
+                data = response.json()
+                
+                if 'Bars' in data:
+                    return data['Bars']
+                else:
+                    logger.warning("No 'Bars' found in response")
+                    return None
+                    
+            except Exception as e:
+                logger.error(f"Attempt {attempt + 1} failed: {e}")
+                if attempt < self.max_retries - 1:
+                    time.sleep(self.retry_delay * (2 ** attempt))  # Exponential backoff
+                continue
+                
+        logger.error("Max retries reached. Request failed.")
+        return None
+    
+    def get_existing_data(self, symbol: str) -> pd.DataFrame:
+        """
+        Get existing data for a symbol from the database.
+        
+        Args:
+            symbol: The symbol to get data for
+            
+        Returns:
+            DataFrame with the existing data
+        """
+        try:
+            query = f"""
+            SELECT *
+            FROM market_data
+            WHERE symbol = '{symbol}'
+            ORDER BY timestamp
+            """
+            df = self.conn.execute(query).fetchdf()
+            return df
+        except Exception as e:
+            logger.error(f"Error getting existing data for {symbol}: {e}")
+            return pd.DataFrame()
+    
+    def process_symbol(self, symbol: str) -> None:
+        """Process a single symbol, retrieving existing data and fetching new data if none exists."""
         logger.info(f"Processing {symbol}")
         
-        # Set interval based on update frequency
-        if update_frequency == 'daily':
-            interval_value = 1
-            unit = 'daily'
-        elif update_frequency == 'hourly':
-            interval_value = 60
-            unit = 'minute'
-        else:  # minute
-            interval_value = 1
-            unit = 'minute'
+        # Get the root symbol (e.g. 'ES' from 'ESH24')
+        root_symbol = symbol[:2] if len(symbol) > 2 else symbol
+        
+        # Get the config for this symbol
+        symbol_config = None
+        for futures_config in self.config.get('futures', []):
+            if futures_config['symbol'] == root_symbol:
+                symbol_config = futures_config
+                break
+                
+        if not symbol_config:
+            for equity_config in self.config.get('equities', []):
+                if equity_config['symbol'] == root_symbol:
+                    symbol_config = equity_config
+                    break
+        
+        if not symbol_config:
+            logger.error(f"No configuration found for symbol {root_symbol}")
+            return
+        
+        # Get the start date from config, defaulting to 2023-01-01
+        start_date = symbol_config.get('start_date', '2023-01-01')
+        
+        # For futures contracts, determine the expiration date
+        if len(symbol) > 2:
+            month_code = symbol[2]
+            year = int('20' + symbol[3:5]) if len(symbol) >= 5 else None
+            
+            if year:
+                # Map month codes to their respective months
+                month_map = {'H': 3, 'M': 6, 'U': 9, 'Z': 12}
+                month = month_map.get(month_code)
+                
+                if month:
+                    # Set end date to the last day of the expiration month
+                    end_date = datetime(year, month, 1) + relativedelta(months=1, days=-1)
+                    end_date = end_date.strftime('%Y-%m-%d')
+                else:
+                    end_date = None
+            else:
+                end_date = None
+        else:
+            end_date = None
 
         # Get existing data for this symbol
-        try:
-            result = self.conn.execute(
-                """
-                SELECT MAX(timestamp) as last_timestamp
-                FROM market_data 
-                WHERE symbol = ? AND interval_value = ? AND interval_unit = ?
-                """,
-                (symbol, interval_value, unit)
-            ).fetchone()
+        existing_data = self.get_existing_data(symbol)
+        
+        if existing_data.empty:
+            logger.info(f"No existing data for {symbol}, fetching from {start_date} to {end_date}")
+            # For daily data
+            daily_data = self.fetch_data_since(
+                symbol=symbol,
+                interval=1,
+                unit='daily',
+                start_date=start_date,
+                end_date=end_date
+            )
+            if not daily_data.empty:
+                self.save_to_db(daily_data)
+        else:
+            logger.info(f"Found existing data for {symbol}")
             
-            last_timestamp = result[0] if result and result[0] else None
-            
-            if last_timestamp:
-                logger.info(f"Found existing data for {symbol}, last timestamp: {last_timestamp}")
-                data = self.fetch_data_since(symbol, last_timestamp, interval_value, unit)
-            else:
-                logger.info(f"No existing data for {symbol}, fetching from {self.start_date}")
-                data = self.fetch_data(symbol, interval_value, unit)
-                
-            # Convert to DataFrame and prepare for saving
-            if data:
-                df = pd.DataFrame(data)
-                
-                # Rename columns to match schema
-                column_mapping = {
-                    'TimeStamp': 'timestamp',
-                    'Open': 'open',
-                    'High': 'high',
-                    'Low': 'low',
-                    'Close': 'close',
-                    'TotalVolume': 'volume'
-                }
-                df = df.rename(columns=column_mapping)
-                
-                # Add required columns
-                df['symbol'] = symbol
-                df['interval_value'] = interval_value
-                df['interval_unit'] = unit
-                df['up_volume'] = 0  # TradeStation doesn't provide this
-                df['down_volume'] = 0  # TradeStation doesn't provide this
-                df['adjusted'] = False
-                df['quality'] = 100
-                
-                # Save to database
-                self.save_to_db(df)
-            else:
-                logger.warning(f"No data fetched for {symbol}")
-                
-        except Exception as e:
-            logger.error(f"Error processing {symbol}: {e}")
-            raise
+        return None
     
     def find_symbol_info(self, symbol):
         """
@@ -418,6 +579,58 @@ class MarketDataFetcher:
         
         return None, None
     
+    def generate_futures_contracts(self, root_symbol, start_date, end_date=None):
+        """
+        Generate futures contract symbols for a given root symbol.
+        
+        Args:
+            root_symbol: The root symbol (e.g., 'ES')
+            start_date: Start date as datetime or string 'YYYY-MM-DD'
+            end_date: End date as datetime or string 'YYYY-MM-DD' (defaults to today)
+            
+        Returns:
+            List of contract symbols (e.g., ['ESH23', 'ESM23', 'ESU23', 'ESZ23'])
+        """
+        # Convert dates to datetime if they're strings
+        if isinstance(start_date, str):
+            start_date = pd.Timestamp(start_date)
+        if isinstance(end_date, str):
+            end_date = pd.Timestamp(end_date)
+        if end_date is None:
+            end_date = pd.Timestamp.now()
+            
+        # Ensure dates are timezone-naive for comparison
+        if start_date.tz is not None:
+            start_date = start_date.tz_localize(None)
+        if end_date.tz is not None:
+            end_date = end_date.tz_localize(None)
+            
+        # Contract months for ES: H (March), M (June), U (Sept), Z (Dec)
+        month_codes = ['H', 'M', 'U', 'Z']
+        month_numbers = [3, 6, 9, 12]  # Corresponding month numbers
+        
+        contracts = []
+        current_date = start_date
+        
+        while current_date <= end_date:
+            year = current_date.year
+            # Generate contracts for current year and next year
+            for _ in range(2):  # Current year and next year
+                for month_code, month_num in zip(month_codes, month_numbers):
+                    contract_date = pd.Timestamp(datetime(year, month_num, 1))
+                    # Only include contracts that expire after start_date and before end_date
+                    if contract_date >= start_date and contract_date <= end_date:
+                        # Format year as two digits
+                        year_str = str(year)[-2:]
+                        contract = f"{root_symbol}{month_code}{year_str}"
+                        if contract not in contracts:
+                            contracts.append(contract)
+                year += 1
+            # Move to next year
+            current_date = pd.Timestamp(datetime(current_date.year + 1, 1, 1))
+            
+        return sorted(contracts)
+
     def run(self, symbol=None, start_date=None):
         """
         Run the data fetcher for all symbols in the config or a specific symbol.
@@ -436,16 +649,47 @@ class MarketDataFetcher:
                 # Process a single symbol
                 symbol_info, symbol_type = self.find_symbol_info(symbol)
                 if symbol_info:
-                    self.process_symbol(symbol, symbol_info.get('update_frequency', self.config['settings']['default_update_frequency']))
+                    if symbol_type == 'futures':
+                        # Generate and process futures contracts
+                        start = start_date or symbol_info.get('start_date', self.start_date)
+                        contracts = self.generate_futures_contracts(symbol, start)
+                        logger.info(f"Generated {len(contracts)} futures contracts for {symbol}")
+                        for contract in contracts:
+                            try:
+                                self.process_symbol(contract)
+                            except Exception as e:
+                                logger.error(f"Error processing futures contract {contract}: {e}")
+                                continue
+                    else:
+                        self.process_symbol(symbol)
                 else:
                     logger.error(f"Symbol '{symbol}' not found in configuration")
             else:
                 # Process all symbols
+                # Process futures first
                 for symbol_info in self.config.get('futures', []):
-                    self.process_symbol(symbol_info['symbol'], symbol_info.get('update_frequency', self.config['settings']['default_update_frequency']))
+                    try:
+                        # Generate and process futures contracts
+                        start = start_date or symbol_info.get('start_date', self.start_date)
+                        contracts = self.generate_futures_contracts(symbol_info['symbol'], start)
+                        logger.info(f"Generated {len(contracts)} futures contracts for {symbol_info['symbol']}")
+                        for contract in contracts:
+                            try:
+                                self.process_symbol(contract)
+                            except Exception as e:
+                                logger.error(f"Error processing futures contract {contract}: {e}")
+                                continue
+                    except Exception as e:
+                        logger.error(f"Error processing futures symbol {symbol_info['symbol']}: {e}")
+                        continue
                 
+                # Then process equities
                 for symbol_info in self.config.get('equities', []):
-                    self.process_symbol(symbol_info['symbol'], symbol_info.get('update_frequency', self.config['settings']['default_update_frequency']))
+                    try:
+                        self.process_symbol(symbol_info['symbol'])
+                    except Exception as e:
+                        logger.error(f"Error processing equity symbol {symbol_info['symbol']}: {e}")
+                        continue
                 
         except Exception as e:
             logger.error(f"Error running data fetcher: {e}")
@@ -455,15 +699,36 @@ class MarketDataFetcher:
 
 def main():
     """Main function to run the script."""
-    parser = argparse.ArgumentParser(description='Fetch market data from TradeStation')
-    parser.add_argument('--config', default='src/config/market_symbols.yaml', help='Path to the market_symbols.yaml file')
-    parser.add_argument('--db', help='Path to the DuckDB database file (optional, defaults to DATA_DIR/financial_data.duckdb)')
-    parser.add_argument('--symbol', help='Specific symbol to fetch data for (optional, if not provided, fetches all symbols)')
-    parser.add_argument('--start-date', help='Start date for data fetching (YYYY-MM-DD format, overrides config)')
+    parser = argparse.ArgumentParser(
+        description='Fetch market data for symbols from TradeStation API',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Fetch data for a specific symbol
+  python fetch_market_data.py --symbol ES
+  
+  # Fetch data for all symbols defined in the config
+  python fetch_market_data.py
+  
+  # Use a custom configuration file
+  python fetch_market_data.py --config path/to/custom_config.yaml
+        """
+    )
+    parser.add_argument('--symbol', type=str, help='Symbol to fetch data for (e.g., ES, NQ, CL)')
+    parser.add_argument('--config', default='config/market_symbols.yaml', help='Path to the market_symbols.yaml configuration file (default: config/market_symbols.yaml)')
     args = parser.parse_args()
     
-    fetcher = MarketDataFetcher(args.config)
-    fetcher.run(args.symbol, args.start_date)
+    try:
+        fetcher = MarketDataFetcher(config_path=args.config)
+        if args.symbol:
+            logger.info(f"Fetching data for symbol: {args.symbol}")
+            fetcher.run(symbol=args.symbol)
+        else:
+            logger.info("Fetching data for all symbols")
+            fetcher.run()
+    except Exception as e:
+        logger.error(f"Error running market data fetcher: {e}")
+        sys.exit(1)
 
 if __name__ == '__main__':
     main()

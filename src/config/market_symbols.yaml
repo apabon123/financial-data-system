@@ -2,51 +2,16 @@
 # This file contains the list of futures and equities to track
 
 futures:
-  # Energy
-  - symbol: CL
-    description: "Crude Oil Futures"
-    exchange: NYMEX
-    update_frequency: daily
-    start_date: "2023-01-01"
-    
-  - symbol: NG
-    description: "Natural Gas Futures"
-    exchange: NYMEX
-    update_frequency: daily
-    start_date: "2023-01-01"
-
-  # Metals
-  - symbol: GC
-    description: "Gold Futures"
-    exchange: COMEX
-    update_frequency: daily
-    start_date: "2023-01-01"
-    
-  - symbol: SI
-    description: "Silver Futures"
-    exchange: COMEX
-    update_frequency: daily
-    start_date: "2023-01-01"
-
-  # Interest Rates
-  - symbol: ZN
-    description: "10-Year T-Note Futures"
-    exchange: CBOT
-    update_frequency: daily
-    start_date: "2023-01-01"
-
-  # Stock Indices
   - symbol: ES
     description: "E-mini S&P 500 Futures"
-    exchange: CME
+    type: Futures
     update_frequency: daily
-    start_date: "2023-01-01"
-    
-  - symbol: NQ
-    description: "E-mini NASDAQ 100 Futures"
+    start_date: "2003-01-01"
     exchange: CME
-    update_frequency: daily
-    start_date: "2023-01-01"
+    contract_size: 50
+    tick_size: 0.25
+    tick_value: 12.50
+    contract_months: ['H', 'M', 'U', 'Z']  # Mar, Jun, Sep, Dec
 
 equities:
   # Major ETFs
@@ -62,41 +27,6 @@ equities:
     update_frequency: daily
     start_date: "2023-01-01"
     
-  - symbol: IWM
-    description: "iShares Russell 2000 ETF"
-    type: ETF
-    update_frequency: daily
-    start_date: "2023-01-01"
-
-  # Technology
-  - symbol: AAPL
-    description: "Apple Inc."
-    type: stock
-    sector: Technology
-    update_frequency: daily
-    start_date: "2023-01-01"
-    
-  - symbol: MSFT
-    description: "Microsoft Corporation"
-    type: stock
-    sector: Technology
-    update_frequency: daily
-    start_date: "2023-01-01"
-
-  # Finance
-  - symbol: JPM
-    description: "JPMorgan Chase & Co."
-    type: stock
-    sector: Finance
-    update_frequency: daily
-    start_date: "2023-01-01"
-    
-  - symbol: GS
-    description: "Goldman Sachs Group Inc."
-    type: stock
-    sector: Finance
-    update_frequency: daily
-    start_date: "2023-01-01"
 
 settings:
   default_update_frequency: daily
