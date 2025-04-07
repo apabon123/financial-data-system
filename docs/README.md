@@ -16,6 +16,9 @@ A comprehensive data management system that retrieves, processes, stores, and an
 - **Modular Design**: Built with single-file agents for maximum flexibility and maintainability
 - **Command-Line Interface**: Interact with the system through intuitive natural language queries
 - **Data Validation**: Check for data gaps and inconsistencies with built-in validation tools
+- **Holiday Calendar Support**: Account for market holidays when analyzing data gaps
+- **Continuous Contract Generation**: Create continuous futures contracts with multiple rollover methods
+- **Price Discrepancy Detection**: Identify and log suspicious price differences at rollover points
 
 ## Getting Started
 
@@ -25,6 +28,7 @@ A comprehensive data management system that retrieves, processes, stores, and an
 - TradeStation API credentials
 - FRED API key (for economic data)
 - Additional API keys based on your data sources
+- DuckDB 1.2.1 or higher (for database operations)
 
 ### Installation
 
@@ -106,6 +110,7 @@ The system is built around the single-file agent pattern, where each agent focus
 2. **Data Processing Agents**:
    - `data_normalization_agent.py`: Transforms and standardizes data from various sources
    - `data_validation_agent.py`: Ensures data quality and integrity
+   - `continuous_contract_generator.py`: Creates continuous futures contracts with multiple rollover methods
 
 3. **Storage Agents**:
    - `duckdb_write_agent.py`: Writes data to DuckDB efficiently
@@ -125,6 +130,7 @@ The system uses DuckDB with a well-defined schema for storing:
 - Account information
 - Positions and trades
 - Derived technical indicators
+- Continuous contracts
 
 See [SCHEMA.md](SCHEMA.md) for the complete database schema documentation.
 
@@ -191,9 +197,38 @@ python src/scripts/check_market_data.py --symbol ES
 # Check for gaps with a custom threshold
 python src/scripts/check_market_data.py --symbol ES --max-gap-days 5
 
+# Use a specific holiday calendar
+python src/scripts/check_market_data.py --symbol ES --calendar EU
+
 # Analyze all symbols
 python src/scripts/check_market_data.py
 ```
+
+### Generate Continuous Contracts
+
+```bash
+# Generate ES continuous contract using volume-based rollover
+python src/scripts/generate_continuous_contract.py --symbol ES --output ES_backadj --rollover-method volume
+
+# Generate NQ continuous contract using fixed rollover
+python src/scripts/generate_continuous_contract.py --symbol NQ --output NQ_backadj --rollover-method fixed
+
+# Force rebuild of existing ES continuous contract
+python src/scripts/generate_continuous_contract.py --symbol ES --output ES_backadj --force
+
+# Generate contract with custom date range
+python src/scripts/generate_continuous_contract.py --symbol ES --output ES_backadj --start-date 2020-01-01 --end-date 2023-12-31
+```
+
+Features:
+- Multiple rollover methods:
+  * Volume-based: Rolls over when next contract's volume exceeds current within 5 days of expiry
+  * Fixed: Rolls over one day before expiration
+- Price discrepancy detection with configurable thresholds
+- Comprehensive logging of rollover events
+- Force mode for rebuilding existing contracts
+- Custom date range support
+- Interval-specific processing (15minute, 1daily, etc.)
 
 ### Generate Futures Symbols
 
@@ -213,5 +248,50 @@ For more detailed information about each tool, use the `--help` flag:
 ```bash
 python src/scripts/fetch_market_data.py --help
 python src/scripts/check_market_data.py --help
+python src/scripts/generate_continuous_contract.py --help
 python src/scripts/generate_futures_symbols.py --help
+```
+
+## Holiday Calendars
+
+The system includes holiday calendars for different markets to account for market closures when analyzing data gaps:
+
+### US Market Holidays
+
+The US calendar includes holidays for NYSE, CME, and other US markets:
+- New Year's Day (January 1)
+- Martin Luther King Jr. Day (Third Monday in January)
+- Presidents Day (Third Monday in February)
+- Good Friday (Friday before Easter Sunday)
+- Memorial Day (Last Monday in May)
+- Juneteenth (June 19)
+- Independence Day (July 4)
+- Labor Day (First Monday in September)
+- Thanksgiving Day (Fourth Thursday in November)
+- Christmas Day (December 25)
+
+### European Market Holidays
+
+The EU calendar includes common European market holidays:
+- New Year's Day (January 1)
+- Good Friday (Friday before Easter Sunday)
+- Easter Monday (Monday after Easter Sunday)
+- Labor Day (May 1)
+- Christmas Day (December 25)
+- Boxing Day (December 26)
+
+### Asian Market Holidays
+
+The ASIA calendar includes common Asian market holidays:
+- New Year's Day (January 1)
+- Chinese New Year (Varies by year)
+- Labor Day (May 1)
+- Mid-Autumn Festival (Varies by year)
+- National Day (October 1)
+- Christmas Day (December 25)
+
+You can specify which calendar to use with the `--calendar` option in the `check_market_data.py` script:
+
+```bash
+python src/scripts/check_market_data.py --symbol ES --calendar EU
 ```

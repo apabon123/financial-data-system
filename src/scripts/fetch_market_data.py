@@ -489,107 +489,337 @@ class MarketDataFetcher:
             logger.error(f"Error getting existing data for {symbol}: {e}")
             return pd.DataFrame()
     
-    def process_symbol(self, symbol: str) -> None:
-        """Process a single symbol, retrieving existing data and fetching new data if none exists."""
-        logger.info(f"Processing {symbol}")
-        
-        # Get the root symbol (e.g. 'ES' from 'ESH24')
-        root_symbol = symbol[:2] if len(symbol) > 2 else symbol
-        
-        # Get the config for this symbol
-        symbol_config = None
-        for futures_config in self.config.get('futures', []):
-            if futures_config['symbol'] == root_symbol:
-                symbol_config = futures_config
-                break
-                
-        if not symbol_config:
-            for equity_config in self.config.get('equities', []):
-                if equity_config['symbol'] == root_symbol:
-                    symbol_config = equity_config
-                    break
-        
-        if not symbol_config:
-            logger.error(f"No configuration found for symbol {root_symbol}")
-            return
-        
-        # Get the start date from config, defaulting to 2023-01-01
-        start_date = symbol_config.get('start_date', '2023-01-01')
-        
-        # For futures contracts, determine the expiration date
-        if len(symbol) > 2:
-            month_code = symbol[2]
-            year = int('20' + symbol[3:5]) if len(symbol) >= 5 else None
-            
-            if year:
-                # Map month codes to their respective months
-                month_map = {'H': 3, 'M': 6, 'U': 9, 'Z': 12}
-                month = month_map.get(month_code)
-                
-                if month:
-                    # Set end date to the last day of the expiration month
-                    end_date = datetime(year, month, 1) + relativedelta(months=1, days=-1)
-                    end_date = end_date.strftime('%Y-%m-%d')
-                else:
-                    end_date = None
-            else:
-                end_date = None
-        else:
-            end_date = None
-
-        # Get existing data for this symbol
-        existing_data = self.get_existing_data(symbol)
-        
-        if existing_data.empty:
-            logger.info(f"No existing data for {symbol}, fetching from {start_date} to {end_date}")
-            # For daily data
-            daily_data = self.fetch_data_since(
-                symbol=symbol,
-                interval=1,
-                unit='daily',
-                start_date=start_date,
-                end_date=end_date
-            )
-            if not daily_data.empty:
-                self.save_to_db(daily_data)
-        else:
-            logger.info(f"Found existing data for {symbol}")
-            
-        return None
-    
-    def find_symbol_info(self, symbol):
+    def get_nth_weekday(self, year: int, month: int, weekday: int, n: int) -> datetime:
         """
-        Find symbol information in the config.
+        Get the nth occurrence of a weekday in a month.
         
         Args:
-            symbol: The symbol to find
+            year: The year
+            month: The month (1-12)
+            weekday: The day of week (0=Monday, 6=Sunday)
+            n: Which occurrence (1=1st, 2=2nd, etc., negative counts from end)
             
         Returns:
-            Tuple of (symbol_info, symbol_type) or (None, None) if not found
+            datetime: The date of the nth weekday
         """
-        # Check futures
-        for symbol_info in self.config.get('futures', []):
-            if symbol_info['symbol'] == symbol:
-                return symbol_info, 'futures'
+        # Create first day of month
+        first_day = datetime(year, month, 1)
         
-        # Check equities
-        for symbol_info in self.config.get('equities', []):
-            if symbol_info['symbol'] == symbol:
-                return symbol_info, 'equities'
+        # Find first occurrence of weekday
+        first_occurrence = first_day + timedelta(days=((weekday - first_day.weekday()) % 7))
         
-        return None, None
+        if n > 0:
+            # Count forward from beginning
+            target_date = first_occurrence + timedelta(weeks=n-1)
+            # If we've gone into next month, there weren't enough occurrences
+            if target_date.month != month:
+                return None
+        else:
+            # Count backward from end
+            # Find last occurrence first
+            if first_occurrence.month != month:
+                first_occurrence -= timedelta(days=7)
+            while (first_occurrence + timedelta(days=7)).month == month:
+                first_occurrence += timedelta(days=7)
+            # Now count backward
+            target_date = first_occurrence + timedelta(weeks=n+1)
+        
+        return target_date
+
+    def is_holiday(self, date: datetime, calendar: str = None) -> bool:
+        """
+        Check if a date is a market holiday using the specified calendar.
+        
+        Args:
+            date: The date to check
+            calendar: Optional calendar name to use (defaults to config default)
+            
+        Returns:
+            bool: True if holiday, False otherwise
+        """
+        # Get calendar to use
+        if not calendar:
+            calendar = self.config.get('settings', {}).get('holiday_calendar', 'NYSE')
+        
+        # Check if it's a weekend
+        if date.weekday() >= 5:  # 5 = Saturday, 6 = Sunday
+            return True
+        
+        # Get holiday definitions for this calendar
+        holiday_defs = self.config.get('holidays', {}).get(calendar, {})
+        if not holiday_defs:
+            logger.warning(f"No holiday definitions found for calendar: {calendar}")
+            return False
+        
+        # Check fixed date holidays (MM-DD format)
+        fixed_dates = holiday_defs.get('fixed_dates', [])
+        date_str = date.strftime('%m-%d')
+        if date_str in fixed_dates:
+            return True
+        
+        # Check relative date holidays
+        relative_dates = holiday_defs.get('relative_dates', [])
+        for holiday in relative_dates:
+            # Skip if not in the right month
+            if holiday['month'] != date.month:
+                continue
+            
+            # Get the target day of week (0=Monday, 6=Sunday)
+            day_map = {
+                'monday': 0, 'tuesday': 1, 'wednesday': 2, 'thursday': 3,
+                'friday': 4, 'saturday': 5, 'sunday': 6
+            }
+            target_weekday = day_map.get(holiday['day_type'].lower())
+            
+            if target_weekday is None:
+                logger.error(f"Invalid day_type in holiday definition: {holiday['day_type']}")
+                continue
+            
+            # Get the occurrence (1=1st, 2=2nd, etc., -1=last)
+            occurrence = holiday['occurrence']
+            
+            # Calculate the target date
+            target_date = self.get_nth_weekday(date.year, date.month, target_weekday, occurrence)
+            
+            # Check if this is the target date
+            if target_date and target_date.date() == date.date():
+                return True
+        
+        return False
+
+    def get_previous_business_day(self, date: datetime, calendar: str = None) -> datetime:
+        """
+        Get the previous business day before a date using the specified calendar.
+        
+        Args:
+            date: The reference date
+            calendar: Optional calendar name to use (defaults to config default)
+            
+        Returns:
+            datetime: The previous business day
+        """
+        current = date
+        while True:
+            current = current - timedelta(days=1)
+            if not self.is_holiday(current, calendar):
+                return current
+
+    def calculate_expiration_date(self, symbol: str) -> Optional[datetime]:
+        """
+        Calculate the expiration date for a futures contract based on config rules.
+        
+        Args:
+            symbol: The futures contract symbol (e.g., 'ESH24')
+            
+        Returns:
+            datetime: The expiration date, or None if invalid symbol
+        """
+        if len(symbol) < 4:
+            return None
+        
+        # Extract components
+        base_symbol = symbol[:-3]  # e.g., ES
+        month_code = symbol[-3]    # e.g., H
+        year_code = symbol[-2:]    # e.g., 24
+        
+        # Map month codes to months
+        month_map = {'H': 3, 'M': 6, 'U': 9, 'Z': 12}
+        month = month_map.get(month_code)
+        if not month:
+            return None
+        
+        # Convert year code to full year
+        year = 2000 + int(year_code)
+        
+        # Get contract config
+        symbol_info = None
+        for futures_config in self.config.get('futures', []):
+            if futures_config['symbol'] == base_symbol:
+                symbol_info = futures_config
+                break
+        
+        if not symbol_info or 'expiry_rule' not in symbol_info:
+            logger.warning(f"No expiry rule found for {base_symbol}, using default last day of month")
+            # Default to last day of month
+            next_month = datetime(year, month % 12 + 1, 1)
+            return next_month - timedelta(days=1)
+        
+        expiry_rule = symbol_info['expiry_rule']
+        calendar = symbol_info.get('holiday_calendar')
+        
+        # Handle business day rules (like CL and GC)
+        if expiry_rule['day_type'] == 'business_day':
+            if 'days_before' in expiry_rule:
+                # Rule like CL: 3 business days before 25th of next month
+                ref_month = month % 12 + 1
+                ref_year = year if ref_month > month else year + 1
+                ref_date = datetime(ref_year, ref_month, expiry_rule['reference_day'])
+                target_date = ref_date
+                for _ in range(expiry_rule['days_before']):
+                    target_date = self.get_previous_business_day(target_date, calendar)
+                return target_date
+            elif 'days_from_end' in expiry_rule:
+                # Rule like GC: 3rd last business day of month
+                next_month = datetime(year, month % 12 + 1, 1)
+                target_date = next_month - timedelta(days=1)
+                for _ in range(expiry_rule['days_from_end']):
+                    target_date = self.get_previous_business_day(target_date, calendar)
+                return target_date
+        
+        # Convert day type to weekday number (0=Monday, 6=Sunday)
+        day_map = {
+            'monday': 0, 'tuesday': 1, 'wednesday': 2, 'thursday': 3,
+            'friday': 4, 'saturday': 5, 'sunday': 6
+        }
+        weekday = day_map.get(expiry_rule['day_type'].lower())
+        
+        if weekday is None:
+            logger.error(f"Invalid day_type in expiry rule for {base_symbol}")
+            return None
+        
+        # If this is a reference-based rule (like VIX)
+        if 'reference_day_type' in expiry_rule:
+            ref_weekday = day_map.get(expiry_rule['reference_day_type'].lower())
+            ref_number = expiry_rule['reference_day_number']
+            # Get reference date (e.g., 3rd Friday)
+            reference_date = self.get_nth_weekday(year, month, ref_weekday, ref_number)
+            if not reference_date:
+                return None
+            # Calculate target date based on offset
+            target_date = reference_date + timedelta(days=expiry_rule['day_number'])
+        else:
+            # Direct rule (like ES 3rd Friday)
+            target_date = self.get_nth_weekday(year, month, weekday, expiry_rule['day_number'])
+            if not target_date:
+                return None
+        
+        # Adjust for holidays if specified
+        if expiry_rule.get('adjust_for_holiday', False):
+            while self.is_holiday(target_date, calendar):
+                target_date = self.get_previous_business_day(target_date, calendar)
+        
+        return target_date
+
+    def process_symbol(self, symbol: str, update_history: bool = False, force: bool = False) -> None:
+        """Process a single symbol, fetching and storing its data.
+        
+        Args:
+            symbol: The symbol to process
+            update_history: If True, fetch from start_date in config to current date, skipping existing data
+            force: If True, overwrite existing data in the database
+        """
+        logger.info(f"Processing {symbol}")
+        
+        # Find symbol configuration
+        symbol_info = self.find_symbol_info(symbol)
+        if not symbol_info:
+            logger.error(f"No configuration found for symbol {symbol}")
+            return
+            
+        # Get existing data
+        latest_date = self.get_latest_date_in_db(symbol)
+        
+        if latest_date and not force and not update_history:
+            # Normal mode: fetch only new data since last date
+            logger.info(f"Found existing data for {symbol}, last date: {latest_date}")
+            start_date = latest_date + timedelta(days=1)
+        elif update_history:
+            # Update history mode: fetch from start_date in config to current date
+            start_date = symbol_info.get('start_date', self.start_date)
+            logger.info(f"Update history mode: fetching {symbol} from {start_date} to current date")
+        else:
+            # Force mode or no existing data: fetch from start_date in config
+            start_date = symbol_info.get('start_date', self.start_date)
+            if force:
+                logger.info(f"Force mode: overwriting {symbol} data from {start_date} to current date")
+            else:
+                logger.info(f"No existing data for {symbol}, fetching from {start_date} to None")
+        
+        # Fetch data for each frequency
+        for freq in symbol_info.get('frequencies', []):
+            if freq == 'daily':
+                interval = 1
+                unit = 'daily'
+            elif freq == '1min':
+                interval = 1
+                unit = 'minute'
+            elif freq == '15min':
+                interval = 15
+                unit = 'minute'
+            else:
+                continue
+                
+            try:
+                # Use the full contract symbol for fetching
+                data = self.fetch_data_since(symbol, interval, unit, start_date)
+                if data is not None and not data.empty:
+                    if force:
+                        # In force mode, delete existing data for this symbol and frequency
+                        self.delete_existing_data(symbol, interval, unit)
+                    self.save_to_db(data)
+            except Exception as e:
+                logger.error(f"Error processing {symbol} for {freq}: {str(e)}")
+                continue
+                
+    def delete_existing_data(self, symbol: str, interval: int, unit: str) -> None:
+        """Delete existing data for a symbol and frequency from the database.
+        
+        Args:
+            symbol: The symbol to delete data for
+            interval: The interval value
+            unit: The interval unit
+        """
+        try:
+            query = f"""
+            DELETE FROM market_data 
+            WHERE symbol = '{symbol}' 
+            AND interval_value = {interval} 
+            AND interval_unit = '{unit}'
+            """
+            self.conn.execute(query)
+            logger.info(f"Deleted existing data for {symbol} with interval {interval} {unit}")
+        except Exception as e:
+            logger.error(f"Error deleting data for {symbol}: {str(e)}")
+            
+    def find_symbol_info(self, symbol):
+        """Find configuration info for a symbol."""
+        # First check if it's a futures contract (e.g., ESH24, RTYM25)
+        if len(symbol) > 2:
+            # Try 3-character root first
+            root_symbol = symbol[:3]
+            for futures_config in self.config.get('futures', []):
+                if futures_config.get('base_symbol') == root_symbol:
+                    return dict(futures_config)
+            
+            # Then try 2-character root
+            root_symbol = symbol[:2]
+            for futures_config in self.config.get('futures', []):
+                if futures_config.get('base_symbol') == root_symbol:
+                    return dict(futures_config)
+        
+        # Then check equities
+        for equity_config in self.config.get('equities', []):
+            if equity_config.get('symbol') == symbol:
+                return dict(equity_config)
+                
+        # Finally check futures again for root symbols
+        for futures_config in self.config.get('futures', []):
+            if futures_config.get('base_symbol') == symbol:
+                return dict(futures_config)
+                
+        return None
     
     def generate_futures_contracts(self, root_symbol, start_date, end_date=None):
         """
-        Generate futures contract symbols for a given root symbol.
+        Generate futures contract symbols for a given root symbol based on YAML configuration.
         
         Args:
-            root_symbol: The root symbol (e.g., 'ES')
+            root_symbol: The root symbol (e.g., 'ES', 'VIX')
             start_date: Start date as datetime or string 'YYYY-MM-DD'
             end_date: End date as datetime or string 'YYYY-MM-DD' (defaults to today)
             
         Returns:
-            List of contract symbols (e.g., ['ESH23', 'ESM23', 'ESU23', 'ESZ23'])
+            List of contract symbols (e.g., ['ESH23', 'ESM23', 'ESU23', 'ESZ23'] for ES)
         """
         # Convert dates to datetime if they're strings
         if isinstance(start_date, str):
@@ -598,46 +828,158 @@ class MarketDataFetcher:
             end_date = pd.Timestamp(end_date)
         if end_date is None:
             end_date = pd.Timestamp.now()
-            
+        
         # Ensure dates are timezone-naive for comparison
         if start_date.tz is not None:
             start_date = start_date.tz_localize(None)
         if end_date.tz is not None:
             end_date = end_date.tz_localize(None)
-            
-        # Contract months for ES: H (March), M (June), U (Sept), Z (Dec)
-        month_codes = ['H', 'M', 'U', 'Z']
-        month_numbers = [3, 6, 9, 12]  # Corresponding month numbers
         
+        # Get symbol config
+        symbol_config = None
+        for futures_config in self.config.get('futures', []):
+            if futures_config.get('base_symbol') == root_symbol:
+                symbol_config = futures_config
+                break
+        
+        if not symbol_config:
+            logger.error(f"No configuration found for futures symbol {root_symbol}")
+            return []
+        
+        # Get contract configuration
+        num_active_contracts = symbol_config.get('num_active_contracts', 3)
+        contract_config = symbol_config.get('historical_contracts', {})
+        month_patterns = contract_config.get('patterns', [])
+        cycle_type = contract_config.get('cycle_type', 'quarterly')  # quarterly, monthly, etc.
+        
+        # Map month codes to months
+        month_map = {
+            'F': 1, 'G': 2, 'H': 3, 'J': 4, 'K': 5, 'M': 6,
+            'N': 7, 'Q': 8, 'U': 9, 'V': 10, 'X': 11, 'Z': 12
+        }
+        
+        # Get current date
+        current_date = datetime.now()
+        current_year = current_date.year
+        current_month = current_date.month
+        
+        # Find the current contract month based on cycle type
+        current_contract_month = None
+        
+        if cycle_type == 'quarterly':
+            # For quarterly contracts (e.g., ES: H,M,U,Z)
+            for month_code in month_patterns:
+                month_num = month_map.get(month_code)
+                if month_num and month_num > current_month:
+                    current_contract_month = month_code
+                    break
+        elif cycle_type == 'monthly':
+            # For monthly contracts (e.g., VIX: all months)
+            # Find the next contract month
+            for month_code in month_patterns:
+                month_num = month_map.get(month_code)
+                if month_num and month_num > current_month:
+                    current_contract_month = month_code
+                    break
+        
+        # If no future month found, use the first month in the pattern
+        if not current_contract_month:
+            current_contract_month = month_patterns[0]
+            if cycle_type == 'monthly':
+                # For monthly contracts, we might need to increment the year
+                current_year += 1
+        
+        # Generate contracts
         contracts = []
-        current_date = start_date
         
-        while current_date <= end_date:
-            year = current_date.year
-            # Generate contracts for current year and next year
-            for _ in range(2):  # Current year and next year
-                for month_code, month_num in zip(month_codes, month_numbers):
-                    contract_date = pd.Timestamp(datetime(year, month_num, 1))
-                    # Only include contracts that expire after start_date and before end_date
-                    if contract_date >= start_date and contract_date <= end_date:
-                        # Format year as two digits
-                        year_str = str(year)[-2:]
-                        contract = f"{root_symbol}{month_code}{year_str}"
-                        if contract not in contracts:
-                            contracts.append(contract)
-                year += 1
-            # Move to next year
-            current_date = pd.Timestamp(datetime(current_date.year + 1, 1, 1))
+        # Add current contract
+        year_str = str(current_year)[-2:]
+        contracts.append(f"{root_symbol}{current_contract_month}{year_str}")
+        
+        # Add next contracts based on cycle type and num_active_contracts
+        month_index = month_patterns.index(current_contract_month)
+        for i in range(1, num_active_contracts):
+            if cycle_type == 'quarterly':
+                # For quarterly contracts, move to next quarter
+                next_month_index = (month_index + i) % len(month_patterns)
+                next_month_code = month_patterns[next_month_index]
+                
+                # If we've wrapped around to the beginning of the year, increment the year
+                if next_month_index < month_index:
+                    year_str = str(current_year + 1)[-2:]
+                else:
+                    year_str = str(current_year)[-2:]
+            else:  # monthly
+                # For monthly contracts, move to next month
+                next_month_index = (month_index + i) % len(month_patterns)
+                next_month_code = month_patterns[next_month_index]
+                
+                # Calculate the year based on how many months we've moved
+                months_ahead = i
+                year_offset = (current_month + months_ahead - 1) // 12
+                year_str = str(current_year + year_offset)[-2:]
             
+            contracts.append(f"{root_symbol}{next_month_code}{year_str}")
+        
+        # Add historical contracts if needed
+        if start_date < current_date:
+            # Generate contracts from start_date to current date
+            historical_contracts = []
+            historical_date = start_date
+            
+            while historical_date < current_date:
+                year = historical_date.year
+                month = historical_date.month
+                
+                # Find the contract month for this date based on cycle type
+                contract_month = None
+                if cycle_type == 'quarterly':
+                    # For quarterly contracts, find the next quarter
+                    for month_code in month_patterns:
+                        month_num = month_map.get(month_code)
+                        if month_num and month_num > month:
+                            contract_month = month_code
+                            break
+                else:  # monthly
+                    # For monthly contracts, use the next month
+                    for month_code in month_patterns:
+                        month_num = month_map.get(month_code)
+                        if month_num and month_num > month:
+                            contract_month = month_code
+                            break
+                
+                # If no future month found, use the first month in the pattern
+                if not contract_month:
+                    contract_month = month_patterns[0]
+                    if cycle_type == 'monthly':
+                        year += 1
+                
+                # Format year as two digits
+                year_str = str(year)[-2:]
+                contract = f"{root_symbol}{contract_month}{year_str}"
+                
+                if contract not in contracts and contract not in historical_contracts:
+                    historical_contracts.append(contract)
+                
+                # Move to next month
+                if month == 12:
+                    historical_date = datetime(year + 1, 1, 1)
+                else:
+                    historical_date = datetime(year, month + 1, 1)
+            
+            # Add historical contracts to the list
+            contracts.extend(historical_contracts)
+        
         return sorted(contracts)
 
-    def run(self, symbol=None, start_date=None):
+    def run(self, symbol=None, update_history=False, force=False):
         """
         Run the data fetcher for all symbols in the config or a specific symbol.
         
         Args:
             symbol: Optional symbol to process (if None, process all symbols)
-            start_date: Optional start date to override the config
+            update_history: If True, fetch from start_date in config to current date
+            force: If True, overwrite existing data in the database
         """
         try:
             # Connect to TradeStation
@@ -647,21 +989,22 @@ class MarketDataFetcher:
             
             if symbol:
                 # Process a single symbol
-                symbol_info, symbol_type = self.find_symbol_info(symbol)
+                symbol_info = self.find_symbol_info(symbol)
                 if symbol_info:
-                    if symbol_type == 'futures':
+                    # Check if it's a futures contract
+                    if symbol_info.get('type') == 'futures' or symbol_info.get('base_symbol'):
                         # Generate and process futures contracts
-                        start = start_date or symbol_info.get('start_date', self.start_date)
+                        start = symbol_info.get('start_date', self.start_date)
                         contracts = self.generate_futures_contracts(symbol, start)
                         logger.info(f"Generated {len(contracts)} futures contracts for {symbol}")
                         for contract in contracts:
                             try:
-                                self.process_symbol(contract)
+                                self.process_symbol(contract, update_history, force)
                             except Exception as e:
                                 logger.error(f"Error processing futures contract {contract}: {e}")
                                 continue
                     else:
-                        self.process_symbol(symbol)
+                        self.process_symbol(symbol, update_history, force)
                 else:
                     logger.error(f"Symbol '{symbol}' not found in configuration")
             else:
@@ -670,23 +1013,23 @@ class MarketDataFetcher:
                 for symbol_info in self.config.get('futures', []):
                     try:
                         # Generate and process futures contracts
-                        start = start_date or symbol_info.get('start_date', self.start_date)
-                        contracts = self.generate_futures_contracts(symbol_info['symbol'], start)
-                        logger.info(f"Generated {len(contracts)} futures contracts for {symbol_info['symbol']}")
+                        start = symbol_info.get('start_date', self.start_date)
+                        contracts = self.generate_futures_contracts(symbol_info['base_symbol'], start)
+                        logger.info(f"Generated {len(contracts)} futures contracts for {symbol_info['base_symbol']}")
                         for contract in contracts:
                             try:
-                                self.process_symbol(contract)
+                                self.process_symbol(contract, update_history, force)
                             except Exception as e:
                                 logger.error(f"Error processing futures contract {contract}: {e}")
                                 continue
                     except Exception as e:
-                        logger.error(f"Error processing futures symbol {symbol_info['symbol']}: {e}")
+                        logger.error(f"Error processing futures symbol {symbol_info['base_symbol']}: {e}")
                         continue
                 
                 # Then process equities
                 for symbol_info in self.config.get('equities', []):
                     try:
-                        self.process_symbol(symbol_info['symbol'])
+                        self.process_symbol(symbol_info['symbol'], update_history, force)
                     except Exception as e:
                         logger.error(f"Error processing equity symbol {symbol_info['symbol']}: {e}")
                         continue
@@ -712,20 +1055,31 @@ Examples:
   
   # Use a custom configuration file
   python fetch_market_data.py --config path/to/custom_config.yaml
+  
+  # Update history for all symbols (from start_date to current)
+  python fetch_market_data.py --updatehistory
+  
+  # Force update (overwrite existing data)
+  python fetch_market_data.py --force
+  
+  # Force update for a specific symbol
+  python fetch_market_data.py --symbol ES --force
         """
     )
     parser.add_argument('--symbol', type=str, help='Symbol to fetch data for (e.g., ES, NQ, CL)')
     parser.add_argument('--config', default='config/market_symbols.yaml', help='Path to the market_symbols.yaml configuration file (default: config/market_symbols.yaml)')
+    parser.add_argument('--updatehistory', action='store_true', help='Update history from start_date in config to current date, skipping existing data')
+    parser.add_argument('--force', action='store_true', help='Force update: overwrite existing data in the database')
     args = parser.parse_args()
     
     try:
         fetcher = MarketDataFetcher(config_path=args.config)
         if args.symbol:
             logger.info(f"Fetching data for symbol: {args.symbol}")
-            fetcher.run(symbol=args.symbol)
+            fetcher.run(symbol=args.symbol, update_history=args.updatehistory, force=args.force)
         else:
             logger.info("Fetching data for all symbols")
-            fetcher.run()
+            fetcher.run(update_history=args.updatehistory, force=args.force)
     except Exception as e:
         logger.error(f"Error running market data fetcher: {e}")
         sys.exit(1)

@@ -1,0 +1,8 @@
+#!/bin/bash
+# AI Interface Wrapper Script
+
+# Get the directory where this script is located
+SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+
+# Run the AI interface with the provided arguments
+python "$SCRIPT_DIR/../src/ai/ai_interface.py" "$@" 
