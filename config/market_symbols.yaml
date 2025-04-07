@@ -1,271 +1,197 @@
+equities:
+  - symbol: SPY
+    description: SPDR S&P 500 ETF
+    exchange: NYSE
+    type: ETF
+    frequencies:
+      - 1min
+      - 15min
+      - daily
+  - symbol: QQQ
+    description: Invesco QQQ Trust
+    exchange: NASDAQ
+    type: ETF
+    frequencies:
+      - 1min
+      - 15min
+      - daily
+  - symbol: AAPL
+    description: Apple Inc.
+    exchange: NASDAQ
+    type: Stock
+    frequencies:
+      - daily
+  - symbol: MSFT
+    description: Microsoft Corporation
+    exchange: NASDAQ
+    type: Stock
+    frequencies:
+      - daily
+  - symbol: GS
+    description: Goldman Sachs Group Inc.
+    exchange: NYSE
+    type: Stock
+    frequencies:
+      - daily
+
 futures:
-- base_symbol: ES
-  symbol: ESH03
-  update_frequency: daily
-- base_symbol: ES
-  symbol: ESM03
-  update_frequency: daily
-- base_symbol: ES
-  symbol: ESU03
-  update_frequency: daily
-- base_symbol: ES
-  symbol: ESZ03
-  update_frequency: daily
-- base_symbol: ES
-  symbol: ESH04
-  update_frequency: daily
-- base_symbol: ES
-  symbol: ESM04
-  update_frequency: daily
-- base_symbol: ES
-  symbol: ESU04
-  update_frequency: daily
-- base_symbol: ES
-  symbol: ESZ04
-  update_frequency: daily
-- base_symbol: ES
-  symbol: ESH05
-  update_frequency: daily
-- base_symbol: ES
-  symbol: ESM05
-  update_frequency: daily
-- base_symbol: ES
-  symbol: ESU05
-  update_frequency: daily
-- base_symbol: ES
-  symbol: ESZ05
-  update_frequency: daily
-- base_symbol: ES
-  symbol: ESH06
-  update_frequency: daily
-- base_symbol: ES
-  symbol: ESM06
-  update_frequency: daily
-- base_symbol: ES
-  symbol: ESU06
-  update_frequency: daily
-- base_symbol: ES
-  symbol: ESZ06
-  update_frequency: daily
-- base_symbol: ES
-  symbol: ESH07
-  update_frequency: daily
-- base_symbol: ES
-  symbol: ESM07
-  update_frequency: daily
-- base_symbol: ES
-  symbol: ESU07
-  update_frequency: daily
-- base_symbol: ES
-  symbol: ESZ07
-  update_frequency: daily
-- base_symbol: ES
-  symbol: ESH08
-  update_frequency: daily
-- base_symbol: ES
-  symbol: ESM08
-  update_frequency: daily
-- base_symbol: ES
-  symbol: ESU08
-  update_frequency: daily
-- base_symbol: ES
-  symbol: ESZ08
-  update_frequency: daily
-- base_symbol: ES
-  symbol: ESH09
-  update_frequency: daily
-- base_symbol: ES
-  symbol: ESM09
-  update_frequency: daily
-- base_symbol: ES
-  symbol: ESU09
-  update_frequency: daily
-- base_symbol: ES
-  symbol: ESZ09
-  update_frequency: daily
-- base_symbol: ES
-  symbol: ESH10
-  update_frequency: daily
-- base_symbol: ES
-  symbol: ESM10
-  update_frequency: daily
-- base_symbol: ES
-  symbol: ESU10
-  update_frequency: daily
-- base_symbol: ES
-  symbol: ESZ10
-  update_frequency: daily
-- base_symbol: ES
-  symbol: ESH11
-  update_frequency: daily
-- base_symbol: ES
-  symbol: ESM11
-  update_frequency: daily
-- base_symbol: ES
-  symbol: ESU11
-  update_frequency: daily
-- base_symbol: ES
-  symbol: ESZ11
-  update_frequency: daily
-- base_symbol: ES
-  symbol: ESH12
-  update_frequency: daily
-- base_symbol: ES
-  symbol: ESM12
-  update_frequency: daily
-- base_symbol: ES
-  symbol: ESU12
-  update_frequency: daily
-- base_symbol: ES
-  symbol: ESZ12
-  update_frequency: daily
-- base_symbol: ES
-  symbol: ESH13
-  update_frequency: daily
-- base_symbol: ES
-  symbol: ESM13
-  update_frequency: daily
-- base_symbol: ES
-  symbol: ESU13
-  update_frequency: daily
-- base_symbol: ES
-  symbol: ESZ13
-  update_frequency: daily
-- base_symbol: ES
-  symbol: ESH14
-  update_frequency: daily
-- base_symbol: ES
-  symbol: ESM14
-  update_frequency: daily
-- base_symbol: ES
-  symbol: ESU14
-  update_frequency: daily
-- base_symbol: ES
-  symbol: ESZ14
-  update_frequency: daily
-- base_symbol: ES
-  symbol: ESH15
-  update_frequency: daily
-- base_symbol: ES
-  symbol: ESM15
-  update_frequency: daily
-- base_symbol: ES
-  symbol: ESU15
-  update_frequency: daily
-- base_symbol: ES
-  symbol: ESZ15
-  update_frequency: daily
-- base_symbol: ES
-  symbol: ESH16
-  update_frequency: daily
-- base_symbol: ES
-  symbol: ESM16
-  update_frequency: daily
-- base_symbol: ES
-  symbol: ESU16
-  update_frequency: daily
-- base_symbol: ES
-  symbol: ESZ16
-  update_frequency: daily
-- base_symbol: ES
-  symbol: ESH17
-  update_frequency: daily
-- base_symbol: ES
-  symbol: ESM17
-  update_frequency: daily
-- base_symbol: ES
-  symbol: ESU17
-  update_frequency: daily
-- base_symbol: ES
-  symbol: ESZ17
-  update_frequency: daily
-- base_symbol: ES
-  symbol: ESH18
-  update_frequency: daily
-- base_symbol: ES
-  symbol: ESM18
-  update_frequency: daily
-- base_symbol: ES
-  symbol: ESU18
-  update_frequency: daily
-- base_symbol: ES
-  symbol: ESZ18
-  update_frequency: daily
-- base_symbol: ES
-  symbol: ESH19
-  update_frequency: daily
-- base_symbol: ES
-  symbol: ESM19
-  update_frequency: daily
-- base_symbol: ES
-  symbol: ESU19
-  update_frequency: daily
-- base_symbol: ES
-  symbol: ESZ19
-  update_frequency: daily
-- base_symbol: ES
-  symbol: ESH20
-  update_frequency: daily
-- base_symbol: ES
-  symbol: ESM20
-  update_frequency: daily
-- base_symbol: ES
-  symbol: ESU20
-  update_frequency: daily
-- base_symbol: ES
-  symbol: ESZ20
-  update_frequency: daily
-- base_symbol: ES
-  symbol: ESH21
-  update_frequency: daily
-- base_symbol: ES
-  symbol: ESM21
-  update_frequency: daily
-- base_symbol: ES
-  symbol: ESU21
-  update_frequency: daily
-- base_symbol: ES
-  symbol: ESZ21
-  update_frequency: daily
-- base_symbol: ES
-  symbol: ESH22
-  update_frequency: daily
-- base_symbol: ES
-  symbol: ESM22
-  update_frequency: daily
-- base_symbol: ES
-  symbol: ESU22
-  update_frequency: daily
-- base_symbol: ES
-  symbol: ESZ22
-  update_frequency: daily
-- base_symbol: ES
-  symbol: ESH23
-  update_frequency: daily
-- base_symbol: ES
-  symbol: ESM23
-  update_frequency: daily
-- base_symbol: ES
-  symbol: ESU23
-  update_frequency: daily
-- base_symbol: ES
-  symbol: ESZ23
-  update_frequency: daily
-- base_symbol: ES
-  symbol: ESH24
-  update_frequency: daily
-- base_symbol: ES
-  symbol: ESM24
-  update_frequency: daily
-- base_symbol: ES
-  symbol: ESU24
-  update_frequency: daily
-- base_symbol: ES
-  symbol: ESZ24
-  update_frequency: daily
-- base_symbol: ES
-  symbol: ESH25
-  update_frequency: daily
+  - base_symbol: ES
+    calendar: US
+    description: E-mini S&P 500 Futures
+    exchange: CME
+    frequencies:
+      - 1min
+      - 15min
+      - daily
+    historical_contracts:
+      patterns:
+        - H
+        - M
+        - U
+        - Z
+      start_month: 1
+      start_year: 3
+    num_active_contracts: 4
+
+  - base_symbol: NQ
+    calendar: US
+    description: E-mini NASDAQ-100 Futures
+    exchange: CME
+    frequencies:
+      - 1min
+      - 15min
+      - daily
+    historical_contracts:
+      patterns:
+        - H
+        - M
+        - U
+        - Z
+      start_month: 1
+      start_year: 3
+    num_active_contracts: 4
+
+  - base_symbol: CL
+    calendar: US
+    description: Crude Oil Futures
+    exchange: NYMEX
+    frequencies:
+      - 1min
+      - 15min
+      - daily
+    historical_contracts:
+      patterns:
+        - F
+        - G
+        - H
+        - J
+        - K
+        - M
+        - N
+        - Q
+        - U
+        - V
+        - X
+        - Z
+      start_month: 1
+      start_year: 4
+    num_active_contracts: 12
+
+  - base_symbol: GC
+    calendar: US
+    description: Gold Futures
+    exchange: COMEX
+    frequencies:
+      - 1min
+      - 15min
+      - daily
+    historical_contracts:
+      patterns:
+        - G
+        - J
+        - M
+        - Q
+        - V
+        - Z
+      start_month: 1
+      start_year: 4
+    num_active_contracts: 6
+
+  - base_symbol: VX
+    calendar: US
+    description: VX Futures
+    exchange: CME
+    frequencies:
+      - 1min
+      - 15min
+      - daily
+    historical_contracts:
+      patterns:
+        - H
+        - M
+        - U
+        - Z
+      start_month: 1
+      start_year: 5
+    num_active_contracts: 4
+
 settings:
+  data_frequencies:
+    - interval: 1
+      name: 1min
+      unit: minute
+    - interval: 15
+      name: 15min
+      unit: minute
+    - interval: 1
+      name: daily
+      unit: day
   default_start_date: '2003-01-01'
-  default_update_frequency: daily
+  holiday_calendars:
+    US:
+      holidays:
+        - name: New Year's Day
+          month: 1
+          day: 1
+          observance: nearest_weekday
+        - name: Martin Luther King Jr. Day
+          month: 1
+          day: 3
+          observance: monday
+        - name: Presidents Day
+          month: 2
+          day: 3
+          observance: monday
+        - name: Good Friday
+          observance: easter_friday
+        - name: Memorial Day
+          month: 5
+          day: -1
+          observance: monday
+        - name: Juneteenth
+          month: 6
+          day: 19
+          observance: nearest_weekday
+        - name: Independence Day
+          month: 7
+          day: 4
+          observance: nearest_weekday
+        - name: Labor Day
+          month: 9
+          day: 1
+          observance: monday
+        - name: Thanksgiving
+          month: 11
+          day: 4
+          observance: thursday
+        - name: Christmas
+          month: 12
+          day: 25
+          observance: nearest_weekday
+      rules:
+        - name: weekend
+          days: [5, 6]  # Friday and Saturday
+        - name: pre_holiday
+          days_before: 1
+        - name: post_holiday
+          days_after: 1
