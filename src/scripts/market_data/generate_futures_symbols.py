@@ -31,14 +31,6 @@ logger = logging.getLogger(__name__)
 class FuturesSymbolGenerator:
     """Class to generate futures contract symbols."""
     
-    # Month codes for quarterly contracts
-    QUARTERLY_MONTHS = {
-        3: 'H',  # March
-        6: 'M',  # June
-        9: 'U',  # September
-        12: 'Z'  # December
-    }
-    
     def __init__(self, config_path=None):
         """Initialize the futures symbol generator."""
         self.config = self._load_config(config_path) if config_path else {}
@@ -70,25 +62,41 @@ class FuturesSymbolGenerator:
         current_year = current_date.year
         current_month = current_date.month
         
+        # Get the contract patterns from the config
+        patterns = None
+        for future in self.config.get('futures', []):
+            if future.get('base_symbol') == base_symbol:
+                patterns = future.get('historical_contracts', {}).get('patterns', [])
+                break
+        
+        if not patterns:
+            logger.error(f"No patterns found for {base_symbol} in configuration")
+            return []
+            
+        # Map month codes to months for comparison
+        month_map = {
+            'F': 1, 'G': 2, 'H': 3, 'J': 4, 'K': 5, 'M': 6,
+            'N': 7, 'Q': 8, 'U': 9, 'V': 10, 'X': 11, 'Z': 12
+        }
+        
         # If no start month specified, use January
         if start_month is None:
             start_month = 1
             
-        # Generate symbols for each year and quarter
+        # Generate symbols for each year and contract month
         for year in range(start_year, current_year + 1):
             # For the start year, only include months after start_month
-            months = self.QUARTERLY_MONTHS.keys()
+            valid_months = [m for m in patterns if month_map.get(m, 0) >= start_month]
             if year == start_year:
-                months = [m for m in months if m >= start_month]
+                valid_months = [m for m in valid_months if month_map.get(m, 0) >= start_month]
             # For the current year, only include months up to current_month
             elif year == current_year:
-                months = [m for m in months if m <= current_month]
+                valid_months = [m for m in valid_months if month_map.get(m, 0) <= current_month]
                 
-            for month in months:
-                month_code = self.QUARTERLY_MONTHS[month]
+            for month in valid_months:
                 # Format year as 2 digits
                 year_code = str(year)[-2:]
-                symbol = f"{base_symbol}{month_code}{year_code}"
+                symbol = f"{base_symbol}{month}{year_code}"
                 symbols.append(symbol)
                 
         return symbols

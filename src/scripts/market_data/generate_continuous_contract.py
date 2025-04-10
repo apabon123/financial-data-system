@@ -61,22 +61,6 @@ class ContinuousContractGenerator:
     - Fixed: Rolls over one day before the current contract's expiration
     """
     
-    # Month codes for quarterly contracts
-    QUARTERLY_MONTHS = {
-        3: 'H',  # March
-        6: 'M',  # June
-        9: 'U',  # September
-        12: 'Z'  # December
-    }
-    
-    # Expiry dates for ES futures (approximate, in days before the end of the month)
-    EXPIRY_DAYS = {
-        'H': 5,  # March
-        'M': 5,  # June
-        'U': 5,  # September
-        'Z': 5   # December
-    }
-    
     def __init__(self, db_path='./data/financial_data.duckdb', config_path='config/market_symbols.yaml'):
         """Initialize the continuous contract generator.
         
@@ -102,7 +86,31 @@ class ContinuousContractGenerator:
                 return yaml.safe_load(f)
         except Exception as e:
             logger.error(f"Error loading configuration: {e}")
-            return {}
+            raise
+    
+    def _get_contract_patterns(self, base_symbol):
+        """Get the contract patterns for a given base symbol from the config."""
+        for future in self.config.get('futures', []):
+            if future.get('base_symbol') == base_symbol:
+                return future.get('historical_contracts', {}).get('patterns', [])
+        return []
+        
+    def _get_month_map(self):
+        """Get the mapping of month codes to month numbers."""
+        return {
+            'F': 1,  # January
+            'G': 2,  # February
+            'H': 3,  # March
+            'J': 4,  # April
+            'K': 5,  # May
+            'M': 6,  # June
+            'N': 7,  # July
+            'Q': 8,  # August
+            'U': 9,  # September
+            'V': 10, # October
+            'X': 11, # November
+            'Z': 12  # December
+        }
     
     def get_contract_symbols(self, base_symbol, start_date=None, end_date=None, interval='15minute'):
         """Get all contract symbols for a base symbol with a specific interval."""
@@ -240,22 +248,8 @@ class ContinuousContractGenerator:
             month_code = symbol[-3]    # e.g., H from ESH25
             year_code = symbol[-2:]    # e.g., 25 from ESH25
             
-            # Map month codes to months
-            month_map = {
-                'F': 1,  # January
-                'G': 2,  # February
-                'H': 3,  # March
-                'J': 4,  # April
-                'K': 5,  # May
-                'M': 6,  # June
-                'N': 7,  # July
-                'Q': 8,  # August
-                'U': 9,  # September
-                'V': 10, # October
-                'X': 11, # November
-                'Z': 12  # December
-            }
-            
+            # Get the month number from the month map
+            month_map = self._get_month_map()
             if month_code not in month_map:
                 logger.warning(f"Invalid month code: {month_code} in symbol {symbol}")
                 return None
@@ -274,16 +268,10 @@ class ContinuousContractGenerator:
             
             # Get the expiry rule from the config
             expiry_rule = None
-            try:
-                with open('config/market_symbols.yaml', 'r') as f:
-                    config = yaml.safe_load(f)
-                    
-                for future in config.get('futures', []):
-                    if future.get('base_symbol') == base_symbol:
-                        expiry_rule = future.get('expiry_rule', {})
-                        break
-            except Exception as e:
-                logger.warning(f"Error reading expiry rule from config: {e}")
+            for future in self.config.get('futures', []):
+                if future.get('base_symbol') == base_symbol:
+                    expiry_rule = future.get('expiry_rule', {})
+                    break
             
             # Default expiry rule if not found in config
             if not expiry_rule:

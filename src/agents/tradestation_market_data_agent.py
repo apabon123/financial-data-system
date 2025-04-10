@@ -182,7 +182,7 @@ class TradeStationMarketDataAgent:
             "start_date": None,
             "end_date": None,
             "interval_value": 1,
-            "interval_unit": "day",
+            "interval_unit": "daily",
             "adjusted": True
         }
         
@@ -196,7 +196,7 @@ class TradeStationMarketDataAgent:
         elif 'daily' in query:
             params["timeframe"] = "daily"
             params["interval_value"] = 1
-            params["interval_unit"] = "day"
+            params["interval_unit"] = "daily"
         elif 'weekly' in query:
             params["timeframe"] = "weekly"
             params["interval_value"] = 1
@@ -376,7 +376,7 @@ class TradeStationMarketDataAgent:
                         
                         api_params = {
                             "interval": params["interval_value"],
-                            "unit": "daily" if params["interval_unit"] == "day" else params["interval_unit"],
+                            "unit": params["interval_unit"],  # Use the interval_unit directly
                             "barsback": bars_back,
                             "lastdate": params["end_date"].strftime("%Y-%m-%dT23:59:59Z")  # Use end date as lastdate
                         }

@@ -47,23 +47,32 @@ DEFAULT_DB_PATH = os.path.join(DATA_DIR, 'financial_data.duckdb')
 class MarketDataFetcher:
     """Class to fetch market data from TradeStation and update the database."""
     
-    def __init__(self, config_path=None):
-        """Initialize the market data fetcher."""
-        self.config = self._load_config(config_path) if config_path else {}
+    def __init__(self, config_path=None, start_date=None, db_path=None):
+        """Initialize the market data fetcher.
+        
+        Args:
+            config_path: Path to config file (optional)
+            start_date: Start date for historical data (optional)
+            db_path: Path to the database file (optional)
+        """
+        # Set up logger
         self.logger = logging.getLogger(__name__)
-        self.start_date = self.config.get('settings', {}).get('default_start_date', '2023-01-01')
         
-        # Connect to database
-        db_path = self.config.get('settings', {}).get('database_path', './data/financial_data.duckdb')
-        try:
-            self.conn = duckdb.connect(db_path)
-            logger.info(f"Connected to database: {db_path}")
-        except Exception as e:
-            logger.error(f"Failed to connect to database: {e}")
-            raise
+        # Load configuration
+        self.config = self._load_config(config_path) if config_path else {}
         
-        self.config_path = config_path
-        self.ts_agent = TradeStationMarketDataAgent(database_path=db_path)
+        # Set start date
+        self.start_date = pd.Timestamp(start_date) if start_date else pd.Timestamp('2010-01-01')
+        
+        # Set database path
+        self.db_path = db_path or self.config.get('settings', {}).get('database_path', DEFAULT_DB_PATH)
+        
+        # Initialize database connection
+        self.conn = self._connect_database()
+        self._setup_database()
+        
+        # Initialize TradeStation agent
+        self.ts_agent = TradeStationMarketDataAgent(database_path=':memory:', verbose=True)
         
         # Add VALID_UNITS attribute to the ts_agent if it doesn't exist
         if not hasattr(self.ts_agent, 'VALID_UNITS'):
@@ -78,16 +87,44 @@ class MarketDataFetcher:
         """Connect to the DuckDB database."""
         try:
             # Ensure the directory exists
-            db_dir = os.path.dirname(self.config.get('settings', {}).get('database_path', DEFAULT_DB_PATH))
+            db_dir = os.path.dirname(self.db_path)
             if db_dir and not os.path.exists(db_dir):
                 os.makedirs(db_dir)
                 
             # Connect to the database
-            conn = duckdb.connect(self.config.get('settings', {}).get('database_path', DEFAULT_DB_PATH))
-            logger.info(f"Connected to database: {self.config.get('settings', {}).get('database_path', DEFAULT_DB_PATH)}")
+            conn = duckdb.connect(self.db_path)
+            logger.info(f"Connected to database: {self.db_path}")
             return conn
         except Exception as e:
             logger.error(f"Failed to connect to database: {e}")
+            sys.exit(1)
+        
+    def _setup_database(self):
+        """Set up the database schema if it doesn't exist."""
+        try:
+            # Create market_data table if it doesn't exist
+            self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS market_data (
+                timestamp TIMESTAMP,
+                symbol VARCHAR,
+                open DOUBLE,
+                high DOUBLE,
+                low DOUBLE,
+                close DOUBLE,
+                volume BIGINT,
+                up_volume BIGINT,
+                down_volume BIGINT,
+                source VARCHAR,
+                interval_value INTEGER,
+                interval_unit VARCHAR,
+                adjusted BOOLEAN,
+                quality INTEGER,
+                PRIMARY KEY (timestamp, symbol, interval_value, interval_unit)
+            )
+            """)
+            logger.info("Database schema initialized")
+        except Exception as e:
+            logger.error(f"Error setting up database: {e}")
             sys.exit(1)
         
     def _load_config(self, config_path):
@@ -124,142 +161,193 @@ class MarketDataFetcher:
             logger.error(f"Error getting latest date for {symbol}: {e}")
             return None
     
-    def fetch_data_since(self, symbol: str, interval: int = 1, unit: str = 'daily', start_date: str = None, end_date: str = None) -> pd.DataFrame:
+    def fetch_data_since(self, symbol, interval, unit, start_date=None, end_date=None):
         """
-        Fetch historical market data since a given date.
+        Fetch historical market data from TradeStation since a specific date.
         
         Args:
-            symbol: The symbol to fetch data for
-            interval: The interval value (e.g. 1 for 1-minute or 1-day)
-            unit: The interval unit (daily, minute, weekly, monthly)
-            start_date: The start date in YYYY-MM-DD format
-            end_date: The end date in YYYY-MM-DD format
+            symbol: The ticker symbol
+            interval: Interval of data
+            unit: Time unit ('daily', 'minute', etc.)
+            start_date: The start date to fetch data from (format: 'YYYY-MM-DD')
+            end_date: The end date to fetch data to (format: 'YYYY-MM-DD')
             
         Returns:
-            DataFrame with the fetched data
+            DataFrame with market data
         """
-        if start_date:
-            # Convert start_date to datetime
-            start_dt = pd.to_datetime(start_date)
-            # Ensure start_dt is timezone-naive
-            if start_dt.tz is not None:
-                start_dt = start_dt.tz_localize(None)
-            # Calculate days between start_date and today
-            days_diff = (pd.Timestamp.now() - start_dt).days
-            # Set bars_back based on days_diff, with a minimum of 1000
-            bars_back = max(days_diff, 1000)
-        else:
-            bars_back = 10000
-            
-        # Ensure bars_back doesn't exceed 50000 (API limit)
-        bars_back = min(bars_back, 50000)
-        
-        # Initialize empty list to store all data
-        all_data = []
-        total_bars = 0
-        last_bar_count = None
-        
-        while True:
-            try:
-                # Construct the API endpoint
-                endpoint = f"{self.ts_agent.base_url}/marketdata/barcharts/{symbol}"
-                
-                # Prepare query parameters
-                params = {
-                    'interval': interval,
-                    'unit': unit,
-                    'barsback': bars_back
-                }
-                
-                # Add lastdate parameter if end_date is provided
-                if end_date:
-                    params['lastdate'] = f"{end_date}T00:00:00Z"
-                
-                # Make the API request with retries
-                data = self.make_request_with_retry(endpoint, params)
-                
-                if not data:
-                    break
-                    
-                # Convert to DataFrame
-                df = pd.DataFrame(data)
-                
-                # Break if we got less than requested bars (means we hit the start)
-                if len(df) < bars_back:
-                    all_data.append(df)
-                    break
-                    
-                # Check if we're getting the same number of bars repeatedly
-                if last_bar_count == len(df):
-                    logger.warning(f"Got same number of bars ({len(df)}) twice in a row, stopping to avoid infinite loop")
-                    break
-                    
-                last_bar_count = len(df)
-                
-                # Add to our collection
-                all_data.append(df)
-                total_bars += len(df)
-                
-                logger.info(f"Retrieved {len(df)} bars. Remaining: {bars_back - len(df)}.")
-                
-                # Get the earliest timestamp
-                earliest_ts = pd.to_datetime(df['TimeStamp'].min())
-                # Ensure earliest_ts is timezone-naive for comparison
-                if earliest_ts.tz is not None:
-                    earliest_ts = earliest_ts.tz_localize(None)
-                
-                # If we've gone back far enough, break
-                if start_date and earliest_ts <= start_dt:
-                    break
-                    
-                # Update lastdate for next request
-                params['lastdate'] = earliest_ts.strftime('%Y-%m-%dT%H:%M:%SZ')
-                
-            except Exception as e:
-                logger.error(f"Error fetching data: {e}")
-                break
-                
-        # Combine all data
-        if all_data:
-            combined_df = pd.concat(all_data, ignore_index=True)
-            
-            # Filter by date range if start_date is provided
+        try:
+            if not self.ts_agent.access_token:
+                raise Exception("Error: No active connection. Please call 'connect' first.")
+
+            logger.debug(f"Fetching data for {symbol} with interval={interval} {unit}")
+            logger.debug(f"Date range: {start_date} to {end_date}")
+
+            # Validate 'unit' input
+            if unit not in self.ts_agent.VALID_UNITS:
+                logger.error(f"Error: Invalid unit '{unit}'. Valid units are: {', '.join(self.ts_agent.VALID_UNITS)}")
+                return None
+
+            # Convert start_date to datetime if provided
+            start_dt = None
             if start_date:
-                combined_df['TimeStamp'] = pd.to_datetime(combined_df['TimeStamp'])
-                # Ensure timestamps are timezone-naive for comparison
-                if combined_df['TimeStamp'].dt.tz is not None:
-                    combined_df['TimeStamp'] = combined_df['TimeStamp'].dt.tz_localize(None)
-                combined_df = combined_df[combined_df['TimeStamp'] >= start_dt]
+                try:
+                    start_dt = pd.to_datetime(start_date)
+                    logger.debug(f"Converted start_date to datetime: {start_dt}")
+                except Exception as e:
+                    logger.error(f"Error parsing start_date: {e}")
+                    return None
+
+            # Convert end_date to datetime if provided
+            end_dt = None
+            if end_date:
+                try:
+                    end_dt = pd.to_datetime(end_date)
+                    logger.debug(f"Converted end_date to datetime: {end_dt}")
+                except Exception as e:
+                    logger.error(f"Error parsing end_date: {e}")
+                    return None
+
+            # Calculate days difference if start_date is provided
+            if start_dt:
+                days_diff = (datetime.now() - start_dt).days
+                logger.debug(f"Days difference: {days_diff}")
+                # Use a reasonable number of bars based on the interval
+                if unit == 'daily':
+                    bars_back = max(days_diff, 1000)
+                elif unit == 'minute':
+                    if interval == 1:
+                        bars_back = max(days_diff * 390, 10000)  # ~390 minutes per trading day
+                    elif interval == 15:
+                        bars_back = max(days_diff * 26, 10000)   # ~26 15-minute bars per trading day
+                    else:
+                        bars_back = max(days_diff * 100, 10000)  # Conservative estimate
+                else:
+                    bars_back = max(days_diff, 1000)
+            else:
+                bars_back = 10000
                 
-            # Rename columns to match schema
-            column_mapping = {
-                'TimeStamp': 'timestamp',
-                'Open': 'open',
-                'High': 'high',
-                'Low': 'low',
-                'Close': 'close',
-                'TotalVolume': 'volume'
-            }
-            combined_df = combined_df.rename(columns=column_mapping)
+            # Ensure bars_back doesn't exceed 50000 (API limit)
+            bars_back = min(bars_back, 50000)
+            logger.debug(f"Requesting {bars_back} bars")
             
-            # Add required columns
-            combined_df['symbol'] = symbol
-            combined_df['interval_value'] = interval
-            combined_df['interval_unit'] = unit
-            combined_df['up_volume'] = 0  # TradeStation doesn't provide this
-            combined_df['down_volume'] = 0  # TradeStation doesn't provide this
-            combined_df['adjusted'] = False
-            combined_df['quality'] = 100
+            # Initialize empty list to store all data
+            all_data = []
+            total_bars = 0
+            last_date = end_date
             
-            # Sort by timestamp
-            combined_df = combined_df.sort_values('timestamp')
-            
-            # Remove duplicates
-            combined_df = combined_df.drop_duplicates(subset=['timestamp'], keep='first')
-            
-            return combined_df
-            
-        return pd.DataFrame()
+            while True:
+                try:
+                    # Construct the API endpoint
+                    endpoint = f"{self.ts_agent.base_url}/marketdata/barcharts/{symbol}"
+                    logger.debug(f"API endpoint: {endpoint}")
+                    
+                    # Prepare query parameters
+                    params = {
+                        'interval': interval,
+                        'unit': unit,
+                        'barsback': bars_back
+                    }
+                    
+                    # Add lastdate parameter if we have a last date
+                    if last_date:
+                        params['lastdate'] = f"{last_date}T00:00:00Z"
+                    
+                    logger.debug(f"API parameters: {params}")
+                    
+                    # Make the API request with retries
+                    data = self.make_request_with_retry(endpoint, params)
+                    
+                    if not data:
+                        logger.warning("No data returned from API")
+                        break
+                        
+                    # Convert to DataFrame
+                    df = pd.DataFrame(data)
+                    
+                    # Break if we got no data
+                    if len(df) == 0:
+                        logger.warning("Empty DataFrame returned")
+                        break
+                    
+                    # Add to our collection
+                    all_data.append(df)
+                    total_bars += len(df)
+                    
+                    logger.info(f"Retrieved {len(df)} bars. Total so far: {total_bars}")
+                    
+                    # Get the earliest timestamp
+                    earliest_ts = pd.to_datetime(df['TimeStamp'].min())
+                    # Ensure earliest_ts is timezone-naive for comparison
+                    if earliest_ts.tz is not None:
+                        earliest_ts = earliest_ts.tz_localize(None)
+                    
+                    logger.debug(f"Earliest timestamp in batch: {earliest_ts}")
+                    
+                    # If we've gone back far enough, break
+                    if start_date and earliest_ts <= start_dt:
+                        logger.debug("Reached or exceeded start date")
+                        break
+                    
+                    # Update lastdate for next request - use the earliest timestamp from this batch
+                    last_date = earliest_ts.strftime('%Y-%m-%d')
+                    logger.debug(f"New last_date for next request: {last_date}")
+                    
+                    # If we got fewer bars than requested, we've reached the beginning
+                    if len(df) < bars_back:
+                        logger.debug("Got fewer bars than requested, reached beginning")
+                        break
+                    
+                except Exception as e:
+                    logger.error(f"Error fetching data: {e}", exc_info=True)
+                    break
+                    
+            # Combine all data
+            if all_data:
+                combined_df = pd.concat(all_data, ignore_index=True)
+                logger.debug(f"Combined {len(all_data)} batches into DataFrame with {len(combined_df)} rows")
+                
+                # Filter by date range if start_date is provided
+                if start_date:
+                    combined_df['TimeStamp'] = pd.to_datetime(combined_df['TimeStamp'])
+                    # Ensure timestamps are timezone-naive for comparison
+                    if combined_df['TimeStamp'].dt.tz is not None:
+                        combined_df['TimeStamp'] = combined_df['TimeStamp'].dt.tz_localize(None)
+                    combined_df = combined_df[combined_df['TimeStamp'] >= start_dt]
+                    logger.debug(f"Filtered to {len(combined_df)} rows after date range filter")
+                    
+                # Rename columns to match schema
+                column_mapping = {
+                    'TimeStamp': 'timestamp',
+                    'Open': 'open',
+                    'High': 'high',
+                    'Low': 'low',
+                    'Close': 'close',
+                    'TotalVolume': 'volume'
+                }
+                combined_df = combined_df.rename(columns=column_mapping)
+                
+                # Add required columns
+                combined_df['symbol'] = symbol
+                combined_df['interval_value'] = interval
+                combined_df['interval_unit'] = unit
+                combined_df['up_volume'] = 0  # TradeStation doesn't provide this
+                combined_df['down_volume'] = 0  # TradeStation doesn't provide this
+                combined_df['adjusted'] = False
+                combined_df['quality'] = 100
+                
+                # Sort by timestamp
+                combined_df = combined_df.sort_values('timestamp')
+                
+                # Remove duplicates
+                combined_df = combined_df.drop_duplicates(subset=['timestamp'], keep='first')
+                
+                logger.debug(f"Final DataFrame has {len(combined_df)} rows")
+                return combined_df
+                
+            return pd.DataFrame()
+        except Exception as e:
+            logger.error(f"Error in fetch_data_since: {e}", exc_info=True)
+            raise
 
     def fetch_data(self, symbol, interval, unit, bars_back=10000, last_date=None):
         """
@@ -622,10 +710,13 @@ class MarketDataFetcher:
         month_code = symbol[-3]    # e.g., H
         year_code = symbol[-2:]    # e.g., 24
         
+        logger.debug(f"Calculating expiration for {symbol} (base: {base_symbol}, month: {month_code}, year: {year_code})")
+        
         # Map month codes to months
         month_map = {'H': 3, 'M': 6, 'U': 9, 'Z': 12}
         month = month_map.get(month_code)
         if not month:
+            logger.warning(f"Invalid month code {month_code} in symbol {symbol}")
             return None
         
         # Convert year code to full year
@@ -634,7 +725,7 @@ class MarketDataFetcher:
         # Get contract config
         symbol_info = None
         for futures_config in self.config.get('futures', []):
-            if futures_config['symbol'] == base_symbol:
+            if futures_config.get('base_symbol') == base_symbol:
                 symbol_info = futures_config
                 break
         
@@ -646,6 +737,8 @@ class MarketDataFetcher:
         
         expiry_rule = symbol_info['expiry_rule']
         calendar = symbol_info.get('holiday_calendar')
+        
+        logger.debug(f"Found expiry rule for {base_symbol}: {expiry_rule}")
         
         # Handle business day rules (like CL and GC)
         if expiry_rule['day_type'] == 'business_day':
@@ -698,69 +791,106 @@ class MarketDataFetcher:
             while self.is_holiday(target_date, calendar):
                 target_date = self.get_previous_business_day(target_date, calendar)
         
+        logger.debug(f"Calculated expiration date for {symbol}: {target_date}")
         return target_date
 
     def process_symbol(self, symbol: str, update_history: bool = False, force: bool = False) -> None:
         """Process a single symbol, fetching and storing its data.
         
         Args:
-            symbol: The symbol to process
+            symbol: The symbol to process (can be a base symbol like 'ES' or specific contract like 'ESH20')
             update_history: If True, fetch from start_date in config to current date, skipping existing data
             force: If True, overwrite existing data in the database
         """
-        logger.info(f"Processing {symbol}")
-        
-        # Find symbol configuration
-        symbol_info = self.find_symbol_info(symbol)
-        if not symbol_info:
-            logger.error(f"No configuration found for symbol {symbol}")
-            return
+        try:
+            logger.info(f"Processing {symbol}")
             
-        # Get existing data
-        latest_date = self.get_latest_date_in_db(symbol)
-        
-        if latest_date and not force and not update_history:
-            # Normal mode: fetch only new data since last date
-            logger.info(f"Found existing data for {symbol}, last date: {latest_date}")
-            start_date = latest_date + timedelta(days=1)
-        elif update_history:
-            # Update history mode: fetch from start_date in config to current date
-            start_date = symbol_info.get('start_date', self.start_date)
-            logger.info(f"Update history mode: fetching {symbol} from {start_date} to current date")
-        else:
-            # Force mode or no existing data: fetch from start_date in config
-            start_date = symbol_info.get('start_date', self.start_date)
-            if force:
-                logger.info(f"Force mode: overwriting {symbol} data from {start_date} to current date")
-            else:
-                logger.info(f"No existing data for {symbol}, fetching from {start_date} to None")
-        
-        # Fetch data for each frequency
-        for freq in symbol_info.get('frequencies', []):
-            if freq == 'daily':
-                interval = 1
-                unit = 'daily'
-            elif freq == '1min':
-                interval = 1
-                unit = 'minute'
-            elif freq == '15min':
-                interval = 15
-                unit = 'minute'
-            else:
-                continue
+            # Find symbol configuration
+            symbol_info = self.find_symbol_info(symbol)
+            if not symbol_info:
+                logger.error(f"No configuration found for symbol {symbol}")
+                return
                 
-            try:
-                # Use the full contract symbol for fetching
-                data = self.fetch_data_since(symbol, interval, unit, start_date)
-                if data is not None and not data.empty:
-                    if force:
-                        # In force mode, delete existing data for this symbol and frequency
-                        self.delete_existing_data(symbol, interval, unit)
-                    self.save_to_db(data)
-            except Exception as e:
-                logger.error(f"Error processing {symbol} for {freq}: {str(e)}")
-                continue
+            logger.debug(f"Found configuration for {symbol}: {symbol_info}")
+            
+            # Get existing data
+            latest_date = self.get_latest_date_in_db(symbol)
+            logger.debug(f"Latest date in DB for {symbol}: {latest_date}")
+            
+            # Initialize start_date
+            start_date = None
+            
+            # For specific futures contracts (e.g., ESH20), calculate appropriate start date
+            if len(symbol) >= 4 and any(c.isalpha() for c in symbol[2:4]):
+                # Calculate contract start date (about 9 months before expiration)
+                expiry_date = self.calculate_expiration_date(symbol)
+                logger.debug(f"Calculated expiry date for {symbol}: {expiry_date}")
+                if expiry_date:
+                    contract_start = expiry_date - timedelta(days=270)  # ~9 months before expiration
+                    start_date = contract_start
+                    logger.info(f"Calculated start date for {symbol}: {start_date}")
+            
+            if latest_date and not force and not update_history:
+                # Normal mode: fetch only new data since last date
+                logger.info(f"Found existing data for {symbol}, last date: {latest_date}")
+                start_date = latest_date + timedelta(days=1)
+            elif update_history:
+                # Update history mode: fetch from start_date in config to current date
+                config_start = symbol_info.get('start_date', self.start_date)
+                start_date = min(start_date, pd.Timestamp(config_start)) if start_date else pd.Timestamp(config_start)
+                logger.info(f"Update history mode: fetching {symbol} from {start_date} to current date")
+            else:
+                # Force mode or no existing data: fetch from start_date in config
+                if not start_date:
+                    start_date = pd.Timestamp(symbol_info.get('start_date', self.start_date))
+                if force:
+                    logger.info(f"Force mode: overwriting {symbol} data from {start_date} to current date")
+                else:
+                    logger.info(f"No existing data for {symbol}, fetching from {start_date} to None")
+            
+            # Get frequencies from symbol_info, defaulting to daily if none specified
+            frequencies = symbol_info.get('frequencies', ['daily'])
+            if not frequencies:
+                frequencies = ['daily']
                 
+            logger.debug(f"Processing frequencies for {symbol}: {frequencies}")
+            
+            # Fetch data for each frequency
+            for freq in frequencies:
+                try:
+                    if freq == 'daily':
+                        interval = 1
+                        unit = 'daily'
+                    elif freq == '1min':
+                        interval = 1
+                        unit = 'minute'
+                    elif freq == '15min':
+                        interval = 15
+                        unit = 'minute'
+                    else:
+                        logger.warning(f"Unsupported frequency {freq} for {symbol}, skipping")
+                        continue
+                        
+                    logger.info(f"Fetching {freq} data for {symbol} from {start_date}")
+                    
+                    # Use the full contract symbol for fetching
+                    data = self.fetch_data_since(symbol, interval, unit, start_date)
+                    
+                    if data is not None and not data.empty:
+                        logger.info(f"Retrieved {len(data)} rows of {freq} data for {symbol}")
+                        if force:
+                            # In force mode, delete existing data for this symbol and frequency
+                            self.delete_existing_data(symbol, interval, unit)
+                        self.save_to_db(data)
+                    else:
+                        logger.warning(f"No {freq} data retrieved for {symbol}")
+                except Exception as e:
+                    logger.error(f"Error processing {symbol} for {freq}: {str(e)}", exc_info=True)
+                    continue
+        except Exception as e:
+            logger.error(f"Error processing symbol {symbol}: {str(e)}", exc_info=True)
+            raise
+
     def delete_existing_data(self, symbol: str, interval: int, unit: str) -> None:
         """Delete existing data for a symbol and frequency from the database.
         
@@ -781,32 +911,58 @@ class MarketDataFetcher:
         except Exception as e:
             logger.error(f"Error deleting data for {symbol}: {str(e)}")
             
-    def find_symbol_info(self, symbol):
-        """Find configuration info for a symbol."""
+    def find_symbol_info(self, symbol: str) -> Optional[Dict[str, Any]]:
+        """Find symbol configuration in the YAML config.
+        
+        Args:
+            symbol: Symbol to look up (can be base symbol like 'ES' or specific contract like 'ESH20')
+            
+        Returns:
+            Dictionary containing symbol configuration or None if not found
+        """
+        logger.debug(f"Looking up configuration for symbol: {symbol}")
+        
         # First check if it's a futures contract (e.g., ESH24, RTYM25)
         if len(symbol) > 2:
-            # Try 3-character root first
-            root_symbol = symbol[:3]
-            for futures_config in self.config.get('futures', []):
-                if futures_config.get('base_symbol') == root_symbol:
-                    return dict(futures_config)
+            # Extract the base symbol (e.g., ES from ESH24)
+            base_symbol = symbol[:2]  # Most futures use 2-character base symbols
+            logger.debug(f"Checking base symbol: {base_symbol}")
             
-            # Then try 2-character root
-            root_symbol = symbol[:2]
+            # Try to find the base symbol in futures config
             for futures_config in self.config.get('futures', []):
-                if futures_config.get('base_symbol') == root_symbol:
-                    return dict(futures_config)
+                if futures_config.get('base_symbol') == base_symbol:
+                    # Create a copy of the config to avoid modifying the original
+                    config_copy = dict(futures_config)
+                    # Add the full symbol to the config
+                    config_copy['symbol'] = symbol
+                    logger.debug(f"Found futures config for {base_symbol}")
+                    return config_copy
+            
+            # If not found, try 3-character base symbols
+            if len(symbol) >= 5:  # Need at least 5 chars for 3-char base + month + year
+                base_symbol = symbol[:3]
+                logger.debug(f"Checking base symbol: {base_symbol}")
+                
+                for futures_config in self.config.get('futures', []):
+                    if futures_config.get('base_symbol') == base_symbol:
+                        config_copy = dict(futures_config)
+                        config_copy['symbol'] = symbol
+                        logger.debug(f"Found futures config for {base_symbol}")
+                        return config_copy
         
         # Then check equities
         for equity_config in self.config.get('equities', []):
             if equity_config.get('symbol') == symbol:
+                logger.debug(f"Found equity config for {symbol}")
                 return dict(equity_config)
                 
         # Finally check futures again for root symbols
         for futures_config in self.config.get('futures', []):
             if futures_config.get('base_symbol') == symbol:
+                logger.debug(f"Found futures root config for {symbol}")
                 return dict(futures_config)
-                
+        
+        logger.warning(f"No configuration found for symbol: {symbol}")
         return None
     
     def generate_futures_contracts(self, root_symbol, start_date, end_date=None):
@@ -986,103 +1142,124 @@ class MarketDataFetcher:
             if not self.ts_agent.authenticate():
                 logger.error("Failed to authenticate with TradeStation API")
                 return
-            
+                
             if symbol:
-                # Process a single symbol
-                symbol_info = self.find_symbol_info(symbol)
-                if symbol_info:
-                    # Check if it's a futures contract
-                    if symbol_info.get('type') == 'futures' or symbol_info.get('base_symbol'):
-                        # Generate and process futures contracts
-                        start = symbol_info.get('start_date', self.start_date)
-                        contracts = self.generate_futures_contracts(symbol, start)
-                        logger.info(f"Generated {len(contracts)} futures contracts for {symbol}")
-                        for contract in contracts:
-                            try:
-                                self.process_symbol(contract, update_history, force)
-                            except Exception as e:
-                                logger.error(f"Error processing futures contract {contract}: {e}")
-                                continue
-                    else:
-                        self.process_symbol(symbol, update_history, force)
+                # Check if it's a specific futures contract (e.g., ESH20)
+                if len(symbol) >= 4 and any(c.isalpha() for c in symbol[2:4]):
+                    # Process the specific contract
+                    self.process_symbol(symbol, update_history, force)
                 else:
-                    logger.error(f"Symbol '{symbol}' not found in configuration")
+                    # For base symbols (e.g., ES), generate and process all contracts
+                    symbol_info = self.find_symbol_info(symbol)
+                    if not symbol_info:
+                        logger.error(f"No configuration found for symbol {symbol}")
+                        return
+                        
+                    # Generate contract symbols
+                    contracts = self.generate_futures_contracts(
+                        symbol,
+                        self.start_date,
+                        datetime.now()
+                    )
+                    logger.info(f"Generated {len(contracts)} futures contracts for {symbol}")
+                    
+                    # Process each contract
+                    for contract in contracts:
+                        self.process_symbol(contract, update_history, force)
             else:
-                # Process all symbols
-                # Process futures first
-                for symbol_info in self.config.get('futures', []):
-                    try:
-                        # Generate and process futures contracts
-                        start = symbol_info.get('start_date', self.start_date)
-                        contracts = self.generate_futures_contracts(symbol_info['base_symbol'], start)
-                        logger.info(f"Generated {len(contracts)} futures contracts for {symbol_info['base_symbol']}")
-                        for contract in contracts:
-                            try:
-                                self.process_symbol(contract, update_history, force)
-                            except Exception as e:
-                                logger.error(f"Error processing futures contract {contract}: {e}")
-                                continue
-                    except Exception as e:
-                        logger.error(f"Error processing futures symbol {symbol_info['base_symbol']}: {e}")
-                        continue
-                
-                # Then process equities
-                for symbol_info in self.config.get('equities', []):
-                    try:
-                        self.process_symbol(symbol_info['symbol'], update_history, force)
-                    except Exception as e:
-                        logger.error(f"Error processing equity symbol {symbol_info['symbol']}: {e}")
-                        continue
-                
+                # Process all symbols from config
+                for equity in self.config.get('equities', []):
+                    self.process_symbol(equity['symbol'], update_history, force)
+                    
+                for future in self.config.get('futures', []):
+                    base_symbol = future['base_symbol']
+                    contracts = self.generate_futures_contracts(
+                        base_symbol,
+                        self.start_date,
+                        datetime.now()
+                    )
+                    logger.info(f"Generated {len(contracts)} futures contracts for {base_symbol}")
+                    
+                    for contract in contracts:
+                        self.process_symbol(contract, update_history, force)
         except Exception as e:
             logger.error(f"Error running data fetcher: {e}")
-        finally:
-            # Close the database connection
-            self.conn.close()
+            raise
 
 def main():
-    """Main function to run the script."""
-    parser = argparse.ArgumentParser(
-        description='Fetch market data for symbols from TradeStation API',
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  # Fetch data for a specific symbol
-  python fetch_market_data.py --symbol ES
-  
-  # Fetch data for all symbols defined in the config
-  python fetch_market_data.py
-  
-  # Use a custom configuration file
-  python fetch_market_data.py --config path/to/custom_config.yaml
-  
-  # Update history for all symbols (from start_date to current)
-  python fetch_market_data.py --updatehistory
-  
-  # Force update (overwrite existing data)
-  python fetch_market_data.py --force
-  
-  # Force update for a specific symbol
-  python fetch_market_data.py --symbol ES --force
-        """
-    )
-    parser.add_argument('--symbol', type=str, help='Symbol to fetch data for (e.g., ES, NQ, CL)')
-    parser.add_argument('--config', default='config/market_symbols.yaml', help='Path to the market_symbols.yaml configuration file (default: config/market_symbols.yaml)')
-    parser.add_argument('--updatehistory', action='store_true', help='Update history from start_date in config to current date, skipping existing data')
-    parser.add_argument('--force', action='store_true', help='Force update: overwrite existing data in the database')
+    """Main function to run the data fetcher."""
+    parser = argparse.ArgumentParser(description='Fetch market data from TradeStation')
+    parser.add_argument('--symbol', help='Symbol to fetch (e.g., ES or ESH20)')
+    parser.add_argument('--config', help='Path to config file', default=os.path.join(project_root, "config", "market_symbols.yaml"))
+    parser.add_argument('--updatehistory', action='store_true', help='Update historical data')
+    parser.add_argument('--force', action='store_true', help='Force update data')
+    parser.add_argument('--interval-value', type=int, default=None, help='Interval value (e.g., 15 for 15-minute data)')
+    parser.add_argument('--interval-unit', choices=['minute', 'daily', 'hour'], default=None, help='Interval unit')
+    parser.add_argument('--loglevel', choices=['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'],
+                      default='INFO', help='Set the logging level')
+    
     args = parser.parse_args()
     
+    # Set logging level
+    logging.getLogger().setLevel(getattr(logging, args.loglevel))
+    
     try:
+        # Initialize fetcher with config path
         fetcher = MarketDataFetcher(config_path=args.config)
-        if args.symbol:
-            logger.info(f"Fetching data for symbol: {args.symbol}")
-            fetcher.run(symbol=args.symbol, update_history=args.updatehistory, force=args.force)
-        else:
-            logger.info("Fetching data for all symbols")
-            fetcher.run(update_history=args.updatehistory, force=args.force)
+        
+        # If interval is specified, update the settings in the config
+        if args.interval_value is not None and args.interval_unit is not None:
+            # Format interval name
+            interval_name = f"{args.interval_value}{args.interval_unit}"
+            if args.interval_value == 1 and args.interval_unit == 'daily':
+                interval_name = 'daily'
+            
+            # Add or update the interval in settings
+            if 'settings' not in fetcher.config:
+                fetcher.config['settings'] = {}
+            if 'data_frequencies' not in fetcher.config['settings']:
+                fetcher.config['settings']['data_frequencies'] = []
+            
+            # Update or add the interval
+            interval_found = False
+            for freq in fetcher.config['settings']['data_frequencies']:
+                if freq['interval'] == args.interval_value and freq['unit'] == args.interval_unit:
+                    interval_found = True
+                    break
+            
+            if not interval_found:
+                fetcher.config['settings']['data_frequencies'].append({
+                    'interval': args.interval_value,
+                    'name': interval_name,
+                    'unit': args.interval_unit
+                })
+            
+            # Update the symbol's frequencies if specified
+            if args.symbol:
+                # Get the base symbol for futures contracts
+                base_symbol = args.symbol[:2] if len(args.symbol) > 2 else args.symbol
+                
+                # Update frequencies in the config
+                for future in fetcher.config.get('futures', []):
+                    if future.get('base_symbol') == base_symbol:
+                        if interval_name not in future['frequencies']:
+                            future['frequencies'].append(interval_name)
+                        logger.debug(f"Updated frequencies for {base_symbol} to include {interval_name}")
+                        break
+                
+                for equity in fetcher.config.get('equities', []):
+                    if equity.get('symbol') == args.symbol:
+                        if interval_name not in equity['frequencies']:
+                            equity['frequencies'].append(interval_name)
+                        logger.debug(f"Updated frequencies for {args.symbol} to include {interval_name}")
+                        break
+        
+        # Run the fetcher
+        fetcher.run(args.symbol, args.updatehistory, args.force)
+        
     except Exception as e:
-        logger.error(f"Error running market data fetcher: {e}")
-        sys.exit(1)
+        logger.error(f"Error running data fetcher: {e}")
+        raise
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

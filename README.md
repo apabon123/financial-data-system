@@ -22,6 +22,8 @@ financial-data-system/
 ├── config/                 # Configuration files
 ├── data/                   # Data storage
 ├── docs/                   # Documentation
+│   ├── README.md           # Main documentation
+│   └── SCRIPTS.md          # Script documentation
 ├── logs/                   # Log files
 ├── output/                 # Output files
 ├── scripts/                # Command-line scripts
@@ -80,6 +82,10 @@ financial-data-system/
    ```
 
 ## Usage
+
+### Scripts
+
+The system includes numerous scripts for various tasks. For detailed information about all available scripts and their usage, see [SCRIPTS.md](docs/SCRIPTS.md).
 
 ### AI Interface
 
@@ -190,6 +196,7 @@ The AI interface supports a wide range of commands, including:
 - Added database backup functionality with retention policy
 - Added price discrepancy detection for continuous contracts
 - Implemented multiple rollover methods for futures contracts
+- Added comprehensive script documentation
 
 ## License
 

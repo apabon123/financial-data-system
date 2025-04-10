@@ -50,8 +50,14 @@ futures:
         - U
         - Z
       start_month: 1
-      start_year: 3
-    num_active_contracts: 4
+      start_year: 2003
+    num_active_contracts: 2
+    expiry_rule:
+      day_type: friday
+      day_number: 3  # Third Friday
+      adjust_for_holiday: true
+      holiday_calendar: US
+    start_date: '2003-01-01'
 
   - base_symbol: NQ
     calendar: US
@@ -68,8 +74,14 @@ futures:
         - U
         - Z
       start_month: 1
-      start_year: 3
-    num_active_contracts: 4
+      start_year: 2003
+    num_active_contracts: 2
+    expiry_rule:
+      day_type: friday
+      day_number: 3  # Third Friday
+      adjust_for_holiday: true
+      holiday_calendar: US
+    start_date: '2003-01-01'
 
   - base_symbol: CL
     calendar: US
@@ -94,8 +106,14 @@ futures:
         - X
         - Z
       start_month: 1
-      start_year: 4
+      start_year: 2004
     num_active_contracts: 12
+    expiry_rule:
+      day_type: business_day
+      days_before: 3  # Three business days before the 25th
+      adjust_for_holiday: true
+      holiday_calendar: US
+    start_date: '2004-01-01'
 
   - base_symbol: GC
     calendar: US
@@ -114,84 +132,84 @@ futures:
         - V
         - Z
       start_month: 1
-      start_year: 4
+      start_year: 2004
     num_active_contracts: 6
+    expiry_rule:
+      day_type: business_day
+      days_before: 3  # Three business days before the last business day
+      adjust_for_holiday: true
+      holiday_calendar: US
+    start_date: '2004-01-01'
 
   - base_symbol: VX
     calendar: US
-    description: VX Futures
-    exchange: CME
+    description: VIX Futures
+    exchange: CBOE
     frequencies:
-      - 1min
-      - 15min
       - daily
     historical_contracts:
       patterns:
-        - H
-        - M
-        - U
-        - Z
+        - F  # February
+        - G  # March
+        - H  # April
+        - J  # May
+        - K  # June
+        - M  # July
+        - N  # August
+        - Q  # September
+        - U  # October
+        - V  # November
+        - X  # December
+        - Z  # January
       start_month: 1
-      start_year: 5
-    num_active_contracts: 4
+      start_year: 2004
+    num_active_contracts: 9  # Monthly contracts
+    expiry_rule:
+      day_type: wednesday
+      day_number: 3  # Third Wednesday
+      adjust_for_holiday: true
+      holiday_calendar: US
+    start_date: '2004-01-01'
 
 settings:
   data_frequencies:
-    - interval: 1
-      name: 1min
-      unit: minute
-    - interval: 15
+    - interval: 15  #Earliest 15min data is 2010-01-01
       name: 15min
       unit: minute
     - interval: 1
-      name: daily
+      name: daily  #Earliest daily data is 2004-03-26
       unit: day
-  default_start_date: '2003-01-01'
-  holiday_calendars:
-    US:
-      holidays:
-        - name: New Year's Day
+  default_start_date: '2004-03-26'
+  holiday_calendar: NYSE
+  holidays:
+    NYSE:
+      fixed_dates:
+        - '01-01'  # New Year's Day
+        - '06-19'  # Juneteenth
+        - '07-04'  # Independence Day
+        - '12-25'  # Christmas Day
+      relative_dates:
+        - name: "Martin Luther King Jr. Day"
           month: 1
-          day: 1
-          observance: nearest_weekday
-        - name: Martin Luther King Jr. Day
-          month: 1
-          day: 3
-          observance: monday
-        - name: Presidents Day
+          day_type: "monday"
+          occurrence: 3  # Third Monday
+        - name: "Presidents Day"
           month: 2
-          day: 3
-          observance: monday
-        - name: Good Friday
-          observance: easter_friday
-        - name: Memorial Day
+          day_type: "monday"
+          occurrence: 3  # Third Monday
+        - name: "Good Friday"
+          month: 4  # This will be calculated based on Easter
+          day_type: "friday"
+          occurrence: -1  # Last Friday before Easter
+        - name: "Memorial Day"
           month: 5
-          day: -1
-          observance: monday
-        - name: Juneteenth
-          month: 6
-          day: 19
-          observance: nearest_weekday
-        - name: Independence Day
-          month: 7
-          day: 4
-          observance: nearest_weekday
-        - name: Labor Day
+          day_type: "monday"
+          occurrence: -1  # Last Monday
+        - name: "Labor Day"
           month: 9
-          day: 1
-          observance: monday
-        - name: Thanksgiving
+          day_type: "monday"
+          occurrence: 1  # First Monday
+        - name: "Thanksgiving"
           month: 11
-          day: 4
-          observance: thursday
-        - name: Christmas
-          month: 12
-          day: 25
-          observance: nearest_weekday
-      rules:
-        - name: weekend
-          days: [5, 6]  # Friday and Saturday
-        - name: pre_holiday
-          days_before: 1
-        - name: post_holiday
-          days_after: 1
+          day_type: "thursday"
+          occurrence: 4  # Fourth Thursday
