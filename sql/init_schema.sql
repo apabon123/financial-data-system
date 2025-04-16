@@ -173,6 +173,27 @@ CREATE TABLE IF NOT EXISTS trades (
     PRIMARY KEY (trade_id)
 );
 
+-- Continuous Contracts Table
+CREATE TABLE IF NOT EXISTS continuous_contracts (
+    timestamp TIMESTAMP NOT NULL,
+    symbol VARCHAR NOT NULL,           -- Continuous contract symbol (e.g., VXc1)
+    underlying_symbol VARCHAR,     -- Specific contract used for this row (e.g., VXF10)
+    open DOUBLE,
+    high DOUBLE,
+    low DOUBLE,
+    close DOUBLE,
+    volume BIGINT,
+    open_interest BIGINT,
+    up_volume BIGINT,
+    down_volume BIGINT,
+    source VARCHAR,
+    interval_value INTEGER,
+    interval_unit VARCHAR,
+    adjusted BOOLEAN DEFAULT FALSE,
+    quality INTEGER DEFAULT 100,
+    PRIMARY KEY (timestamp, symbol, interval_value, interval_unit)
+);
+
 -- Create standard views
 
 -- Daily Bars View

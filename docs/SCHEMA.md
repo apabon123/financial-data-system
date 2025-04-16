@@ -65,52 +65,33 @@
 - description (VARCHAR) - Description of the setting
 
 ### continuous_contracts
-Table for storing generated continuous futures contracts.
+Stores generated continuous futures contracts.
 
-```sql
-CREATE TABLE continuous_contracts (
-    date TIMESTAMP,
-    symbol VARCHAR,  -- e.g., VXc1, VXc2 for first and second VX continuous contracts
-    open DOUBLE,
-    high DOUBLE,
-    low DOUBLE,
-    close DOUBLE,
-    volume BIGINT,
-    source VARCHAR DEFAULT 'continuous',
-    interval_value INTEGER DEFAULT 1,
-    interval_unit VARCHAR DEFAULT 'day',
-    adjusted BOOLEAN DEFAULT true,
-    quality INTEGER DEFAULT 100
-)
-```
+| Column Name       | Data Type | Description                                                    | Example        |
+|-------------------|-----------|----------------------------------------------------------------|----------------|
+| `timestamp`       | TIMESTAMP | Date/time of the data point                                    | `2023-10-26 00:00:00` |
+| `symbol`          | VARCHAR   | Continuous contract symbol (e.g., `VXc1`, `ESc2`)                | `VXc1`         |
+| `underlying_symbol`| VARCHAR   | Specific contract used for this row (e.g., `VXF10`, `ESZ23`) | `VXZ23`        |
+| `open`            | DOUBLE    | Opening price for the period                                   | `18.50`        |
+| `high`            | DOUBLE    | Highest price during the period                                | `19.00`        |
+| `low`             | DOUBLE    | Lowest price during the period                                 | `18.25`        |
+| `close`           | DOUBLE    | Closing price for the period                                   | `18.75`        |
+| `volume`          | BIGINT    | Trading volume during the period                               | `150000`       |
+| `open_interest`   | BIGINT    | Open interest at the end of the period                         | `250000`       |
+| `up_volume`       | BIGINT    | Volume traded during upward price movement (optional)          | `80000`        |
+| `down_volume`     | BIGINT    | Volume traded during downward price movement (optional)        | `70000`        |
+| `source`          | VARCHAR   | Indicates data is generated (e.g., 'continuous')            | `continuous`   |
+| `interval_value`  | INTEGER   | Numeric part of the time interval (e.g., 1 for daily)          | `1`            |
+| `interval_unit`   | VARCHAR   | Unit of the time interval (e.g., 'day', 'minute')           | `day`          |
+| `adjusted`        | BOOLEAN   | Whether prices are adjusted (typically TRUE for continuous)    | `TRUE`         |
+| `quality`         | INTEGER   | Data quality indicator (e.g., 100)                             | `100`          |
 
-The continuous_contracts table stores generated continuous futures contracts with the following features:
-- Continuous contract symbols are formed as {root_symbol}c{n} where n is the contract number (e.g., VXc1, VXc2)
-- Data is rolled over to the next contract ON the expiry date of the current contract
-- Gaps in data are preserved when underlying contract data is missing
-- Only daily data is stored (interval_value=1, interval_unit='day')
-- Source is always set to 'continuous' to distinguish from raw contract data
-- Quality is set to 100 for all continuous contract data points
+**Primary Key:** (`timestamp`, `symbol`, `interval_value`, `interval_unit`)
 
-Example usage:
-```sql
--- Query the first continuous contract for VX
-SELECT date, open, high, low, close, volume
-FROM continuous_contracts
-WHERE symbol = 'VXc1'
-ORDER BY date;
-
--- Compare first and second continuous contracts
-SELECT c1.date, 
-       c1.close as c1_close,
-       c2.close as c2_close,
-       c2.close - c1.close as spread
-FROM continuous_contracts c1
-JOIN continuous_contracts c2 ON c1.date = c2.date
-WHERE c1.symbol = 'VXc1'
-  AND c2.symbol = 'VXc2'
-ORDER BY c1.date;
-```
+**Notes:**
+- This table is populated by scripts like `src/scripts/market_data/generate_continuous_futures.py`.
+- The `underlying_symbol` column tracks which specific futures contract provided the data for that row in the continuous series.
+- `adjusted` is typically TRUE for continuous contracts, indicating potential price adjustments during rollovers (though current implementation might not adjust).
 
 ## Relations
 

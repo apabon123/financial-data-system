@@ -111,26 +111,40 @@ To list available tools:
 
 ### Continuous Contract Generation
 
-The system supports advanced continuous contract generation with multiple rollover methods and price discrepancy detection:
+The system supports continuous futures contract generation based on configurable expiry rules defined in `config/market_symbols.yaml`. Rollovers occur *on* the expiry date of the front contract.
 
 ```bash
-# Generate ES continuous contract using volume-based rollover
-python src/scripts/generate_continuous_contract.py --symbol ES --output ES_backadj --rollover-method volume
+# Generate VXc1 and VXc2 continuous contracts based on config
+python src/scripts/market_data/generate_continuous_futures.py --root-symbol VX --num-contracts 2
 
-# Generate NQ continuous contract using fixed rollover
-python src/scripts/generate_continuous_contract.py --symbol NQ --output NQ_backadj --rollover-method fixed
-
-# Force rebuild of existing ES continuous contract
-python src/scripts/generate_continuous_contract.py --symbol ES --output ES_backadj --force
+# Generate only VXc1
+python src/scripts/market_data/generate_continuous_futures.py --root-symbol VX --num-contracts 1
 ```
 
 Features:
-- Multiple rollover methods:
-  * Volume-based: Rolls over when next contract's volume exceeds current within 5 days of expiry
-  * Fixed: Rolls over one day before expiration
-- Price discrepancy detection with configurable thresholds
-- Comprehensive logging of rollover events
-- Force mode for rebuilding existing contracts
+- Reads expiry rules and other settings from `config/market_symbols.yaml`.
+- Calculates expiry dates based on rules (e.g., VIX rule: Wednesday before the 3rd Friday, adjusted for holidays).
+- Handles rollovers correctly on the calculated expiry date.
+- Stores generated contracts in the `continuous_contracts` table, including the `underlying_symbol` for each data point.
+- Comprehensive logging of generation and rollover events.
+
+### Continuous Contract Verification
+
+A verification script helps ensure the quality and consistency of the generated continuous contracts.
+
+```bash
+# Verify all VX continuous contracts (VXc1, VXc2, etc.)
+python src/scripts/analysis/verify_vx_continuous.py --symbol-prefix VXc
+
+# Verify with a custom price gap threshold (e.g., 15%)
+python src/scripts/analysis/verify_vx_continuous.py --symbol-prefix VXc --gap-threshold 0.15
+```
+
+Checks Performed:
+- **Sunday Data:** Identifies any data points incorrectly recorded on a Sunday.
+- **Price Gaps:** Detects large day-over-day percentage changes in the closing price (configurable threshold).
+- **Date Gaps:** Finds missing trading days (excluding weekends and known holidays based on `config/market_symbols.yaml`).
+- **Rollover Consistency:** Compares actual rollover dates (when `underlying_symbol` changes) against the expected expiry dates calculated using the same logic as the generation script.
 
 ### Database Backup
 
@@ -197,6 +211,8 @@ The AI interface supports a wide range of commands, including:
 - Added price discrepancy detection for continuous contracts
 - Implemented multiple rollover methods for futures contracts
 - Added comprehensive script documentation
+- Refactored continuous futures generation (`generate_continuous_futures.py`)
+- Added continuous futures verification script (`verify_vx_continuous.py`)
 
 ## License
 
