@@ -25,7 +25,7 @@ from typing import List, Dict, Any, Optional
 load_dotenv(os.path.join(os.path.dirname(os.path.dirname(__file__)), 'config', '.env'))
 
 # Add the project root directory to the Python path
-project_root = str(Path(__file__).resolve().parent.parent.parent)
+project_root = str(Path(__file__).resolve().parent.parent.parent.parent)
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
@@ -91,6 +91,20 @@ class MarketDataFetcher:
             if db_dir and not os.path.exists(db_dir):
                 os.makedirs(db_dir)
                 
+            # Try to close any existing connections
+            try:
+                import psutil
+                for proc in psutil.process_iter(['pid', 'name', 'open_files']):
+                    try:
+                        for file in proc.open_files():
+                            if self.db_path in file.path:
+                                logger.warning(f"Database file is open by process {proc.pid}. Attempting to close.")
+                                # We can't force close it, but we can log a warning
+                    except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                        pass
+            except ImportError:
+                logger.warning("psutil not installed. Cannot check for open database connections.")
+                
             # Connect to the database
             conn = duckdb.connect(self.db_path)
             logger.info(f"Connected to database: {self.db_path}")
@@ -130,6 +144,10 @@ class MarketDataFetcher:
     def _load_config(self, config_path):
         """Load the configuration from the YAML file."""
         try:
+            # If config_path is relative, make it relative to project root
+            if not os.path.isabs(config_path):
+                config_path = os.path.join(project_root, config_path)
+            
             with open(config_path, 'r') as f:
                 return yaml.safe_load(f)
         except Exception as e:
@@ -216,15 +234,15 @@ class MarketDataFetcher:
                     bars_back = max(days_diff, 1000)
                 elif unit == 'minute':
                     if interval == 1:
-                        bars_back = max(days_diff * 390, 10000)  # ~390 minutes per trading day
+                        bars_back = max(days_diff * 390, 50000)  # ~390 minutes per trading day
                     elif interval == 15:
-                        bars_back = max(days_diff * 26, 10000)   # ~26 15-minute bars per trading day
+                        bars_back = max(days_diff * 26, 50000)   # ~26 15-minute bars per trading day
                     else:
-                        bars_back = max(days_diff * 100, 10000)  # Conservative estimate
+                        bars_back = max(days_diff * 100, 50000)  # Conservative estimate
                 else:
                     bars_back = max(days_diff, 1000)
             else:
-                bars_back = 10000
+                bars_back = 50000
                 
             # Ensure bars_back doesn't exceed 50000 (API limit)
             bars_back = min(bars_back, 50000)
@@ -743,10 +761,10 @@ class MarketDataFetcher:
         # Handle business day rules (like CL and GC)
         if expiry_rule['day_type'] == 'business_day':
             if 'days_before' in expiry_rule:
-                # Rule like CL: 3 business days before 25th of next month
+                # Rule like CL: 3 business days before 25th
                 ref_month = month % 12 + 1
                 ref_year = year if ref_month > month else year + 1
-                ref_date = datetime(ref_year, ref_month, expiry_rule['reference_day'])
+                ref_date = datetime(ref_year, ref_month, 25)  # Default to 25th
                 target_date = ref_date
                 for _ in range(expiry_rule['days_before']):
                     target_date = self.get_previous_business_day(target_date, calendar)
@@ -806,16 +824,19 @@ class MarketDataFetcher:
             logger.info(f"Processing {symbol}")
             
             # Find symbol configuration
-            symbol_info = self.find_symbol_info(symbol)
+            symbol_info = self._get_symbol_config(symbol)
             if not symbol_info:
                 logger.error(f"No configuration found for symbol {symbol}")
                 return
                 
             logger.debug(f"Found configuration for {symbol}: {symbol_info}")
             
+            # Use the actual symbol from the config for indices
+            actual_symbol = symbol_info.get('symbol', symbol)
+            
             # Get existing data
-            latest_date = self.get_latest_date_in_db(symbol)
-            logger.debug(f"Latest date in DB for {symbol}: {latest_date}")
+            latest_date = self.get_latest_date_in_db(actual_symbol)
+            logger.debug(f"Latest date in DB for {actual_symbol}: {latest_date}")
             
             # Initialize start_date
             start_date = None
@@ -832,28 +853,28 @@ class MarketDataFetcher:
             
             if latest_date and not force and not update_history:
                 # Normal mode: fetch only new data since last date
-                logger.info(f"Found existing data for {symbol}, last date: {latest_date}")
+                logger.info(f"Found existing data for {actual_symbol}, last date: {latest_date}")
                 start_date = latest_date + timedelta(days=1)
             elif update_history:
                 # Update history mode: fetch from start_date in config to current date
                 config_start = symbol_info.get('start_date', self.start_date)
                 start_date = min(start_date, pd.Timestamp(config_start)) if start_date else pd.Timestamp(config_start)
-                logger.info(f"Update history mode: fetching {symbol} from {start_date} to current date")
+                logger.info(f"Update history mode: fetching {actual_symbol} from {start_date} to current date")
             else:
                 # Force mode or no existing data: fetch from start_date in config
                 if not start_date:
                     start_date = pd.Timestamp(symbol_info.get('start_date', self.start_date))
                 if force:
-                    logger.info(f"Force mode: overwriting {symbol} data from {start_date} to current date")
+                    logger.info(f"Force mode: overwriting {actual_symbol} data from {start_date} to current date")
                 else:
-                    logger.info(f"No existing data for {symbol}, fetching from {start_date} to None")
+                    logger.info(f"No existing data for {actual_symbol}, fetching from {start_date} to None")
             
             # Get frequencies from symbol_info, defaulting to daily if none specified
             frequencies = symbol_info.get('frequencies', ['daily'])
             if not frequencies:
                 frequencies = ['daily']
                 
-            logger.debug(f"Processing frequencies for {symbol}: {frequencies}")
+            logger.debug(f"Processing frequencies for {actual_symbol}: {frequencies}")
             
             # Fetch data for each frequency
             for freq in frequencies:
@@ -868,24 +889,24 @@ class MarketDataFetcher:
                         interval = 15
                         unit = 'minute'
                     else:
-                        logger.warning(f"Unsupported frequency {freq} for {symbol}, skipping")
+                        logger.warning(f"Unsupported frequency {freq} for {actual_symbol}, skipping")
                         continue
                         
-                    logger.info(f"Fetching {freq} data for {symbol} from {start_date}")
+                    logger.info(f"Fetching {freq} data for {actual_symbol} from {start_date}")
                     
-                    # Use the full contract symbol for fetching
-                    data = self.fetch_data_since(symbol, interval, unit, start_date)
+                    # Use the actual symbol for fetching
+                    data = self.fetch_data_since(actual_symbol, interval, unit, start_date)
                     
                     if data is not None and not data.empty:
-                        logger.info(f"Retrieved {len(data)} rows of {freq} data for {symbol}")
+                        logger.info(f"Retrieved {len(data)} rows of {freq} data for {actual_symbol}")
                         if force:
                             # In force mode, delete existing data for this symbol and frequency
-                            self.delete_existing_data(symbol, interval, unit)
+                            self.delete_existing_data(actual_symbol, interval, unit)
                         self.save_to_db(data)
                     else:
-                        logger.warning(f"No {freq} data retrieved for {symbol}")
+                        logger.warning(f"No {freq} data retrieved for {actual_symbol}")
                 except Exception as e:
-                    logger.error(f"Error processing {symbol} for {freq}: {str(e)}", exc_info=True)
+                    logger.error(f"Error processing {actual_symbol} for {freq}: {str(e)}", exc_info=True)
                     continue
         except Exception as e:
             logger.error(f"Error processing symbol {symbol}: {str(e)}", exc_info=True)
@@ -911,58 +932,27 @@ class MarketDataFetcher:
         except Exception as e:
             logger.error(f"Error deleting data for {symbol}: {str(e)}")
             
-    def find_symbol_info(self, symbol: str) -> Optional[Dict[str, Any]]:
-        """Find symbol configuration in the YAML config.
+    def _get_symbol_config(self, symbol: str) -> Optional[Dict[str, Any]]:
+        """Get the configuration for a symbol."""
+        # First check if it's a futures contract
+        if len(symbol) == 5 and symbol[0:2] == 'VX':
+            # Get the base futures configuration
+            for future in self.config.get('futures', []):
+                if future.get('base_symbol') == 'VX':
+                    config = future.copy()
+                    config['symbol'] = symbol
+                    return config
         
-        Args:
-            symbol: Symbol to look up (can be base symbol like 'ES' or specific contract like 'ESH20')
-            
-        Returns:
-            Dictionary containing symbol configuration or None if not found
-        """
-        logger.debug(f"Looking up configuration for symbol: {symbol}")
+        # Check indices
+        for index in self.config.get('indices', []):
+            if index.get('symbol') == symbol:
+                return index
         
-        # First check if it's a futures contract (e.g., ESH24, RTYM25)
-        if len(symbol) > 2:
-            # Extract the base symbol (e.g., ES from ESH24)
-            base_symbol = symbol[:2]  # Most futures use 2-character base symbols
-            logger.debug(f"Checking base symbol: {base_symbol}")
-            
-            # Try to find the base symbol in futures config
-            for futures_config in self.config.get('futures', []):
-                if futures_config.get('base_symbol') == base_symbol:
-                    # Create a copy of the config to avoid modifying the original
-                    config_copy = dict(futures_config)
-                    # Add the full symbol to the config
-                    config_copy['symbol'] = symbol
-                    logger.debug(f"Found futures config for {base_symbol}")
-                    return config_copy
-            
-            # If not found, try 3-character base symbols
-            if len(symbol) >= 5:  # Need at least 5 chars for 3-char base + month + year
-                base_symbol = symbol[:3]
-                logger.debug(f"Checking base symbol: {base_symbol}")
-                
-                for futures_config in self.config.get('futures', []):
-                    if futures_config.get('base_symbol') == base_symbol:
-                        config_copy = dict(futures_config)
-                        config_copy['symbol'] = symbol
-                        logger.debug(f"Found futures config for {base_symbol}")
-                        return config_copy
+        # Check equities
+        for equity in self.config.get('equities', []):
+            if equity.get('symbol') == symbol:
+                return equity
         
-        # Then check equities
-        for equity_config in self.config.get('equities', []):
-            if equity_config.get('symbol') == symbol:
-                logger.debug(f"Found equity config for {symbol}")
-                return dict(equity_config)
-                
-        # Finally check futures again for root symbols
-        for futures_config in self.config.get('futures', []):
-            if futures_config.get('base_symbol') == symbol:
-                logger.debug(f"Found futures root config for {symbol}")
-                return dict(futures_config)
-        
-        logger.warning(f"No configuration found for symbol: {symbol}")
         return None
     
     def generate_futures_contracts(self, root_symbol, start_date, end_date=None):
@@ -980,15 +970,21 @@ class MarketDataFetcher:
         # Convert dates to datetime if they're strings
         if isinstance(start_date, str):
             start_date = pd.Timestamp(start_date)
+        elif isinstance(start_date, datetime):
+            start_date = pd.Timestamp(start_date)
+            
         if isinstance(end_date, str):
             end_date = pd.Timestamp(end_date)
+        elif isinstance(end_date, datetime):
+            end_date = pd.Timestamp(end_date)
+            
         if end_date is None:
             end_date = pd.Timestamp.now()
         
         # Ensure dates are timezone-naive for comparison
-        if start_date.tz is not None:
+        if hasattr(start_date, 'tz') and start_date.tz is not None:
             start_date = start_date.tz_localize(None)
-        if end_date.tz is not None:
+        if hasattr(end_date, 'tz') and end_date.tz is not None:
             end_date = end_date.tz_localize(None)
         
         # Get symbol config
@@ -1150,7 +1146,7 @@ class MarketDataFetcher:
                     self.process_symbol(symbol, update_history, force)
                 else:
                     # For base symbols (e.g., ES), generate and process all contracts
-                    symbol_info = self.find_symbol_info(symbol)
+                    symbol_info = self._get_symbol_config(symbol)
                     if not symbol_info:
                         logger.error(f"No configuration found for symbol {symbol}")
                         return
@@ -1190,13 +1186,15 @@ def main():
     """Main function to run the data fetcher."""
     parser = argparse.ArgumentParser(description='Fetch market data from TradeStation')
     parser.add_argument('--symbol', help='Symbol to fetch (e.g., ES or ESH20)')
-    parser.add_argument('--config', help='Path to config file', default=os.path.join(project_root, "config", "market_symbols.yaml"))
+    parser.add_argument('--config', type=str, default=os.path.join(project_root, 'config', 'market_symbols.yaml'),
+                      help='Path to market symbols configuration file')
     parser.add_argument('--updatehistory', action='store_true', help='Update historical data')
     parser.add_argument('--force', action='store_true', help='Force update data')
     parser.add_argument('--interval-value', type=int, default=None, help='Interval value (e.g., 15 for 15-minute data)')
     parser.add_argument('--interval-unit', choices=['minute', 'daily', 'hour'], default=None, help='Interval unit')
     parser.add_argument('--loglevel', choices=['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'],
                       default='INFO', help='Set the logging level')
+    parser.add_argument('--db-path', help='Path to database file', default=None)
     
     args = parser.parse_args()
     
@@ -1204,8 +1202,8 @@ def main():
     logging.getLogger().setLevel(getattr(logging, args.loglevel))
     
     try:
-        # Initialize fetcher with config path
-        fetcher = MarketDataFetcher(config_path=args.config)
+        # Initialize fetcher with config path and db path
+        fetcher = MarketDataFetcher(config_path=args.config, db_path=args.db_path)
         
         # If interval is specified, update the settings in the config
         if args.interval_value is not None and args.interval_unit is not None:

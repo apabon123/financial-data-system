@@ -86,24 +86,31 @@ Example:
 python src/scripts/market_data/force_update_contracts.py --symbols ESH24 ESM24 --interval-value 15 --interval-unit minute
 ```
 
-### generate_continuous_contract.py
+### generate_continuous_futures.py
 
-Generates continuous contracts for futures.
+Generates continuous futures contracts for a given root symbol.
 
 ```bash
-python src/scripts/market_data/generate_continuous_contract.py --symbol SYMBOL --output OUTPUT [options]
+python src/scripts/market_data/generate_continuous_futures.py --root-symbol SYMBOL --config CONFIG_FILE
 ```
 
 Options:
-- `--symbol`: Base symbol (e.g., ES for E-mini S&P 500)
-- `--output`: Output symbol name
-- `--rollover-method`: Rollover method (volume, fixed)
-- `--force`: Force rebuild of existing contract
+- `--root-symbol`: Root symbol (e.g., VX for VIX futures)
+- `--config`: Path to the market symbols configuration file
+
+The script:
+- Generates continuous contracts (c1, c2) for the specified root symbol
+- Handles rollovers based on contract expiry dates
+- Maintains gaps in data when underlying contracts are missing
+- Uses only daily data (interval_value=1, interval_unit='day')
+- Stores results in the continuous_contracts table
 
 Example:
 ```bash
-python src/scripts/market_data/generate_continuous_contract.py --symbol ES --output ES_backadj --rollover-method volume
+python src/scripts/market_data/generate_continuous_futures.py --root-symbol VX --config config/market_symbols.yaml
 ```
+
+This will generate VXc1 and VXc2 continuous contracts, rolling over to the next contract on expiry dates.
 
 ### generate_futures_symbols.py
 
@@ -261,35 +268,3 @@ Checks environment variables.
 ```bash
 python src/scripts/api/check_env_vars.py
 ```
-
-### test_keys.py
-
-Tests API keys.
-
-```bash
-python src/scripts/api/test_keys.py
-```
-
-### debug_api_keys.py
-
-Debugs API key issues.
-
-```bash
-python src/scripts/api/debug_api_keys.py
-```
-
-### update_api_keys.py
-
-Updates API keys.
-
-```bash
-python src/scripts/api/update_api_keys.py
-```
-
-### list_openai_models.py
-
-Lists available OpenAI models.
-
-```bash
-python src/scripts/api/list_openai_models.py
-``` 

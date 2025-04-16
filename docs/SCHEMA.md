@@ -64,6 +64,54 @@
 - updated_at (TIMESTAMP) - Last update time
 - description (VARCHAR) - Description of the setting
 
+### continuous_contracts
+Table for storing generated continuous futures contracts.
+
+```sql
+CREATE TABLE continuous_contracts (
+    date TIMESTAMP,
+    symbol VARCHAR,  -- e.g., VXc1, VXc2 for first and second VX continuous contracts
+    open DOUBLE,
+    high DOUBLE,
+    low DOUBLE,
+    close DOUBLE,
+    volume BIGINT,
+    source VARCHAR DEFAULT 'continuous',
+    interval_value INTEGER DEFAULT 1,
+    interval_unit VARCHAR DEFAULT 'day',
+    adjusted BOOLEAN DEFAULT true,
+    quality INTEGER DEFAULT 100
+)
+```
+
+The continuous_contracts table stores generated continuous futures contracts with the following features:
+- Continuous contract symbols are formed as {root_symbol}c{n} where n is the contract number (e.g., VXc1, VXc2)
+- Data is rolled over to the next contract ON the expiry date of the current contract
+- Gaps in data are preserved when underlying contract data is missing
+- Only daily data is stored (interval_value=1, interval_unit='day')
+- Source is always set to 'continuous' to distinguish from raw contract data
+- Quality is set to 100 for all continuous contract data points
+
+Example usage:
+```sql
+-- Query the first continuous contract for VX
+SELECT date, open, high, low, close, volume
+FROM continuous_contracts
+WHERE symbol = 'VXc1'
+ORDER BY date;
+
+-- Compare first and second continuous contracts
+SELECT c1.date, 
+       c1.close as c1_close,
+       c2.close as c2_close,
+       c2.close - c1.close as spread
+FROM continuous_contracts c1
+JOIN continuous_contracts c2 ON c1.date = c2.date
+WHERE c1.symbol = 'VXc1'
+  AND c2.symbol = 'VXc2'
+ORDER BY c1.date;
+```
+
 ## Relations
 
 ### symbol_tags
@@ -199,3 +247,77 @@ Simple view that returns a distinct list of symbols from the market_data table.
 ## Notes
 
 The complete SQL implementation for all tables, views, and indexes can be found in the `init_schema.sql` file, which should be used for initializing the database in Claude Code.
+
+## Key Features
+
+### Continuous Contracts
+- Multiple continuous contracts can be maintained for the same base symbol (e.g., VXc1, VXc2)
+- Contracts are generated with proper rollover handling on expiry days
+- Data quality and adjustment metadata is preserved
+- Supports various futures contracts including VX (CBOE Volatility Index Futures)
+
+### Data Quality
+- Quality field (0-100) indicates data reliability
+- Source tracking for all data points
+- Adjustment flags for modified data
+
+### Time Management
+- All timestamps stored in UTC
+- Supports multiple time intervals (1-minute, 5-minute, daily, etc.)
+- Proper handling of market holidays and rollovers
+
+## Common Operations
+
+### Generating Continuous Contracts
+```sql
+-- Example: Generate VX continuous contracts
+INSERT INTO continuous_contracts
+SELECT 
+    date,
+    'VXc1' as symbol,
+    open,
+    high,
+    low,
+    close,
+    volume,
+    'continuous' as source,
+    1 as interval_value,
+    'day' as interval_unit,
+    true as adjusted,
+    100 as quality
+FROM daily_bars
+WHERE symbol LIKE 'VX%'
+AND date >= '2024-01-01'
+ORDER BY date;
+```
+
+### Querying Continuous Contracts
+```sql
+-- Get latest data for a continuous contract
+SELECT * FROM continuous_contracts
+WHERE symbol = 'VXc1'
+ORDER BY date DESC
+LIMIT 5;
+```
+
+### Checking Data Coverage
+```sql
+-- Check data availability for continuous contracts
+SELECT 
+    symbol,
+    MIN(date) as earliest_date,
+    MAX(date) as latest_date,
+    COUNT(*) as records
+FROM continuous_contracts
+WHERE symbol LIKE 'VX%'
+GROUP BY symbol
+ORDER BY symbol;
+```
+
+1. The `market_data` table serves as the source of truth for all market data.
+2. Views like `daily_bars` provide convenient access to filtered data.
+3. The `continuous_contracts` table stores derived data generated from raw market data.
+4. Multiple continuous contracts can be maintained simultaneously for analysis.
+5. All timestamps are stored in UTC to avoid timezone issues.
+6. Data quality and source tracking are maintained throughout the system.
+7. Proper rollover handling is implemented for futures contracts.

@@ -260,11 +260,11 @@ class TradeStationMarketDataAgent:
         try:
             client_id = os.getenv('CLIENT_ID')
             client_secret = os.getenv('CLIENT_SECRET')
-            refresh_token = os.getenv('TRADESTATION_REFRESH_TOKEN')
+            refresh_token = os.getenv('REFRESH_TOKEN')
             
             if not all([client_id, client_secret, refresh_token]):
                 logger.error("Missing TradeStation API credentials in environment variables")
-                logger.error("Please set CLIENT_ID, CLIENT_SECRET, and TRADESTATION_REFRESH_TOKEN")
+                logger.error("Please set CLIENT_ID, CLIENT_SECRET, and REFRESH_TOKEN")
                 return False
             
             # API credentials authentication using refresh token

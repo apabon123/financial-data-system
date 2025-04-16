@@ -7,6 +7,7 @@ CREATE TABLE IF NOT EXISTS market_data (
     low DOUBLE,
     close DOUBLE,
     volume BIGINT,
+    open_interest BIGINT,
     up_volume BIGINT,
     down_volume BIGINT,
     source VARCHAR,

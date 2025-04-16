@@ -38,16 +38,21 @@ def cleanup_market_data(db_path='./data/financial_data.duckdb'):
         # Create continuous contracts table
         conn.execute("""
         CREATE TABLE continuous_contracts (
-            timestamp TIMESTAMP,
-            symbol VARCHAR,
-            open DOUBLE,
-            high DOUBLE,
-            low DOUBLE,
-            close DOUBLE,
-            volume BIGINT
+            timestamp TIMESTAMP,      -- Date of the data point
+            symbol VARCHAR,           -- Continuous contract symbol (e.g., VXc1)
+            open DOUBLE,              -- Opening price
+            high DOUBLE,              -- Highest price
+            low DOUBLE,               -- Lowest price
+            close DOUBLE,             -- Closing price
+            volume BIGINT,            -- Trading volume
+            source VARCHAR,           -- Data source ('continuous')
+            interval_value INTEGER,   -- Interval length (e.g., 1)
+            interval_unit VARCHAR,    -- Interval unit (e.g., 'day')
+            adjusted BOOLEAN,         -- Whether the price is adjusted (TRUE for continuous)
+            quality INTEGER           -- Data quality indicator (e.g., 100)
         )
         """)
-        logger.info("Created continuous_contracts table")
+        logger.info("Created continuous_contracts table with updated schema")
         
         conn.close()
         logger.info("Cleanup completed successfully")

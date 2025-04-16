@@ -17,8 +17,8 @@ from datetime import datetime
 project_root = str(Path(__file__).resolve().parent.parent.parent)
 sys.path.insert(0, project_root)
 
-# Import MarketDataFetcher
-from src.scripts.fetch_market_data import MarketDataFetcher
+# Fix import path
+from .fetch_market_data import MarketDataFetcher
 
 # Configure logging
 logging.basicConfig(

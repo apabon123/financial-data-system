@@ -9,7 +9,7 @@ A comprehensive system for managing and analyzing financial data, including mark
 - Account data management
 - Data validation and cleaning
 - Technical analysis and derived indicators
-- Database management with DuckDB
+- Database management with DuckDB ([Database Documentation](docs/DATABASE.md))
 - AI-driven natural language interface for interacting with the system
 - Automated database backup with retention policy
 - Advanced continuous contract generation with multiple rollover methods

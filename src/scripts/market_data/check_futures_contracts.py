@@ -26,14 +26,14 @@ from dotenv import load_dotenv
 import argparse
 
 # Add project root to Python path
-project_root = str(Path(__file__).resolve().parent.parent.parent)
+project_root = str(Path(__file__).resolve().parent.parent.parent.parent)
 sys.path.insert(0, project_root)
 
 # Import MarketDataFetcher
-from src.scripts.fetch_market_data import MarketDataFetcher
+from .fetch_market_data import MarketDataFetcher
 
 # Load environment variables from .env file
-env_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'config', '.env')
+env_path = os.path.join(project_root, '.env')
 load_dotenv(env_path)
 
 # Configure logging

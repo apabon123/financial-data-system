@@ -3,173 +3,119 @@ equities:
     description: SPDR S&P 500 ETF
     exchange: NYSE
     type: ETF
-    frequencies:
-      - 1min
-      - 15min
-      - daily
+    frequencies: [1min, 15min, daily]  # Available data frequencies
   - symbol: QQQ
     description: Invesco QQQ Trust
     exchange: NASDAQ
     type: ETF
-    frequencies:
-      - 1min
-      - 15min
-      - daily
+    frequencies: [1min, 15min, daily]  # Available data frequencies
   - symbol: AAPL
     description: Apple Inc.
     exchange: NASDAQ
     type: Stock
-    frequencies:
-      - daily
+    frequencies: [daily]  # Daily data only
   - symbol: MSFT
     description: Microsoft Corporation
     exchange: NASDAQ
     type: Stock
-    frequencies:
-      - daily
+    frequencies: [daily]  # Daily data only
   - symbol: GS
     description: Goldman Sachs Group Inc.
     exchange: NYSE
     type: Stock
-    frequencies:
-      - daily
+    frequencies: [daily]  # Daily data only
 
 futures:
   - base_symbol: ES
     calendar: US
     description: E-mini S&P 500 Futures
     exchange: CME
-    frequencies:
-      - 1min
-      - 15min
-      - daily
+    frequencies: [1min, 15min, daily]  # Available data frequencies
     historical_contracts:
-      patterns:
-        - H
-        - M
-        - U
-        - Z
-      start_month: 1
-      start_year: 2003
+      patterns: [H, M, U, Z]  # March, June, September, December
+      start_year: 2003  # Year when contract data collection begins
     num_active_contracts: 2
     expiry_rule:
       day_type: friday
       day_number: 3  # Third Friday
       adjust_for_holiday: true
       holiday_calendar: US
-    start_date: '2003-01-01'
+    start_date: '2003-01-01'  # Earliest date for historical data
 
   - base_symbol: NQ
     calendar: US
     description: E-mini NASDAQ-100 Futures
     exchange: CME
-    frequencies:
-      - 1min
-      - 15min
-      - daily
+    frequencies: [1min, 15min, daily]  # Available data frequencies
     historical_contracts:
-      patterns:
-        - H
-        - M
-        - U
-        - Z
-      start_month: 1
-      start_year: 2003
+      patterns: [H, M, U, Z]  # March, June, September, December
+      start_year: 2003  # Year when contract data collection begins
     num_active_contracts: 2
     expiry_rule:
       day_type: friday
       day_number: 3  # Third Friday
       adjust_for_holiday: true
       holiday_calendar: US
-    start_date: '2003-01-01'
+    start_date: '2003-01-01'  # Earliest date for historical data
 
   - base_symbol: CL
     calendar: US
     description: Crude Oil Futures
     exchange: NYMEX
-    frequencies:
-      - 1min
-      - 15min
-      - daily
+    frequencies: [1min, 15min, daily]  # Available data frequencies
     historical_contracts:
-      patterns:
-        - F
-        - G
-        - H
-        - J
-        - K
-        - M
-        - N
-        - Q
-        - U
-        - V
-        - X
-        - Z
-      start_month: 1
-      start_year: 2004
+      patterns: [F, G, H, J, K, M, N, Q, U, V, X, Z]  # All months
+      start_year: 2005  # Year when contract data collection begins
+      start_month: 6  # First month to collect data (June 2005)
     num_active_contracts: 12
     expiry_rule:
       day_type: business_day
       days_before: 3  # Three business days before the 25th
       adjust_for_holiday: true
       holiday_calendar: US
-    start_date: '2004-01-01'
+    start_date: '2005-01-01'  # Earliest date for historical data
 
   - base_symbol: GC
     calendar: US
     description: Gold Futures
     exchange: COMEX
-    frequencies:
-      - 1min
-      - 15min
-      - daily
+    frequencies: [daily]  # Available data frequencies
     historical_contracts:
-      patterns:
-        - G
-        - J
-        - M
-        - Q
-        - V
-        - Z
-      start_month: 1
-      start_year: 2004
+      patterns: [G, J, M, Q, V, Z]  # February, April, June, August, October, December
+      start_year: 2004  # Year when contract data collection begins
     num_active_contracts: 6
     expiry_rule:
       day_type: business_day
       days_before: 3  # Three business days before the last business day
       adjust_for_holiday: true
       holiday_calendar: US
-    start_date: '2004-01-01'
+    start_date: '2004-01-01'  # Earliest date for historical data
 
   - base_symbol: VX
     calendar: US
-    description: VIX Futures
+    description: CBOE Volatility Index Futures
     exchange: CBOE
-    frequencies:
-      - daily
+    frequencies: [15min, daily]  # Daily data only
     historical_contracts:
-      patterns:
-        - F  # February
-        - G  # March
-        - H  # April
-        - J  # May
-        - K  # June
-        - M  # July
-        - N  # August
-        - Q  # September
-        - U  # October
-        - V  # November
-        - X  # December
-        - Z  # January
-      start_month: 1
-      start_year: 2004
+      patterns: [F, G, H, J, K, M, N, Q, U, V, X, Z]  # All months
+      start_year: 2004  # Year when contract data collection begins
     num_active_contracts: 9  # Monthly contracts
     expiry_rule:
       day_type: wednesday
       day_number: 3  # Third Wednesday
       adjust_for_holiday: true
       holiday_calendar: US
-    start_date: '2004-01-01'
+    start_date: '2004-01-01'  # Earliest date for historical data
+
+indices:
+  - symbol: $VIX.X
+    description: CBOE Volatility Index
+    exchange: CBOE
+    type: Index
+    frequencies: [daily]  # Daily data only
+    start_date: '1993-01-29'  # Historical data start date
+    calendar: US  # Trading calendar
+    source: TradeStation  # Data source
 
 settings:
   data_frequencies:
