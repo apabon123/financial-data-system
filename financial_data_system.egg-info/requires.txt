@@ -1,6 +1,0 @@
-pandas
-requests
-pyyaml
-duckdb
-python-dotenv
-python-dateutil

@@ -36,7 +36,7 @@ def load_vix_index(source_file, db_path):
         df['symbol'] = canonical_symbol
         df['source'] = source_name
         df['interval_value'] = 1
-        df['interval_unit'] = 'daily'
+        df['interval_unit'] = 'day'
         df['adjusted'] = False
         df['changed'] = False
         df['volume'] = 0  # Volume not applicable for index

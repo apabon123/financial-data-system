@@ -4,6 +4,20 @@ __pycache__/
 *$py.class
 *.so
 .Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+*.egg-info/
+.installed.cfg
+*.egg
 venv/
 ENV/
 env/
@@ -19,6 +33,7 @@ data/
 .vscode/
 *.swp
 *.swo
+.cursor/
 
 # OS specific
 .DS_Store
@@ -28,3 +43,25 @@ Thumbs.db
 *.log
 logs/
 output/
+
+# Temporary files and directories
+temp/
+tmp/
+.tmpfile*
+.temp*
+
+# Generated plots
+plots/
+figures/
+charts/
+
+# Backups
+backups/
+*.bak
+*.backup
+
+# Task files
+tasks/
+
+# Wrapper scripts
+wrappers/

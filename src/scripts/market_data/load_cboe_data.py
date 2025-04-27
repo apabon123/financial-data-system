@@ -152,7 +152,7 @@ def parse_cboe_file(file_path: str) -> Optional[pd.DataFrame]:
 
         # 4. Add standard columns
         df['interval_value'] = 1
-        df['interval_unit'] = 'day'
+        df['interval_unit'] = 'daily'
         df['source'] = DATA_SOURCE
         df['up_volume'] = None  # CBOE data doesn't provide this
         df['down_volume'] = None  # CBOE data doesn't provide this
@@ -198,7 +198,7 @@ def clean_existing_data(conn: duckdb.DuckDBPyConnection, symbol: str, min_date, 
     WHERE symbol = ?
       AND source = ?
       AND interval_value = 1
-      AND interval_unit = 'day'
+      AND interval_unit = 'daily'
       AND timestamp BETWEEN ? AND ?
     """
     try:

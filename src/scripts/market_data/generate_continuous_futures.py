@@ -36,14 +36,11 @@ def load_config(config_path):
         return None
 
 # --- Database Operations ---
-def connect_db(db_path):
+def connect_db(db_path, read_only=False):
     """Connects to the DuckDB database."""
     try:
-        # Connect read-only unless force deleting
-        # However, the delete function needs write access later.
-        # Let's connect read-write for simplicity, assuming it's needed.
-        conn = duckdb.connect(database=db_path, read_only=False)
-        logger.info(f"Connected to database: {db_path}")
+        conn = duckdb.connect(database=db_path, read_only=read_only)
+        logger.info(f"Connected to database: {db_path} (Read-Only: {read_only})")
         return conn
     except duckdb.Error as e:
         logger.error(f"Error connecting to database {db_path}: {e}")
@@ -88,12 +85,10 @@ def load_roll_calendar(conn, root_symbol):
 def delete_continuous_data(conn, continuous_symbol):
     """Deletes existing data for a continuous contract symbol."""
     try:
-        # Using 'market_data' table based on previous context
-        table_name = 'market_data'
+        # Target the correct table
+        table_name = 'continuous_contracts' # Changed from market_data
         query = f"DELETE FROM {table_name} WHERE symbol = ?"
-        # DuckDB execute often doesn't return rowcount directly
         conn.execute(query, [continuous_symbol])
-        # Assuming auto-commit or handled elsewhere if transaction needed
         logger.info(f"Executed delete for existing entries of {continuous_symbol} from {table_name}.")
     except Exception as e:
         logger.error(f"Error deleting data for {continuous_symbol} from {table_name}: {e}")
@@ -158,8 +153,8 @@ def _get_active_contract_for_date(current_date, contracts, roll_calendar):
     return active_contract
 
 # --- Main Generation Function ---
-def generate_continuous(conn, db_path, root_symbol, contract_config, start_date, end_date, force):
-    """Generates continuous futures contracts (c1, c2, ...)."""
+def generate_continuous(conn, root_symbol, contract_config, start_date, end_date, force):
+    """Generates continuous futures contracts (c1, c2, ...). Assumes conn is a valid DuckDB connection."""
     num_contracts = contract_config.get('num_active_contracts', 1)
     patterns = contract_config.get('historical_contracts', {}).get('patterns', [])
     hist_start_year = contract_config.get('historical_contracts', {}).get('start_year', datetime.strptime(start_date, '%Y-%m-%d').year)
@@ -179,7 +174,7 @@ def generate_continuous(conn, db_path, root_symbol, contract_config, start_date,
     # --- Delete existing data if forced ---
     if force:
         for c_num in range(1, num_contracts + 1):
-            continuous_symbol = f"{root_symbol}c{c_num}"
+            continuous_symbol = f"@{root_symbol}={c_num}01XN"
             logger.info(f"Deleting existing data for {continuous_symbol} due to --force flag.")
             delete_continuous_data(conn, continuous_symbol)
 
@@ -190,16 +185,50 @@ def generate_continuous(conn, db_path, root_symbol, contract_config, start_date,
     # --- Load all relevant underlying contract data into memory ---
     # This avoids querying the database repeatedly inside the loop
     underlying_data = {}
-    # Determine which contracts might be needed based on date range and calendar
+    
+    # --- Optimized contract selection --- #
     contracts_to_load = set()
+    gen_start_dt = pd.to_datetime(start_date)
+    gen_end_dt = pd.to_datetime(end_date)
+    
+    # Find the contract active just before the generation period starts
+    # We need this to correctly identify the c1 contract at the start of the range
+    contract_before_start = None
+    latest_ltd_before_start = pd.Timestamp.min
     for contract_code, last_trading_day in roll_calendar.items():
-        # Load if the contract's last trading day is within or after our range start
-        # And potentially started before our range end (rough filter)
-        contract_year = int(f"20{contract_code[-2:]}")
-        if last_trading_day.year >= hist_start_year and contract_year <= current_year + 1:
-             contracts_to_load.add(contract_code)
+        if last_trading_day < gen_start_dt and last_trading_day > latest_ltd_before_start:
+            latest_ltd_before_start = last_trading_day
+            contract_before_start = contract_code
+    if contract_before_start:
+        contracts_to_load.add(contract_before_start)
+        logger.debug(f"Identified contract active before start date: {contract_before_start}")
+        
+    # Find all contracts whose last trading day is within or slightly after the generation period
+    # Add a buffer (e.g., 3 months) to ensure we have data for c2, c3 etc. near the end date
+    buffer_end_date = gen_end_dt + pd.DateOffset(months=3) 
+    for contract_code, last_trading_day in roll_calendar.items():
+        # Load if the contract expires after our generation period started 
+        # (or includes the contract active just before the start)
+        # AND it expires before a reasonable buffer after our period ends.
+        if last_trading_day >= latest_ltd_before_start and last_trading_day <= buffer_end_date:
+            contracts_to_load.add(contract_code)
+            
+    # Ensure the contract active at the very start date is included if missed
+    start_contract_seq = _get_active_contract_for_date(gen_start_dt, list(roll_calendar.keys()), roll_calendar)
+    if start_contract_seq:
+         contracts_to_load.add(start_contract_seq) # Add the first contract active on start date
 
-    logger.info(f"Attempting to load data for {len(contracts_to_load)} potential underlying contracts...")
+    # --- Fallback if filtering is too aggressive (should be rare) ---
+    if not contracts_to_load:
+        logger.warning("Optimized contract pre-load filtering yielded no results. Falling back to broader load (LTD >= start_date - 3 months). This might happen for very short generation periods.")
+        fallback_start_date = gen_start_dt - pd.DateOffset(months=3) 
+        for contract_code, last_trading_day in roll_calendar.items():
+            if last_trading_day >= fallback_start_date:
+                 contracts_to_load.add(contract_code)
+    # --- End of optimized contract selection ---
+
+    logger.info(f"Attempting to load data for {len(contracts_to_load)} underlying contracts relevant to the period {start_date} - {end_date}...")
+    loaded_count = 0
     for symbol in contracts_to_load:
         # Load data for the entire potential period for each contract
         df_sym = load_market_data(conn, symbol, start_date, end_date) # Adjust range if needed
@@ -208,7 +237,8 @@ def generate_continuous(conn, db_path, root_symbol, contract_config, start_date,
             df_sym['timestamp'] = pd.to_datetime(df_sym['timestamp'])
             # Store Series including settle and source, indexed by timestamp
             underlying_data[symbol] = df_sym.set_index('timestamp')[['settle', 'source']]
-    logger.info(f"Successfully loaded data for {len(underlying_data)} underlying contracts.")
+            loaded_count += 1
+    logger.info(f"Successfully loaded data for {loaded_count} underlying contracts.")
 
     # --- Process Each Date --- #
     results = []
@@ -234,7 +264,9 @@ def generate_continuous(conn, db_path, root_symbol, contract_config, start_date,
 
         # For each continuous contract (c1, c2, ...)
         for c_num, underlying_symbol in enumerate(active_contracts_sequence, 1):
-            continuous_symbol = f"{root_symbol}c{c_num}"
+            # continuous_symbol = f"{root_symbol}c{c_num}" # Old format
+            # Generate symbol like @VX=101XN, @VX=201XN etc. Using 01XN as placeholder suffix for now.
+            continuous_symbol = f"@{root_symbol}={c_num}01XN"
 
             # Get the settlement price and source from the pre-loaded data
             settle_price = None
@@ -244,10 +276,20 @@ def generate_continuous(conn, db_path, root_symbol, contract_config, start_date,
                 try:
                     # Use .loc for potential index lookup
                     row_data = underlying_df.loc[current_dt]
+
+                    # Ensure row_data is a Series (take the first row if it's a DataFrame)
+                    if isinstance(row_data, pd.DataFrame):
+                        if not row_data.empty:
+                            row_data = row_data.iloc[0] # Take the first row for the date
+                        else:
+                            # Handle case where loc returns an empty DataFrame (should be caught by KeyError ideally)
+                            raise KeyError(f"No data found for {current_dt} despite non-empty DataFrame check.")
+
+                    # Now row_data is guaranteed to be a Series (or raised an error)
                     # Check if settle exists and is not NaN before assigning
-                    if pd.notna(row_data['settle']):
+                    if 'settle' in row_data and pd.notna(row_data['settle']): # Check column exists first
                         settle_price = row_data['settle']
-                        source_value = row_data['source'] # Assign source only if settle is valid
+                        source_value = row_data.get('source') # Use .get for robustness
                 except KeyError:
                     # Date not found in this specific underlying contract's data
                     logger.debug(f"Data for {current_dt.strftime('%Y-%m-%d')} not found in pre-loaded data for {underlying_symbol}")
@@ -261,141 +303,123 @@ def generate_continuous(conn, db_path, root_symbol, contract_config, start_date,
                 'settle': settle_price if pd.notna(settle_price) else None,
                 'UnderlyingSymbol': underlying_symbol,
                 'interval_value': 1,
-                'interval_unit': 'day',
-                'source': source_value # Add the retrieved source
+                'interval_unit': 'daily',
+                'source': source_value,
+                'BuiltBy': 'local_generator'
             })
 
-    # --- Write Results to Database --- #
+    # --- Save Results ---
     if results:
-        results_df = pd.DataFrame(results)
+        df_results = pd.DataFrame(results)
+        df_results['timestamp'] = pd.to_datetime(df_results['timestamp'])
+        
+        # Use the passed connection `conn`
         try:
-            # --- Ensure UnderlyingSymbol column exists in market_data ---
-            cursor = conn.cursor()
-            cursor.execute("""
-                SELECT COUNT(*) FROM pragma_table_info('market_data')
-                WHERE name = 'UnderlyingSymbol'
-            """)
-            column_exists = cursor.fetchone()[0] > 0
-            cursor.close()
+            # Target the correct table: continuous_contracts
+            conn.register('results_df', df_results)
+            # Rename columns in DataFrame to match target table
+            df_results = df_results.rename(columns={
+                'Symbol': 'symbol',
+                'UnderlyingSymbol': 'underlying_symbol',
+                'settle': 'settle',
+                'BuiltBy': 'built_by'
+            })
+            
+            # Define columns for insertion
+            # Match these to the columns in continuous_contracts table schema
+            insert_columns = ['timestamp', 'symbol', 'underlying_symbol', 'settle', 'interval_value', 'interval_unit', 'source'] 
+            # Add 'built_by' and other columns if they exist
+            if 'built_by' in df_results.columns and 'built_by' not in insert_columns: insert_columns.append('built_by')
+            # Ensure 'adjusted' is set correctly (likely FALSE if we only have settle)
+            df_results['adjusted'] = False # Assuming not adjusted for now
+            if 'adjusted' not in insert_columns: insert_columns.append('adjusted')
 
-            if not column_exists:
-                logger.info("Column 'UnderlyingSymbol' not found in 'market_data'. Adding column...")
-                conn.execute("ALTER TABLE market_data ADD COLUMN UnderlyingSymbol VARCHAR") # Use VARCHAR or TEXT
-                logger.info("Column 'UnderlyingSymbol' added successfully.")
-            else:
-                logger.info("Column 'UnderlyingSymbol' already exists in 'market_data'.")
+            # Filter DataFrame to only include insert_columns
+            df_insert = df_results[insert_columns]
 
-            # --- Write data ---
-            # Assuming 'market_data' table with columns: timestamp, Symbol, settle, UnderlyingSymbol
-            logger.info(f"Writing {len(results_df)} continuous contract entries to database...")
-            conn.register('results_df_view', results_df)
-            conn.execute(f"""
-                INSERT OR REPLACE INTO market_data (timestamp, Symbol, settle, UnderlyingSymbol, interval_value, interval_unit, source)
-                SELECT timestamp, Symbol, settle, UnderlyingSymbol, interval_value, interval_unit, source FROM results_df_view
-            """)
-            conn.commit() # Necessary for DuckDB when not using autocommit context
-            logger.info("Successfully wrote continuous contract data.")
+            conn.register('insert_view', df_insert)
+
+            insert_columns_str = ", ".join(insert_columns)
+            update_setters_str = ", ".join([f"{col} = excluded.{col}" for col in insert_columns if col not in ['timestamp', 'symbol', 'interval_value', 'interval_unit']])
+            
+            sql = f"""
+                INSERT INTO continuous_contracts ({insert_columns_str})
+                SELECT {insert_columns_str}
+                FROM insert_view
+                ON CONFLICT (timestamp, symbol, interval_value, interval_unit) DO UPDATE SET
+                    {update_setters_str}
+            """
+            conn.execute(sql)
+            conn.unregister('insert_view') # Unregister the final view used
+            conn.unregister('results_df') # Also unregister the original df
+            logger.info(f"Successfully inserted/updated {len(df_insert)} continuous data points into continuous_contracts table.")
         except Exception as e:
-            logger.error(f"Error writing continuous data to database: {e}")
+            logger.error(f"Error saving continuous data to database: {e}")
+            # Ensure unregistration even on error if views were created
+            try:
+                conn.unregister('insert_view')
+            except: pass
+            try:
+                 conn.unregister('results_df')
+            except: pass
     else:
         logger.warning("No continuous contract data generated.")
 
 # --- Main Execution ---
-def main(args_dict=None):
-    effective_args = {}
-    if args_dict is None:
-        # --- Argument Parsing (if run directly) ---
-        parser = argparse.ArgumentParser(description='Generate Continuous Futures Contracts.')
-        parser.add_argument('--db-path', type=str, default=DEFAULT_DB_PATH, help='Path to the DuckDB database file.')
-        parser.add_argument('--config-path', type=str, default=DEFAULT_CONFIG_PATH, help='Path to the market symbols YAML config file.')
-        parser.add_argument('--root-symbol', type=str, required=True, help='Root symbol to generate continuous contracts for (e.g., ES, VX).')
-        parser.add_argument('--start-date', type=str, default=None, help='Start date (YYYY-MM-DD). Defaults to config or earliest data.')
-        parser.add_argument('--end-date', type=str, default=DEFAULT_END_DATE, help='End date (YYYY-MM-DD). Defaults to today.')
-        parser.add_argument('--force', action='store_true', help='Force delete existing data before generating new contracts.')
-        parsed_args = parser.parse_args()
-        # Populate effective_args from parsed command-line args
-        effective_args['db_path'] = parsed_args.db_path
-        effective_args['config_path'] = parsed_args.config_path
-        effective_args['root_symbol'] = parsed_args.root_symbol
-        effective_args['start_date'] = parsed_args.start_date
-        effective_args['end_date'] = parsed_args.end_date
-        effective_args['force'] = parsed_args.force
-        logger.info("Running generate_continuous_futures from command line.")
+def main(args_dict=None, existing_conn=None):
+    """Main function to run generation from CLI or direct call."""
+    if args_dict:
+        # Called directly with arguments
+        args = argparse.Namespace(**args_dict)
+        logger.info("Running generate_continuous_futures from direct call.")
     else:
-        # --- Use Provided Args (if called programmatically) ---
-        logger.info("Running generate_continuous_futures programmatically.")
-        effective_args['db_path'] = args_dict.get('db_path', DEFAULT_DB_PATH)
-        effective_args['config_path'] = args_dict.get('config_path', DEFAULT_CONFIG_PATH)
-        effective_args['root_symbol'] = args_dict.get('root_symbol') # Required, should be in args_dict
-        effective_args['start_date'] = args_dict.get('start_date') # Optional, defaults to None
-        effective_args['end_date'] = args_dict.get('end_date', DEFAULT_END_DATE)
-        effective_args['force'] = args_dict.get('force', False) # Default force to False
+        # Called from command line
+        parser = argparse.ArgumentParser(description='Generate continuous futures contracts.')
+        parser.add_argument('--db-path', default=DEFAULT_DB_PATH, help='Path to DuckDB database')
+        parser.add_argument('--config-path', default=DEFAULT_CONFIG_PATH, help='Path to YAML configuration file')
+        parser.add_argument('--root-symbol', required=True, help='Root symbol (e.g., VX, ES, NQ)')
+        parser.add_argument('--start-date', default=DEFAULT_START_DATE, help='Start date (YYYY-MM-DD)')
+        parser.add_argument('--end-date', default=DEFAULT_END_DATE, help='End date (YYYY-MM-DD)')
+        parser.add_argument('--force', action='store_true', help='Delete existing data before generating')
+        args = parser.parse_args()
+        logger.info("Running generate_continuous_futures from command line.")
+    
+    logger.info(f"Effective args: {vars(args)}")
 
-        # Basic validation for required arg
-        if not effective_args['root_symbol']:
-             logger.error("Root symbol must be provided in args_dict.")
-             sys.exit(1)
-
-
-    # --- Common Logic using effective_args ---
-    logger.info(f"Effective args: {effective_args}")
-
-    # Load configuration
-    config = load_config(effective_args['config_path'])
-
-    # Find the correct contract config within the 'futures' list
-    contract_config = None
-    if config and 'futures' in config:
-        for future_config in config['futures']:
-            if future_config.get('base_symbol') == effective_args['root_symbol']:
-                contract_config = future_config
-                break
-
-    if contract_config is None:
-        logger.error(f"Config for root symbol {effective_args['root_symbol']} not found under 'futures' list in {effective_args['config_path']}.")
+    config = load_config(args.config_path)
+    if config is None:
         sys.exit(1)
 
-    # Determine effective start/end dates (handle None defaults)
-    config_start_date = contract_config.get('start_date', DEFAULT_START_DATE)
-    # Use start_date from effective_args if provided, else use config start_date
-    gen_start_date = effective_args['start_date'] if effective_args['start_date'] else config_start_date
-    gen_end_date = effective_args['end_date'] # Already defaulted
-
-    # Validate dates if needed (basic check)
+    contract_config = next((item for item in config.get('futures', []) if item['base_symbol'] == args.root_symbol), None)
+    if not contract_config:
+        logger.error(f"Configuration for root symbol '{args.root_symbol}' not found in {args.config_path}")
+        sys.exit(1)
+        
+    conn = None # Initialize conn to None
+    close_conn_locally = False # Flag to track if we need to close the connection here
+    
     try:
-        datetime.strptime(gen_start_date, '%Y-%m-%d')
-        datetime.strptime(gen_end_date, '%Y-%m-%d')
-    except ValueError:
-        logger.error("Invalid date format provided. Please use YYYY-MM-DD.")
-        sys.exit(1)
-    except TypeError:
-        logger.error("Date validation failed - check start/end date values.")
-        sys.exit(1)
-
-
-    conn = None # Initialize conn
-    try:
-        conn = connect_db(effective_args['db_path'])
-        logger.info(f"Generating continuous contracts for {effective_args['root_symbol']} from {gen_start_date} to {gen_end_date}")
-        generate_continuous(conn,
-                            effective_args['db_path'],
-                            effective_args['root_symbol'],
-                            contract_config,
-                            gen_start_date,
-                            gen_end_date,
-                            effective_args['force'])
-    except Exception as e:
-        logger.error(f"An error occurred during execution: {e}", exc_info=True)
-        sys.exit(1) # Exit after logging the error
-    finally:
+        if existing_conn:
+            conn = existing_conn
+            logger.info("Using existing database connection.")
+        else:
+            # Need write access for delete and insert/update
+            conn = connect_db(args.db_path, read_only=False) 
+            close_conn_locally = True # We created it, so we should close it
+            
         if conn:
-            try:
-                 if not conn.closed:
-                     conn.close()
-                     logger.info("Database connection closed.")
-            except Exception as close_e:
-                 logger.error(f"Error closing database connection: {close_e}")
-
+            generate_continuous(conn, args.root_symbol, contract_config, args.start_date, args.end_date, args.force)
+            logger.info("Continuous futures generation completed.")
+        else:
+             logger.error("Failed to establish database connection.")
+             sys.exit(1)
+             
+    except Exception as e:
+        logger.error(f"An error occurred during continuous generation: {e}")
+    finally:
+        if conn and close_conn_locally:
+            conn.close()
+            logger.info("Database connection closed.")
 
 # Guard execution for when script is run directly
 if __name__ == "__main__":

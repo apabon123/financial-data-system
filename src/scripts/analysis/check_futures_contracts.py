@@ -30,7 +30,7 @@ project_root = str(Path(__file__).resolve().parent.parent.parent.parent)
 sys.path.insert(0, project_root)
 
 # Import MarketDataFetcher
-from .fetch_market_data import MarketDataFetcher
+from src.scripts.market_data.fetch_market_data import MarketDataFetcher
 
 # Load environment variables from .env file
 env_path = os.path.join(project_root, '.env')
@@ -53,14 +53,12 @@ class FuturesContractAnalyzer:
     def __init__(
         self,
         base_symbol: str,
-        start_year: int = 2004,
         end_year: int = 2025,
         interval_value: int = 1,
         interval_unit: str = "daily"
     ):
         """Initialize the analyzer."""
         self.base_symbol = base_symbol
-        self.start_year = start_year
         self.end_year = end_year
         self.interval_value = interval_value
         self.interval_unit = interval_unit
@@ -68,6 +66,21 @@ class FuturesContractAnalyzer:
         
         # Load configuration
         self.config = self._load_config()
+        
+        # Determine start_year from config['start_date']
+        config_start_date_str = self.config.get('start_date')
+        default_start_year = 2004
+        if config_start_date_str:
+            try:
+                config_start_date = pd.to_datetime(config_start_date_str)
+                self.start_year = config_start_date.year
+                logging.info(f"Using start year {self.start_year} from config file start_date: {config_start_date_str}")
+            except Exception as e:
+                logging.warning(f"Could not parse start_date '{config_start_date_str}' from config: {e}. Defaulting start year to {default_start_year}.")
+                self.start_year = default_start_year
+        else:
+            logging.warning(f"No start_date found in config for {base_symbol}. Defaulting start year to {default_start_year}.")
+            self.start_year = default_start_year
         
         # Initialize fetcher with shared database path
         config_path = os.path.join(project_root, "config", "market_symbols.yaml")
@@ -343,8 +356,7 @@ def main():
     """Main function to analyze futures contracts."""
     parser = argparse.ArgumentParser(description='Analyze futures contracts data')
     parser.add_argument('base_symbol', help='Base symbol (e.g., VX for VIX futures)')
-    parser.add_argument('--start-year', type=int, default=2004, help='Start year for analysis')
-    parser.add_argument('--end-year', type=int, default=2025, help='End year for analysis')
+    parser.add_argument('--end-year', type=int, default=datetime.now().year, help='End year for analysis (defaults to current year)')
     parser.add_argument('--interval-value', type=int, default=1, help='Interval value (e.g., 1 for daily, 15 for 15-minute)')
     parser.add_argument('--interval-unit', default='daily', choices=['daily', 'minute', 'hour'], help='Interval unit (use "daily" for daily data)')
     parser.add_argument('--missing-only', action='store_true', help='Show only missing contracts')
@@ -355,7 +367,6 @@ def main():
     # Create analyzer
     analyzer = FuturesContractAnalyzer(
         base_symbol=args.base_symbol,
-        start_year=args.start_year,
         end_year=args.end_year,
         interval_value=args.interval_value,
         interval_unit=args.interval_unit

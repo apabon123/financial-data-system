@@ -13,27 +13,41 @@ Primary table for storing raw market data.
 
 ```sql
 CREATE TABLE market_data (
-    symbol VARCHAR NOT NULL,
-    timestamp TIMESTAMP NOT NULL,
-    open DOUBLE PRECISION,
-    high DOUBLE PRECISION,
-    low DOUBLE PRECISION,
-    close DOUBLE PRECISION,
-    volume BIGINT,
-    up_volume BIGINT,
-    down_volume BIGINT,
-    source VARCHAR,
+    timestamp TIMESTAMP,
+    symbol VARCHAR,
+    date VARCHAR,            -- Date in YYYY-MM-DD format for compatibility
+    open DOUBLE,
+    high DOUBLE,
+    low DOUBLE,
+    close DOUBLE,
+    settle DOUBLE,           -- Settlement price (especially for futures)
+    volume DOUBLE,
+    open_interest DOUBLE,    -- For futures contracts
+    up_volume DOUBLE,        -- TradeStation specific
+    down_volume DOUBLE,      -- TradeStation specific
     interval_value INTEGER,
     interval_unit VARCHAR,
-    adjusted BOOLEAN,
-    quality VARCHAR,
-    PRIMARY KEY (symbol, timestamp, interval_value, interval_unit)
+    source VARCHAR,
+    changed BOOLEAN DEFAULT FALSE,  -- Flag for indicating changed/filled data
+    adjusted BOOLEAN DEFAULT FALSE, -- Flag for adjusted prices
+    quality INTEGER DEFAULT 100,    -- Quality score for data
+    PRIMARY KEY (timestamp, symbol, interval_value, interval_unit)
 );
 ```
 
-- Used for storing raw market data from various sources
-- Contains data at different intervals (1-minute, 5-minute, daily, etc.)
-- Primary key ensures no duplicate data points
+Key fields:
+- **timestamp**: The exact date and time of the data point
+- **symbol**: Trading symbol (e.g., ES, NQ, VX, $VIX.X)
+- **date**: String representation of the date in YYYY-MM-DD format (for backward compatibility)
+- **open, high, low, close**: Price data
+- **settle**: Settlement price (primarily for futures)
+- **volume**: Trading volume
+- **open_interest**: Number of open contracts (for futures)
+- **up_volume, down_volume**: Volume on up/down ticks (TradeStation specific)
+- **interval_value, interval_unit**: Timeframe specification (e.g., 1 day, 5 minute)
+- **source**: Data source (e.g., 'tradestation', 'CBOE')
+- **changed**: Flag indicating whether the data has been modified/filled
+- **quality**: Data quality score (100 = original source data, lower values for derived/filled data)
 
 ### continuous_contracts
 Stores generated continuous futures contracts.
@@ -146,23 +160,18 @@ View for accessing daily market data.
 ```sql
 CREATE VIEW daily_bars AS
 SELECT 
+    date,
     symbol,
-    timestamp as date,
     open,
     high,
     low,
     close,
     volume,
-    up_volume,
-    down_volume,
-    source,
-    interval_value,
-    interval_unit,
-    adjusted,
-    quality
-FROM market_data
-WHERE interval_value = 1 
-AND interval_unit = 'day';
+    source
+FROM 
+    market_data
+WHERE 
+    interval_unit = 'day' AND interval_value = 1;
 ```
 
 ### weekly_bars

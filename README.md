@@ -14,20 +14,21 @@ This system provides automated tools for:
 ## Key Components
 
 ### Data Download and Update
-- `src/scripts/market_data/update_vx_futures.py`: Downloads VIX futures data from CBOE and updates the database
+- `src/scripts/market_data/vix/update_vx_futures.py`: Downloads VIX futures data from CBOE and updates the database
+- `src/scripts/market_data/vix/update_vix_index.py`: Updates the VIX Index data
 
 ### Continuous Contract Generation
-- `src/scripts/market_data/generate_vix_roll_calendar.py`: Creates a roll calendar for VIX futures
+- `src/scripts/market_data/vix/generate_vix_roll_calendar.py`: Creates a roll calendar for VIX futures
 - `src/scripts/market_data/generate_continuous_futures.py`: Generates continuous contracts based on the roll calendar
 
 ### Data Quality and Cleanup
-- `src/scripts/market_data/fill_vx_continuous_gaps.py`: Fills historical gaps in early continuous data using VIX index
-- `src/scripts/market_data/fill_vx_zero_prices.py`: Fixes zero prices in continuous contracts using interpolation and reference data
+- `src/scripts/market_data/vix/fill_vx_continuous_gaps.py`: Fills historical gaps in early continuous data using VIX index
+- `src/scripts/market_data/vix/fill_vx_zero_prices.py`: Fixes zero prices in continuous contracts using interpolation and reference data
 
 ### Analysis and Verification
-- `src/scripts/market_data/verify_continuous_futures.py`: Verifies continuous contracts against underlying data
-- `src/scripts/analysis/show_vix_continuous_data.py`: Displays VIX and continuous contracts data for analysis
-- `src/scripts/analysis/detect_vx_outliers.py`: Identifies potential outliers in VIX futures data
+- `src/scripts/market_data/improved_verify_continuous.py`: Verifies continuous contracts against underlying data
+- `src/scripts/analysis/vix/show_vix_continuous_data.py`: Displays VIX and continuous contracts data for analysis
+- `src/scripts/analysis/vix/verify_vx_continuous.py`: Verifies VX continuous contracts specifically
 
 ## Database Structure
 
@@ -42,6 +43,44 @@ The system uses DuckDB for data storage with the following key tables:
 ```
 python -m src.scripts.market_data.update_vx_futures
 ```
+
+### Daily Update (Recommended)
+The main script for daily updates is `update_all_market_data.py`. This script handles:
+- Updating VIX Index data
+- Updating VX futures contracts
+- Rebuilding continuous VX continuous contracts for the last ~90 days
+- Optional verification of the data
+
+Basic usage:
+```bash
+# Regular daily update (updates last ~90 days of continuous contracts)
+python src/scripts/market_data/update_all_market_data.py
+
+# With verification
+python src/scripts/market_data/update_all_market_data.py --verify
+
+# Full historical update (rebuilds all continuous contracts from 2004)
+python src/scripts/market_data/update_all_market_data.py --full-update
+```
+
+For automated scheduled updates, run the setup_tasks.bat script:
+```bash
+setup_tasks.bat
+```
+
+This will create two scheduled tasks:
+- VIXUpdate1: Runs daily at 3:50 PM CST
+- VIXUpdate2: Runs daily at 7:00 PM CST
+
+Available options for the update script:
+- `--db-path`: Custom database path (default: data/financial_data.duckdb)
+- `--config-path`: Custom config path (default: config/market_symbols.yaml)
+- `--start-date`: Custom start date for continuous contracts (YYYY-MM-DD)
+- `--end-date`: Custom end date for continuous contracts (YYYY-MM-DD)
+- `--skip-vix`: Skip VIX Index update
+- `--skip-futures`: Skip VX futures update
+- `--skip-continuous`: Skip continuous contracts update
+- `--skip-historical`: Skip historical gap filling
 
 ### Full Regeneration
 ```
@@ -125,14 +164,18 @@ financial-data-system/
 │   ├── database/           # Database modules
 │   ├── scripts/            # Python scripts
 │   │   ├── analysis/       # Data analysis scripts
+│   │   │   └── vix/        # VIX-specific analysis scripts
 │   │   ├── database/       # Database management scripts
 │   │   ├── market_data/    # Market data scripts
+│   │   │   └── vix/        # VIX-specific market data scripts
 │   │   └── utility/        # Utility scripts
 │   ├── tradestation/       # TradeStation API modules
 │   └── utils/              # Utility modules
 ├── sql/                    # SQL queries
+├── tasks/                  # Scheduled task configuration files
 ├── templates/              # Template files
 ├── tests/                  # Test files
+├── wrappers/               # Wrapper scripts for easier command-line use
 ├── .env.template           # Environment variables template
 ├── .gitignore              # Git ignore file
 ├── README.md               # This file
@@ -150,102 +193,3 @@ financial-data-system/
 
 2. Create a virtual environment and activate it:
    ```
-   python -m venv venv
-   source venv/bin/activate  # On Windows: venv\Scripts\activate
-   ```
-
-3. Install the dependencies:
-   ```
-   pip install -r requirements.txt
-   ```
-
-4. Set up your API credentials:
-   ```
-   cp .env.template .env
-   # Edit .env with your API keys
-   ```
-
-## Usage
-
-### Scripts
-
-The system includes numerous scripts for various tasks. For detailed information about all available scripts and their usage, see [SCRIPTS.md](docs/SCRIPTS.md).
-
-### AI Interface
-
-The system provides a natural language interface for interacting with the various tools and agents. You can use it with simple English commands.
-
-To list available tools:
-```
-./scripts/ai --list
-```
-
-### Continuous Contract Generation
-
-The system supports continuous futures contract generation based on configurable expiry rules defined in `config/market_symbols.yaml`. Rollovers occur *on* the expiry date of the front contract.
-
-```bash
-# Generate VXc1 and VXc2 continuous contracts based on config
-python -m src.scripts.market_data.generate_continuous_futures --root-symbol VX --num-contracts 2
-```
-
-Features:
-- Reads expiry rules and other settings from `config/market_symbols.yaml`.
-- Calculates expiry dates based on rules (e.g., VIX rule: Wednesday before the 3rd Friday, adjusted for holidays).
-- Handles rollovers correctly on the calculated expiry date.
-- Stores generated contracts in the `continuous_contracts` table, including the `underlying_symbol` for each data point.
-
-### Continuous Contract Verification
-
-A verification script helps ensure the quality and consistency of the generated continuous contracts.
-
-```bash
-# Verify all VX continuous contracts (VXc1, VXc2, etc.)
-python -m src.scripts.analysis.verify_vx_continuous --symbol-prefix VXc
-```
-
-Checks Performed:
-- **Sunday Data:** Identifies any data points incorrectly recorded on a Sunday.
-- **Price Gaps:** Detects large day-over-day percentage changes in the closing price.
-- **Date Gaps:** Finds missing trading days (excluding weekends and known holidays).
-- **Rollover Consistency:** Compares actual rollover dates against the expected expiry dates.
-
-### Database Backup
-
-The system includes a backup utility to protect your financial data.
-
-#### Manual Backup
-
-```
-python -m src.scripts.database.backup_database
-```
-
-Options:
-- `-d, --database PATH`: Path to the database file (default: ./data/financial_data.duckdb)
-- `-o, --output DIR`: Output directory for backups (default: ./backups)
-- `-r, --retention DAYS`: Number of days to keep backups (default: 30)
-
-## Documentation
-
-Full documentation is available in the `docs/` directory:
-
-- [SCRIPTS.md](docs/SCRIPTS.md): Detailed information about all scripts and their usage
-- [DATABASE.md](docs/DATABASE.md): Database schema and organization
-- [SETUP.md](docs/SETUP.md): Detailed setup instructions
-
-## Recent Changes
-
-- Improved project organization with clear directory structure
-- Updated documentation to reflect current structure and usage
-- Added script for reorganizing project files
-- Added natural language interface for interacting with the system
-- Integrated LLM services for improved command understanding
-- Improved continuous contract generation with configurable rollover logic
-- Enhanced data quality checks and validation
-- Added database backup functionality with retention policy
-- Added price discrepancy detection for continuous contracts
-- Implemented multiple rollover methods for futures contracts
-
-## License
-
-This project is licensed under the MIT License - see the LICENSE file for details. 

@@ -4,6 +4,7 @@ equities:
     exchange: NYSE
     type: ETF
     frequencies: [1min, 15min, daily]  # Available data frequencies
+    start_date: '2001-01-01'  # Historical data start date
   - symbol: QQQ
     description: Invesco QQQ Trust
     exchange: NASDAQ
@@ -27,7 +28,7 @@ equities:
 
 futures:
   - base_symbol: ES
-    calendar: US
+    calendar: CME_Equity
     description: E-mini S&P 500 Futures
     exchange: CME
     frequencies: [1min, 15min, daily]  # Available data frequencies
@@ -39,11 +40,12 @@ futures:
       day_type: friday
       day_number: 3  # Third Friday
       adjust_for_holiday: true
-      holiday_calendar: US
     start_date: '2003-01-01'  # Earliest date for historical data
+    is_continuous: true  # Mark as continuous for verification
+    source: tradestation # Source of the continuous data
 
   - base_symbol: NQ
-    calendar: US
+    calendar: CME_Equity
     description: E-mini NASDAQ-100 Futures
     exchange: CME
     frequencies: [1min, 15min, daily]  # Available data frequencies
@@ -55,11 +57,12 @@ futures:
       day_type: friday
       day_number: 3  # Third Friday
       adjust_for_holiday: true
-      holiday_calendar: US
     start_date: '2003-01-01'  # Earliest date for historical data
+    is_continuous: true  # Mark as continuous for verification
+    source: tradestation # Source of the continuous data
 
   - base_symbol: CL
-    calendar: US
+    calendar: CMEGlobex_CL
     description: Crude Oil Futures
     exchange: NYMEX
     frequencies: [1min, 15min, daily]  # Available data frequencies
@@ -71,12 +74,12 @@ futures:
     expiry_rule:
       day_type: business_day
       days_before: 3  # Three business days before the 25th
+      reference_day: 25
       adjust_for_holiday: true
-      holiday_calendar: US
     start_date: '2005-01-01'  # Earliest date for historical data
 
   - base_symbol: GC
-    calendar: US
+    calendar: CMEGlobex_GC
     description: Gold Futures
     exchange: COMEX
     frequencies: [daily]  # Available data frequencies
@@ -87,12 +90,12 @@ futures:
     expiry_rule:
       day_type: business_day
       days_before: 3  # Three business days before the last business day
+      reference_point: last_business_day
       adjust_for_holiday: true
-      holiday_calendar: US
     start_date: '2004-01-01'  # Earliest date for historical data
 
   - base_symbol: VX
-    calendar: US
+    calendar: CBOE_Futures
     description: CBOE Volatility Index Futures
     exchange: CBOE
     frequencies: [15min, daily]  # Daily data only
@@ -102,10 +105,10 @@ futures:
     num_active_contracts: 9  # Monthly contracts
     expiry_rule:
       day_type: wednesday
-      day_number: 3  # Third Wednesday
-      adjust_for_holiday: true
-      holiday_calendar: US
+      special_rule: VX_expiry
     start_date: '2004-01-01'  # Earliest date for historical data
+    is_continuous: true  # Mark as continuous for verification
+    source: cboe # Source of the underlying data used for generation
 
 indices:
   - symbol: $VIX.X
@@ -114,7 +117,7 @@ indices:
     type: Index
     frequencies: [daily]  # Daily data only
     start_date: '1993-01-29'  # Historical data start date
-    calendar: US  # Trading calendar
+    calendar: CBOE_Futures
     source: TradeStation  # Data source
 
 settings:
@@ -126,36 +129,3 @@ settings:
       name: daily  #Earliest daily data is 2004-03-26
       unit: day
   default_start_date: '2004-03-26'
-  holiday_calendar: NYSE
-  holidays:
-    NYSE:
-      fixed_dates:
-        - '01-01'  # New Year's Day
-        - '06-19'  # Juneteenth
-        - '07-04'  # Independence Day
-        - '12-25'  # Christmas Day
-      relative_dates:
-        - name: "Martin Luther King Jr. Day"
-          month: 1
-          day_type: "monday"
-          occurrence: 3  # Third Monday
-        - name: "Presidents Day"
-          month: 2
-          day_type: "monday"
-          occurrence: 3  # Third Monday
-        - name: "Good Friday"
-          month: 4  # This will be calculated based on Easter
-          day_type: "friday"
-          occurrence: -1  # Last Friday before Easter
-        - name: "Memorial Day"
-          month: 5
-          day_type: "monday"
-          occurrence: -1  # Last Monday
-        - name: "Labor Day"
-          month: 9
-          day_type: "monday"
-          occurrence: 1  # First Monday
-        - name: "Thanksgiving"
-          month: 11
-          day_type: "thursday"
-          occurrence: 4  # Fourth Thursday

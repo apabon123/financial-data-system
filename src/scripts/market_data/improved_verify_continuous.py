@@ -69,8 +69,9 @@ def c(text: str, color: str) -> str:
 def connect_db(db_path):
     """Connects to the DuckDB database."""
     try:
+        # Verification should only read
         conn = duckdb.connect(database=db_path, read_only=True)
-        logger.info(f"Connected to database: {db_path}")
+        logger.info(f"Connected to database: {db_path} (Read-Only)")
         return conn
     except duckdb.Error as e:
         logger.error(f"Error connecting to database {db_path}: {e}")
@@ -160,8 +161,40 @@ def _get_expected_underlying_sequence(current_date, all_contract_codes, roll_cal
 
     return potential_contracts  # The sequence is just the sorted list of contracts active on or after current_date
 
-def verify_data(continuous_data, underlying_settles, underlying_sources, roll_calendar, root_symbol, contract_num):
-    """Performs the verification checks and returns results."""
+def verify_data(conn, continuous_symbol, start_date, end_date):
+    """Performs the verification checks using the provided connection."""
+    
+    # Extract root symbol and contract number
+    match = re.match(r'([A-Z0-9]+)c(\d+)', continuous_symbol)
+    if not match:
+        logger.error(f"Invalid continuous symbol format: {continuous_symbol}")
+        return pd.DataFrame()
+    root_symbol = match.group(1)
+    contract_num = int(match.group(2))
+    
+    logger.info(f"Verifying {continuous_symbol} (Root: {root_symbol}, Number: {contract_num})")
+    
+    # Load data using the provided connection
+    roll_calendar = load_roll_calendar(conn, root_symbol)
+    if not roll_calendar or not roll_calendar[0]:
+        logger.error("Failed to load roll calendar. Cannot verify.")
+        return pd.DataFrame()
+    
+    continuous_data_df = load_continuous_data(conn, continuous_symbol, start_date, end_date)
+    if continuous_data_df.empty:
+        logger.warning(f"No data found for {continuous_symbol} in the specified date range.")
+        return pd.DataFrame()
+        
+    # Identify all unique underlying symbols mentioned in the continuous data
+    actual_underlying_symbols = set(continuous_data_df['UnderlyingSymbol'].dropna().unique())
+    logger.debug(f"Actual underlying symbols found: {actual_underlying_symbols}")
+
+    # Load settlement prices for these symbols
+    underlying_settles, underlying_sources = load_underlying_settles(conn, actual_underlying_symbols, start_date, end_date)
+    
+    # --- The rest of the original verify_data logic starts here ---
+    # (Assuming it now uses the pre-loaded data: continuous_data_df, 
+    # underlying_settles, underlying_sources, roll_calendar)
     verification_results = []
     all_contract_codes = list(roll_calendar[0].keys())  # All codes known to the calendar
     
@@ -169,7 +202,7 @@ def verify_data(continuous_data, underlying_settles, underlying_sources, roll_ca
     last_trading_days, settlement_dates = roll_calendar
     
     # Pre-sort the continuous data to ensure we can detect changes correctly
-    continuous_data = continuous_data.sort_values('timestamp')
+    continuous_data_df = continuous_data_df.sort_values('timestamp')
     
     # To detect changes in underlying symbols, we need to track the previous value
     prev_generator_underlying = None
@@ -183,7 +216,7 @@ def verify_data(continuous_data, underlying_settles, underlying_sources, roll_ca
             settlement_date_to_contract[settlement_date_only] = []
         settlement_date_to_contract[settlement_date_only].append(contract)
 
-    for idx, row in continuous_data.iterrows():
+    for idx, row in continuous_data_df.iterrows():
         current_dt = row['timestamp']
         current_date = current_dt.date()  # Extract date component
         continuous_settle = row['settle']
@@ -449,95 +482,60 @@ def summarize_verification_results(df):
     lines.append("")
     return "\n".join(lines)
 
-# --- Main Execution ---
-def main():
-    parser = argparse.ArgumentParser(description='Enhanced Verification for Continuous Futures Contracts.')
-    parser.add_argument('--symbol', type=str, required=True, help='Continuous contract symbol (e.g., VXc1).')
-    parser.add_argument('--start-date', type=str, required=True, help='Start date (YYYY-MM-DD).')
-    parser.add_argument('--end-date', type=str, required=True, help='End date (YYYY-MM-DD).')
-    parser.add_argument('--db-path', type=str, default=DEFAULT_DB_PATH, help='Path to the DuckDB database file.')
-    parser.add_argument('--no-color', action='store_true', help='Disable colored output.')
-    parser.add_argument('--output-csv', type=str, help='Export results to CSV file.')
-    parser.add_argument('--verbose', action='store_true', help='Show detailed debugging information.')
+def main(args_dict=None, existing_conn=None):
+    """Main execution function."""
+    if args_dict:
+        args = argparse.Namespace(**args_dict)
+        logger.info("Running improved_verify_continuous from direct call.")
+    else:
+        parser = argparse.ArgumentParser(description='Verify continuous futures contracts.')
+        parser.add_argument('--symbol', required=True, help='Continuous contract symbol (e.g., VXc1)')
+        parser.add_argument('--start-date', required=True, help='Start date (YYYY-MM-DD)')
+        parser.add_argument('--end-date', required=True, help='End date (YYYY-MM-DD)')
+        parser.add_argument('--db-path', default=DEFAULT_DB_PATH, help='Path to DuckDB database')
+        parser.add_argument('--no-color', action='store_true', help='Disable color output')
+        args = parser.parse_args()
+        logger.info("Running improved_verify_continuous from command line.")
 
-    args = parser.parse_args()
-    
-    # Set logging level based on verbosity
-    if args.verbose:
-        logger.setLevel(logging.DEBUG)
-    
     # Disable color if requested
     global COLOR_OUTPUT
     if args.no_color:
         COLOR_OUTPUT = False
-
-    # Parse continuous symbol
-    match = re.match(r'^([A-Z]+)c(\d+)$', args.symbol, re.IGNORECASE)
-    if not match:
-        logger.error(f"Invalid continuous symbol format: {args.symbol}. Expected format like 'VXc1'.")
-        sys.exit(1)
-    root_symbol = match.group(1).upper()
-    contract_num = int(match.group(2))
-    logger.info(f"Verifying {args.symbol} (Root: {root_symbol}, Number: {contract_num})")
-
+        
     conn = None
+    close_conn_locally = False
+    
     try:
-        conn = connect_db(args.db_path)
-
-        # Load Roll Calendar
-        roll_calendar = load_roll_calendar(conn, root_symbol)
-        if not roll_calendar[0]:  # Check if the first dictionary is empty
-            logger.error("Failed to load roll calendar. Cannot proceed.")
+        if existing_conn:
+            conn = existing_conn
+            logger.info("Using existing database connection.")
+        else:
+            conn = connect_db(args.db_path) # Connects read-only by default now
+            close_conn_locally = True
+            
+        if not conn:
+            logger.error("Failed to establish database connection.")
             sys.exit(1)
 
-        # Load Continuous Data
-        continuous_data = load_continuous_data(conn, args.symbol, args.start_date, args.end_date)
-        if continuous_data.empty:
-            logger.warning(f"No data found for {args.symbol} in the specified date range.")
-            sys.exit(0)
-
-        # Identify and Load Underlying Data
-        needed_underlying_symbols = set(continuous_data['UnderlyingSymbol'].dropna().unique())
+        # Perform verification using the connection
+        results_df = verify_data(conn, args.symbol, args.start_date, args.end_date)
         
-        # Also add symbols from the calendar that *could* be expected
-        if roll_calendar[0]:  # Check that we have loaded the roll calendar
-            for code, _ in roll_calendar[0].items():  # Only need to check one of the dictionaries
-                try:
-                    # Extract year from contract code (assumes last 2 chars are year)
-                    if len(code) >= 2:
-                        contract_year_str = code[-2:]
-                        contract_year = 2000 + int(contract_year_str)  # Assuming years in 2000s
-                        
-                        # Heuristic to load contracts relevant to the date range (+/- 1 year)
-                        start_year = datetime.strptime(args.start_date, '%Y-%m-%d').year
-                        end_year = datetime.strptime(args.end_date, '%Y-%m-%d').year
-                        if start_year - 1 <= contract_year <= end_year + 1:
-                            needed_underlying_symbols.add(code)
-                except Exception as e:
-                     logger.warning(f"Could not process roll calendar entry {code}: {e}")
-
-        underlying_settles, underlying_sources = load_underlying_settles(conn, needed_underlying_symbols, args.start_date, args.end_date)
-
-        # Perform Verification
-        results_df = verify_data(continuous_data, underlying_settles, underlying_sources, roll_calendar, root_symbol, contract_num)
-
-        # Print formatted results
-        print("\n=== Verification Results ===")
-        print(format_verification_results(results_df))
-        
-        # Print summary
-        print("\n" + summarize_verification_results(results_df))
-        
-        # Export to CSV if requested
-        if args.output_csv:
-            results_df.to_csv(args.output_csv, index=False)
-            logger.info(f"Results exported to {args.output_csv}")
-
+        if not results_df.empty:
+            # Format and display results
+            formatted_output = format_verification_results(results_df)
+            print("\n--- Verification Details ---")
+            print(formatted_output)
+            print("\n" + "=" * 60)
+            
+            # Summarize results
+            summarize_verification_results(results_df)
+        else:
+            logger.info("No verification results to display.")
+            
     except Exception as e:
-        logger.error(f"An unexpected error occurred during verification: {e}", exc_info=True)
-        sys.exit(1)
+        logger.error(f"An error occurred during verification: {e}", exc_info=True)
     finally:
-        if conn:
+        if conn and close_conn_locally:
             conn.close()
             logger.info("Database connection closed.")
 

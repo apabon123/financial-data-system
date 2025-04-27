@@ -135,13 +135,15 @@ ORDER BY COUNT(DISTINCT symbol) DESC;
 
 -- 1.10 Summarize continuous contracts
 -- ------------------------------------------------------------
--- Get metadata for continuous contract symbols
+-- Get metadata for continuous contract symbols, broken down by interval
 SELECT 
     symbol,
-    strftime(MIN(date)::TIMESTAMP, '%Y-%m-%d') as first_date,
-    strftime(MAX(date)::TIMESTAMP, '%Y-%m-%d') as last_date,
+    interval_unit,
+    interval_value,
+    strftime(MIN(timestamp)::TIMESTAMP, '%Y-%m-%d') as first_date,
+    strftime(MAX(timestamp)::TIMESTAMP, '%Y-%m-%d') as last_date,
     COUNT(*) as record_count,
-    DATEDIFF('day', MIN(date)::TIMESTAMP, MAX(date)::TIMESTAMP) as date_range_days
+    DATEDIFF('day', MIN(timestamp)::TIMESTAMP, MAX(timestamp)::TIMESTAMP) as date_range_days
 FROM continuous_contracts
-GROUP BY symbol
-ORDER BY symbol;
+GROUP BY symbol, interval_unit, interval_value
+ORDER BY symbol, interval_unit, interval_value;
