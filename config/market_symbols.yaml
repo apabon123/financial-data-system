@@ -1,131 +1,180 @@
-equities:
-  - symbol: SPY
-    description: SPDR S&P 500 ETF
-    exchange: NYSE
-    type: ETF
-    frequencies: [1min, 15min, daily]  # Available data frequencies
-    start_date: '2001-01-01'  # Historical data start date
-  - symbol: QQQ
-    description: Invesco QQQ Trust
-    exchange: NASDAQ
-    type: ETF
-    frequencies: [1min, 15min, daily]  # Available data frequencies
-  - symbol: AAPL
-    description: Apple Inc.
-    exchange: NASDAQ
-    type: Stock
-    frequencies: [daily]  # Daily data only
-  - symbol: MSFT
-    description: Microsoft Corporation
-    exchange: NASDAQ
-    type: Stock
-    frequencies: [daily]  # Daily data only
-  - symbol: GS
-    description: Goldman Sachs Group Inc.
-    exchange: NYSE
-    type: Stock
-    frequencies: [daily]  # Daily data only
-
-futures:
-  - base_symbol: ES
-    calendar: CME_Equity
-    description: E-mini S&P 500 Futures
-    exchange: CME
-    frequencies: [1min, 15min, daily]  # Available data frequencies
-    historical_contracts:
-      patterns: [H, M, U, Z]  # March, June, September, December
-      start_year: 2003  # Year when contract data collection begins
-    num_active_contracts: 2
-    expiry_rule:
-      day_type: friday
-      day_number: 3  # Third Friday
-      adjust_for_holiday: true
-    start_date: '2003-01-01'  # Earliest date for historical data
-    is_continuous: true  # Mark as continuous for verification
-    source: tradestation # Source of the continuous data
-
-  - base_symbol: NQ
-    calendar: CME_Equity
-    description: E-mini NASDAQ-100 Futures
-    exchange: CME
-    frequencies: [1min, 15min, daily]  # Available data frequencies
-    historical_contracts:
-      patterns: [H, M, U, Z]  # March, June, September, December
-      start_year: 2003  # Year when contract data collection begins
-    num_active_contracts: 2
-    expiry_rule:
-      day_type: friday
-      day_number: 3  # Third Friday
-      adjust_for_holiday: true
-    start_date: '2003-01-01'  # Earliest date for historical data
-    is_continuous: true  # Mark as continuous for verification
-    source: tradestation # Source of the continuous data
-
-  - base_symbol: CL
-    calendar: CMEGlobex_CL
-    description: Crude Oil Futures
-    exchange: NYMEX
-    frequencies: [1min, 15min, daily]  # Available data frequencies
-    historical_contracts:
-      patterns: [F, G, H, J, K, M, N, Q, U, V, X, Z]  # All months
-      start_year: 2005  # Year when contract data collection begins
-      start_month: 6  # First month to collect data (June 2005)
-    num_active_contracts: 12
-    expiry_rule:
-      day_type: business_day
-      days_before: 3  # Three business days before the 25th
-      reference_day: 25
-      adjust_for_holiday: true
-    start_date: '2005-01-01'  # Earliest date for historical data
-
-  - base_symbol: GC
-    calendar: CMEGlobex_GC
-    description: Gold Futures
-    exchange: COMEX
-    frequencies: [daily]  # Available data frequencies
-    historical_contracts:
-      patterns: [G, J, M, Q, V, Z]  # February, April, June, August, October, December
-      start_year: 2004  # Year when contract data collection begins
-    num_active_contracts: 6
-    expiry_rule:
-      day_type: business_day
-      days_before: 3  # Three business days before the last business day
-      reference_point: last_business_day
-      adjust_for_holiday: true
-    start_date: '2004-01-01'  # Earliest date for historical data
-
-  - base_symbol: VX
-    calendar: CBOE_Futures
-    description: CBOE Volatility Index Futures
-    exchange: CBOE
-    frequencies: [15min, daily]  # Daily data only
-    historical_contracts:
-      patterns: [F, G, H, J, K, M, N, Q, U, V, X, Z]  # All months
-      start_year: 2004  # Year when contract data collection begins
-    num_active_contracts: 9  # Monthly contracts
-    expiry_rule:
-      day_type: wednesday
-      special_rule: VX_expiry
-    start_date: '2004-01-01'  # Earliest date for historical data
-    is_continuous: true  # Mark as continuous for verification
-    source: cboe # Source of the underlying data used for generation
+# YAML Configuration for Market Symbols
 
 indices:
   - symbol: $VIX.X
     description: CBOE Volatility Index
     exchange: CBOE
     type: Index
-    frequencies: [daily]  # Daily data only
-    start_date: '1993-01-29'  # Historical data start date
-    calendar: CBOE_Futures
-    source: TradeStation  # Data source
+    default_source: cboe
+    default_raw_table: market_data_cboe
+    frequencies: # Kept as list of dictionaries
+      - name: daily # Uses defaults
+        interval: 1
+        unit: daily
+    start_date: '1993-01-29'
+    calendar: CFE
+
+
+futures:
+  - base_symbol: ES
+    default_source: tradestation
+    default_raw_table: market_data
+    calendar: CME_Equity
+    description: E-mini S&P 500 Futures
+    exchange: CME
+    frequencies: [1min, 15min, daily] # Reverted to simple list
+    historical_contracts:
+      patterns: [H, M, U, Z]
+      start_year: 2003
+    num_active_contracts: 2
+    expiry_rule:
+      day_type: friday
+      day_number: 3
+      adjust_for_holiday: true
+    start_date: '2003-01-01'
+    is_continuous: true
+
+  - base_symbol: NQ
+    default_source: tradestation
+    default_raw_table: market_data
+    calendar: CME_Equity
+    description: E-mini NASDAQ-100 Futures
+    exchange: CME
+    frequencies: [1min, 15min, daily] # Reverted to simple list
+    historical_contracts:
+      patterns: [H, M, U, Z]
+      start_year: 2003
+    num_active_contracts: 2
+    expiry_rule:
+      day_type: friday
+      day_number: 3
+      adjust_for_holiday: true
+    start_date: '2003-01-01'
+    is_continuous: true
+
+  - base_symbol: CL
+    default_source: tradestation
+    default_raw_table: market_data
+    calendar: CMEGlobex_CL
+    description: Crude Oil Futures
+    exchange: NYMEX
+    frequencies: [1min, 15min, daily] # Reverted to simple list
+    historical_contracts:
+      patterns: [F, G, H, J, K, M, N, Q, U, V, X, Z]
+      start_year: 2005
+      start_month: 6
+    num_active_contracts: 12
+    expiry_rule:
+      day_type: business_day
+      days_before: 3
+      reference_day: 25
+      adjust_for_holiday: true
+    start_date: '2005-01-01'
+
+  - base_symbol: GC
+    default_source: tradestation
+    default_raw_table: market_data
+    calendar: CMEGlobex_GC
+    description: Gold Futures
+    exchange: COMEX
+    frequencies: [daily] # Reverted to simple list
+    historical_contracts:
+      patterns: [G, J, M, Q, V, Z]
+      start_year: 2004
+    num_active_contracts: 6
+    expiry_rule:
+      day_type: business_day
+      days_before: 3
+      reference_point: last_business_day
+      adjust_for_holiday: true
+    start_date: '2004-01-01'
+
+  - base_symbol: VX
+    default_source: tradestation
+    default_raw_table: market_data
+    calendar: CFE
+    description: CBOE Volatility Index Futures
+    exchange: CBOE
+    frequencies: # Kept as list of dictionaries due to override
+      - name: daily
+        source: cboe              # Explicit override
+        raw_table: market_data_cboe # Explicit override
+        interval: 1
+        unit: daily
+      - name: 1min               # Uses defaults
+        interval: 1
+        unit: minute
+      - name: 15min              # Uses defaults
+        interval: 15
+        unit: minute
+    historical_contracts:
+      patterns: [F, G, H, J, K, M, N, Q, U, V, X, Z]
+      start_year: 2004
+      exclude_contracts: # Added list of known non-trading contracts
+        - VXF04
+        - VXG04
+        - VXH04
+        - VXJ04
+        - VXZ04
+        - VXJ05
+        - VXN05
+        - VXU05
+    num_active_contracts: 9
+    expiry_rule:
+      day_type: wednesday
+      special_rule: VX_expiry
+    start_date: '2004-01-01'
+    is_continuous: True
+
+
+equities:
+  - symbol: SPY
+    description: SPDR S&P 500 ETF
+    exchange: NYSE
+    calendar: NYSE # Added calendar
+    type: ETF
+    default_source: tradestation
+    default_raw_table: market_data
+    frequencies: [1min, 15min, daily] # Reverted to simple list
+    start_date: '2001-01-01'
+
+  - symbol: QQQ
+    description: Invesco QQQ Trust
+    exchange: NASDAQ
+    calendar: NASDAQ # Added calendar
+    type: ETF
+    default_source: tradestation
+    default_raw_table: market_data
+    frequencies: [1min, 15min, daily] # Reverted to simple list
+    start_date: '2001-01-01'
+
+  - symbol: AAPL
+    description: Apple Inc.
+    exchange: NASDAQ
+    calendar: NASDAQ # Added calendar
+    type: Stock
+    default_source: tradestation
+    default_raw_table: market_data
+    frequencies: [daily] # Reverted to simple list
+    start_date: '2001-01-01'
+
+  - symbol: GS
+    description: Goldman Sachs Group Inc.
+    exchange: NYSE
+    calendar: NYSE # Added calendar
+    type: Stock
+    default_source: tradestation
+    default_raw_table: market_data
+    frequencies: [daily] # Reverted to simple list
+    start_date: '2001-01-01'
+
 
 settings:
   data_frequencies:
-    - interval: 15  #Earliest 15min data is 2010-01-01
+    - interval: 15
       name: 15min
       unit: minute
     - interval: 1
-      name: daily  #Earliest daily data is 2004-03-26
+      name: daily
       unit: day
   default_start_date: '2004-03-26'

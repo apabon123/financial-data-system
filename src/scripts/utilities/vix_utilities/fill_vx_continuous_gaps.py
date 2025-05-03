@@ -16,7 +16,7 @@ import argparse
 
 # --- Configuration ---
 DEFAULT_DB_PATH = "data/financial_data.duckdb"
-TARGET_SYMBOLS = ['VXc1', 'VXc2']
+TARGET_SYMBOLS = [f'@VX={i}01XN' for i in range(1, 3)]
 REFERENCE_SYMBOL = '$VIX.X'
 GAP_START_DATE = '2004-01-01'
 GAP_END_DATE = '2005-12-31'
@@ -45,7 +45,7 @@ def load_data_for_period(conn, symbol, start_date, end_date):
         # Select OHLC and Settle columns
         query = f"""
             SELECT timestamp, open, high, low, settle
-            FROM market_data
+            FROM continuous_contracts
             WHERE symbol = ? AND timestamp BETWEEN ? AND ?
             ORDER BY timestamp
         """
@@ -225,7 +225,7 @@ def main(args_dict=None):
             # Add UnderlyingSymbol if it exists in the table schema
             try:
                  # Quick check if column exists - assumes it does if no error
-                 conn.execute("SELECT UnderlyingSymbol FROM market_data LIMIT 1")
+                 conn.execute("SELECT UnderlyingSymbol FROM continuous_contracts LIMIT 1")
                  df_derived['UnderlyingSymbol'] = None
             except duckdb.CatalogException:
                  logger.debug("UnderlyingSymbol column not found, not adding to derived data.")
@@ -241,14 +241,14 @@ def main(args_dict=None):
             # No return here, let finally handle closing
         else:
             df_to_insert = pd.concat(all_derived_data, ignore_index=True)
-            logger.info(f"Attempting to insert {len(df_to_insert)} derived rows into market_data...")
+            logger.info(f"Attempting to insert {len(df_to_insert)} derived rows into continuous_contracts...")
             try:
                 conn.register('df_derived_view', df_to_insert)
                 cols = df_to_insert.columns
                 col_names_db = ", ".join([f'"{c}"' for c in cols])
                 col_names_view = ", ".join([f'v."{c}"' for c in cols])
                 sql = f"""
-                    INSERT OR REPLACE INTO market_data ({col_names_db})
+                    INSERT INTO continuous_contracts ({col_names_db})
                     SELECT {col_names_view}
                     FROM df_derived_view v
                 """

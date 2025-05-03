@@ -22,6 +22,7 @@ from dotenv import load_dotenv
 from typing import List, Dict, Any, Optional
 import re
 import pandas_market_calendars as mcal
+import io
 
 # Load environment variables
 load_dotenv(os.path.join(os.path.dirname(os.path.dirname(__file__)), 'config', '.env'))
@@ -443,6 +444,177 @@ class MarketDataFetcher:
             ]
             return pd.DataFrame(columns=final_columns) # Return empty DF on error
 
+    def _fetch_cboe_vx_daily(self, symbol: str, interval: int, unit: str, fetch_start_date: pd.Timestamp) -> pd.DataFrame:
+        """Fetch daily VX data directly from CBOE CSV for a specific contract."""
+        self.logger.info(f"Fetching daily data for {symbol} directly from CBOE website.")
+        
+        final_columns = [
+            'timestamp', 'symbol', 'open', 'high', 'low', 'close', 'volume',
+            'settle', 'open_interest',
+            'source', 'interval_value', 'interval_unit',
+            'adjusted', 'quality'
+        ]
+        
+        # 1. Calculate Expiration/Settlement Date to build URL
+        settlement_date = self.calculate_expiration_date(symbol)
+        if not settlement_date:
+            self.logger.error(f"Could not determine settlement date for {symbol} to build CBOE URL. Cannot fetch.")
+            return pd.DataFrame(columns=final_columns)
+
+        # 2. Construct CBOE URL based on settlement date year
+        settlement_year = settlement_date.year
+        settlement_date_str = settlement_date.strftime('%Y-%m-%d')
+        
+        if settlement_year < 2014:
+            # Use archive URL format: https://cdn.cboe.com/resources/futures/archive/volume-and-price/CFE_MYY_VX.csv
+            self.logger.info(f"Settlement year {settlement_year} is before 2014. Using CBOE archive URL format.")
+            # Extract month code and 2-digit year
+            match = re.match(r"([A-Z]{1,2})([FGHJKMNQUVXZ])([0-9]{1,2})$", symbol)
+            if not match:
+                 self.logger.error(f"Could not parse month code/year from symbol {symbol} for archive URL.")
+                 return pd.DataFrame(columns=final_columns)
+            base_symbol, month_code, year_code = match.groups()
+            yy = settlement_date.strftime('%y') # Get 2-digit year
+            # Ensure yy matches the parsed year_code for consistency if needed?
+            # For now, directly use calculated yy and parsed month_code
+            
+            cboe_url = f"https://cdn.cboe.com/resources/futures/archive/volume-and-price/CFE_{month_code}{yy}_VX.csv"
+            # Note: Archive CSV format might differ, parsing below might need adjustment.
+            # Define expected columns for archive files based on observed header
+            archive_expected_cols = ['Trade Date','Futures','Open','High','Low','Close','Settle','Change','Total Volume','EFP','Open Interest']
+            is_archive = True # Flag to use specific parsing args later
+        else:
+            # Use current/recent data URL format: https://cdn.cboe.com/data/us/futures/market_statistics/historical_data/VX/VX_YYYY-MM-DD.csv
+            logger.info(f"Settlement year {settlement_year} is 2014 or later. Using current CBOE data URL format.")
+            # Extract base symbol (e.g., VX from VXU06) - Although usually just VX for these files
+            base_symbol_match = re.match(r"([A-Z]{1,2})", symbol)
+            base_symbol = base_symbol_match.group(1) if base_symbol_match else "VX" # Should generally be VX
+            
+            # Construct the URL using the base symbol and settlement date
+            # Corrected path based on update_vx_futures.py logs
+            cboe_url = f"https://cdn.cboe.com/data/us/futures/market_statistics/historical_data/{base_symbol}/{base_symbol}_{settlement_date_str}.csv"
+            archive_expected_cols = None # Not needed for modern files
+            is_archive = False # Flag
+            
+        self.logger.info(f"Attempting download from CBOE URL: {cboe_url}")
+
+        # 3. Download CSV data
+        try:
+            response = self.session.get(cboe_url, timeout=30) # Use the shared session
+            response.raise_for_status() # Raise HTTPError for bad responses (4xx or 5xx)
+            csv_content = response.text
+            # --- REMOVED DEBUG --- #
+        except requests.exceptions.RequestException as e:
+            self.logger.error(f"Error downloading CBOE data for {symbol} from {cboe_url}: {e}")
+            # Specifically check for 404 Not Found
+            if isinstance(e, requests.exceptions.HTTPError) and e.response.status_code == 404:
+                 self.logger.warning(f"CBOE URL returned 404 (Not Found). Data for {symbol} (settlement {settlement_date_str}) may not be available.")
+            return pd.DataFrame(columns=final_columns)
+        except Exception as e:
+            self.logger.error(f"Unexpected error during CBOE download for {symbol}: {e}")
+            return pd.DataFrame(columns=final_columns)
+
+        # 4. Parse CSV content
+        try:
+            # Use io.StringIO to treat the string as a file
+            csv_file = io.StringIO(csv_content)
+            
+            # --- Dynamically determine header row --- #
+            header_row_index = 0 # Default assumption
+            try:
+                # Peek at the first two lines without consuming the reader
+                line1 = csv_file.readline().strip()
+                line2 = csv_file.readline().strip()
+                csv_file.seek(0) # IMPORTANT: Reset reader to start
+                
+                # Check if line 2 starts like the expected header
+                if line2.startswith('Trade Date'):
+                    header_row_index = 1
+                    logger.debug(f"Detected header on line {header_row_index + 1}. Skipping disclaimer.")
+                elif line1.startswith('Trade Date'):
+                    header_row_index = 0
+                    logger.debug(f"Detected header on line {header_row_index + 1}. No disclaimer found.")
+                else:
+                    logger.warning("Could not detect 'Trade Date' header in first two lines. Assuming header is on line 1.")
+            except Exception as e_peek:
+                 logger.warning(f"Error peeking at header lines: {e_peek}. Assuming header is on line 1.")
+                 csv_file.seek(0) # Ensure reader is reset even on error
+            # ------------------------------------------ #
+
+            # --- MODIFIED: Use specific args for archive files --- #
+            if is_archive:
+                logger.debug(f"Parsing archive file: header={header_row_index}, usecols={archive_expected_cols}")
+                df = pd.read_csv(csv_file, 
+                                 header=header_row_index, # Use determined header row (0 or 1)
+                                 usecols=archive_expected_cols, # Use only expected columns
+                                 on_bad_lines='skip' # Skip rows with too many fields (handles trailing comma)
+                                 )
+            else:
+                 # Default parsing for modern files, skipping potential disclaimer
+                 logger.debug(f"Parsing modern file: skiprows={header_row_index}")
+                 df = pd.read_csv(csv_file, skiprows=header_row_index)
+            # ------------------------------------------------------ #
+
+            # Check if essential columns exist (use a common subset required for our final df)
+            required_csv_cols = ['Trade Date', 'Open', 'High', 'Low', 'Close', 'Total Volume', 'Settle', 'Open Interest']
+            if not all(col in df.columns for col in required_csv_cols):
+                 self.logger.error(f"Downloaded CBOE CSV for {symbol} is missing required columns. Columns found: {df.columns.tolist()}")
+                 return pd.DataFrame(columns=final_columns)
+
+            # 5. Rename and Select Columns
+            df = df.rename(columns={
+                'Trade Date': 'timestamp',
+                'Open': 'open',
+                'High': 'high',
+                'Low': 'low',
+                'Close': 'close',
+                'Total Volume': 'volume',
+                'Settle': 'settle',
+                'Open Interest': 'open_interest'
+            })
+            
+            # Select only the needed columns after renaming
+            # Ensure order matches final_columns as much as possible before adding metadata
+            selected_cols = ['timestamp', 'open', 'high', 'low', 'close', 'volume', 'settle', 'open_interest']
+            df = df[selected_cols]
+            
+            # Convert timestamp and numeric types
+            df['timestamp'] = pd.to_datetime(df['timestamp'])
+            for col in ['open', 'high', 'low', 'close', 'settle', 'volume', 'open_interest']:
+                df[col] = pd.to_numeric(df[col], errors='coerce')
+            df = df.dropna(subset=['open', 'high', 'low', 'close', 'settle', 'timestamp'])
+            df['volume'] = df['volume'].fillna(0).astype('int64')
+            df['open_interest'] = df['open_interest'].fillna(0).astype('int64')
+            
+        except Exception as e:
+            self.logger.error(f"Error parsing CBOE CSV content for {symbol}: {e}", exc_info=True)
+            return pd.DataFrame(columns=final_columns)
+
+        # 6. Add Standard Metadata Columns
+        df['symbol'] = symbol # Use the specific contract symbol
+        df['source'] = 'cboe'
+        df['interval_value'] = interval
+        df['interval_unit'] = unit
+        df['adjusted'] = False
+        df['quality'] = 100 # Assume direct download is high quality
+
+        # 7. Filter by fetch_start_date
+        # Ensure timestamp is naive before comparison
+        if df['timestamp'].dt.tz is not None:
+            df['timestamp'] = df['timestamp'].dt.tz_localize(None)
+        
+        # Ensure fetch_start_date is also naive for comparison
+        naive_fetch_start_date = fetch_start_date
+        if fetch_start_date.tz is not None:
+            naive_fetch_start_date = fetch_start_date.tz_localize(None)
+            
+        df_filtered = df[df['timestamp'] > naive_fetch_start_date].copy()
+        
+        self.logger.info(f"Successfully parsed {len(df)} rows from CBOE CSV for {symbol}. Filtered to {len(df_filtered)} rows after {naive_fetch_start_date.date()}.")
+        
+        # Return in the correct column order
+        return df_filtered[final_columns]
+
     def fetch_data(self, symbol, interval, unit, bars_back=10000, last_date=None):
         """
         Fetch historical market data from TradeStation with input validation.
@@ -517,64 +689,108 @@ class MarketDataFetcher:
             logger.error(f"Max retries reached for {symbol}. Ending fetch process.")
             return all_bars  # Return whatever we have so far
 
-    def save_to_db(self, df: pd.DataFrame) -> None:
-        """Save market data to the database using DuckDB's direct DataFrame insertion.
+    def save_to_db(self, df: pd.DataFrame, table_name: str = "market_data") -> None:
+        """Save market data to the specified database table using DuckDB's direct DataFrame insertion.
            Handles potential conflicts by updating existing rows.
         """
         if df is None or df.empty:
-            self.logger.warning("No data to save to database")
+            self.logger.warning(f"No data to save to database table {table_name}")
             return
 
         try:
-            # Ensure all required columns are present with correct types
-            # Convert timestamp to datetime64[us] which DuckDB handles well
-            df['timestamp'] = pd.to_datetime(df['timestamp']).astype('datetime64[us]')
-            df['symbol'] = df['symbol'].astype(str)
-            df['open'] = df['open'].astype(float)
-            df['high'] = df['high'].astype(float)
-            df['low'] = df['low'].astype(float)
-            df['close'] = df['close'].astype(float)
-            df['volume'] = pd.to_numeric(df['volume'], errors='coerce').fillna(0).astype('int64') # Handle potential NaN
-            df['up_volume'] = df.get('up_volume', 0).fillna(0).astype('int64')
-            df['down_volume'] = df.get('down_volume', 0).fillna(0).astype('int64')
-            df['source'] = df['source'].astype(str)
-            df['interval_value'] = df['interval_value'].astype(int)
-            df['interval_unit'] = df['interval_unit'].astype(str)
-            df['adjusted'] = df.get('adjusted', False).astype(bool)
-            df['quality'] = df.get('quality', 100).astype(int)
+            # --- Define known columns for each target table --- #
+            market_data_cols = [
+                'timestamp', 'symbol', 'open', 'high', 'low', 'close', 'volume',
+                'open_interest', 'up_volume', 'down_volume', 'source',
+                'interval_value', 'interval_unit', 'adjusted', 'quality', 'settle',
+                'changed', 'UnderlyingSymbol'
+            ]
+            market_data_cboe_cols = [
+                'timestamp', 'symbol', 'open', 'high', 'low', 'settle',
+                'interval_value', 'interval_unit', 'source', 'close', 'volume',
+                'open_interest'
+            ]
+            
+            if table_name == "market_data":
+                valid_columns_for_table = market_data_cols
+            elif table_name == "market_data_cboe":
+                valid_columns_for_table = market_data_cboe_cols
+            else:
+                self.logger.error(f"Unknown target table '{table_name}' in save_to_db. Cannot save.")
+                return
+            # ---------------------------------------------------- #
 
-            # Select columns in the exact order of the table to be safe
-            df_to_insert = df[[
-                 'timestamp', 'symbol', 'open', 'high', 'low', 'close', 'volume', 
-                 'up_volume', 'down_volume', 'source', 'interval_value', 'interval_unit',
-                 'adjusted', 'quality'
-            ]]
+            # --- Prepare DataFrame based on TARGET TABLE schema --- #
+            
+            # 1. Identify columns present in the input df AND valid for the target table
+            cols_to_keep = [col for col in df.columns if col in valid_columns_for_table]
+            df_filtered = df[cols_to_keep].copy() # Work with a filtered copy
+
+            # 2. Perform type conversions on the filtered DataFrame
+            # Ensure correct types for columns that exist in df_filtered
+            if 'timestamp' in df_filtered.columns: df_filtered['timestamp'] = pd.to_datetime(df_filtered['timestamp']).astype('datetime64[us]')
+            if 'symbol' in df_filtered.columns: df_filtered['symbol'] = df_filtered['symbol'].astype(str)
+            if 'open' in df_filtered.columns: df_filtered['open'] = df_filtered['open'].astype(float)
+            if 'high' in df_filtered.columns: df_filtered['high'] = df_filtered['high'].astype(float)
+            if 'low' in df_filtered.columns: df_filtered['low'] = df_filtered['low'].astype(float)
+            if 'close' in df_filtered.columns: df_filtered['close'] = df_filtered['close'].astype(float)
+            if 'volume' in df_filtered.columns: df_filtered['volume'] = pd.to_numeric(df_filtered['volume'], errors='coerce').fillna(0).astype('int64')
+            if 'up_volume' in df_filtered.columns: df_filtered['up_volume'] = df_filtered['up_volume'].fillna(0).astype('int64')
+            if 'down_volume' in df_filtered.columns: df_filtered['down_volume'] = df_filtered['down_volume'].fillna(0).astype('int64')
+            if 'source' in df_filtered.columns: df_filtered['source'] = df_filtered['source'].astype(str)
+            if 'interval_value' in df_filtered.columns: df_filtered['interval_value'] = df_filtered['interval_value'].astype(int)
+            if 'interval_unit' in df_filtered.columns: df_filtered['interval_unit'] = df_filtered['interval_unit'].astype(str)
+            if 'adjusted' in df_filtered.columns: df_filtered['adjusted'] = df_filtered.get('adjusted', False).astype(bool)
+            if 'quality' in df_filtered.columns: df_filtered['quality'] = df_filtered.get('quality', 100).astype(int)
+            if 'settle' in df_filtered.columns: df_filtered['settle'] = df_filtered['settle'].astype(float)
+            if 'open_interest' in df_filtered.columns: df_filtered['open_interest'] = df_filtered['open_interest'].fillna(0).astype('int64')
+            # Add conversions for 'changed', 'UnderlyingSymbol' if needed for market_data table?
+            # Assuming they are handled correctly or not critical for now
+
+            # 3. Prepare for Insertion
+            df_to_insert = df_filtered # Use the filtered and type-converted df
+
+            if df_to_insert.empty:
+                 self.logger.warning(f"DataFrame is empty after filtering for target table '{table_name}'. No data to save.")
+                 return
 
             # Use DuckDB's efficient UPSERT capability via temp view registration
-            table_name = "market_data"
             temp_view_name = f"temp_{table_name}_view"
             
             self.conn.register(temp_view_name, df_to_insert)
             
-            sql = f"""
-            INSERT INTO {table_name} (
-                 timestamp, symbol, open, high, low, close, volume,
-                 up_volume, down_volume, source, interval_value, interval_unit,
-                 adjusted, quality 
-            )
-            SELECT * FROM {temp_view_name}
-            ON CONFLICT (timestamp, symbol, interval_value, interval_unit) DO UPDATE SET 
-                open = EXCLUDED.open, 
-                high = EXCLUDED.high, 
-                low = EXCLUDED.low, 
-                close = EXCLUDED.close, 
-                volume = EXCLUDED.volume, 
-                up_volume = EXCLUDED.up_volume, 
-                down_volume = EXCLUDED.down_volume, 
-                source = EXCLUDED.source, 
-                adjusted = EXCLUDED.adjusted, 
-                quality = EXCLUDED.quality
-            """
+            # Dynamically generate column names and EXCLUDED placeholders for UPSERT
+            # Use columns from df_to_insert which are guaranteed to be in the target table
+            column_names_str = ", ".join([f'"{col}"' for col in df_to_insert.columns])
+            select_cols_str = ", ".join([f'"{col}"' for col in df_to_insert.columns])
+            
+            # Define primary key columns based on the target table (assuming same PK structure)
+            pk_columns = ['timestamp', 'symbol', 'interval_value', 'interval_unit']
+            update_setters_list = []
+            for col in df_to_insert.columns:
+                 if col not in pk_columns:
+                     update_setters_list.append(f'"{col}" = EXCLUDED."{col}"')
+            update_setters = ", ".join(update_setters_list)
+            
+            conflict_target = f'({" , ".join([f'"{col}"' for col in pk_columns])})'
+            
+            # Check if there are any columns to update before adding SET clause
+            if not update_setters:
+                 # If only PK columns are inserted, use DO NOTHING
+                 sql = f'''
+                 INSERT INTO "{table_name}" ({column_names_str}) 
+                 SELECT {select_cols_str} FROM {temp_view_name}
+                 ON CONFLICT {conflict_target} DO NOTHING
+                 '''
+                 self.logger.warning(f"Only primary key columns present for upsert into {table_name}. Using ON CONFLICT DO NOTHING.")
+            else:
+                 # Use DO UPDATE SET if there are non-PK columns
+                 sql = f'''
+                 INSERT INTO "{table_name}" ({column_names_str}) 
+                 SELECT {select_cols_str} FROM {temp_view_name}
+                 ON CONFLICT {conflict_target} DO UPDATE SET 
+                     {update_setters}
+                 '''
             
             self.conn.execute(sql)
             self.conn.unregister(temp_view_name) # Clean up the view
@@ -582,7 +798,7 @@ class MarketDataFetcher:
             self.logger.info(f"Successfully upserted {len(df_to_insert)} rows into {table_name}")
 
         except Exception as e:
-            self.logger.error(f"Error saving to database: {str(e)}")
+            self.logger.error(f"Error saving to database table {table_name}: {str(e)}")
             self.conn.rollback()
             import traceback
             traceback.print_exc()
@@ -771,35 +987,57 @@ class MarketDataFetcher:
             if next_month > 12:
                 next_month = 1
                 next_year += 1
-            next_month_start = pd.Timestamp(f'{next_year}-{next_month:02d}-01')
-            search_end_spx = next_month_start + timedelta(days=35)
-            valid_days_spx = calendar.valid_days(start_date=next_month_start.strftime('%Y-%m-%d'),
-                                                 end_date=search_end_spx.strftime('%Y-%m-%d'))
-            next_month_days = valid_days_spx[(valid_days_spx.month == next_month) & (valid_days_spx.year == next_year)]
-            fridays_next_month = next_month_days[next_month_days.weekday == 4]
-            if len(fridays_next_month) >= 3:
-                spx_expiry_friday = fridays_next_month[2]
-                target_date = spx_expiry_friday - timedelta(days=30)
-                potential_expiry = target_date
-                while potential_expiry.weekday() != 2: # Wednesday
-                    potential_expiry -= timedelta(days=1)
-                if calendar.is_session(potential_expiry.strftime('%Y-%m-%d')):
-                     expiry = potential_expiry.normalize()
-                     logger.debug(f"Calculated expiration date for {symbol} (VX Rule): {expiry.date()}")
+            
+            # --- Find the 3rd *Calendar* Friday ---
+            first_day_next_month = pd.Timestamp(f'{next_year}-{next_month:02d}-01')
+            first_friday = first_day_next_month + pd.Timedelta(days=(4 - first_day_next_month.weekday() + 7) % 7)
+            third_calendar_friday = first_friday + pd.Timedelta(days=14)
+            logger.debug(f"[VX Rule Debug] Symbol: {symbol}, 3rd Calendar Friday: {third_calendar_friday.date()}")
+
+            # --- Calculate the Target Wednesday ---
+            target_date = third_calendar_friday - timedelta(days=30)
+            logger.debug(f"[VX Rule Debug] Target Date (3rd Cal Fri - 30d): {target_date.date()}")
+            potential_expiry = target_date
+            while potential_expiry.weekday() != 2: # Wednesday
+                potential_expiry -= timedelta(days=1)
+            logger.debug(f"[VX Rule Debug] Potential Expiry (Prev Wed): {potential_expiry.date()}")
+
+            # --- Get valid trading days around BOTH the 3rd Friday and potential expiry ---
+            check_start = min(potential_expiry, third_calendar_friday) - timedelta(days=10)
+            check_end = max(potential_expiry, third_calendar_friday) + timedelta(days=10)
+            valid_days_for_check = calendar.valid_days(start_date=check_start.strftime('%Y-%m-%d'),
+                                                          end_date=check_end.strftime('%Y-%m-%d'))
+            # Ensure valid_days are naive for comparison
+            if valid_days_for_check.tz is not None:
+                 valid_days_for_check = valid_days_for_check.tz_localize(None)
+                 logger.debug("[VX Rule Debug] Converted valid_days_for_check to timezone-naive.")
+
+            # --- Apply CBOE Holiday Rule ---
+            potential_expiry_normalized = potential_expiry.normalize()
+            third_friday_normalized = third_calendar_friday.normalize()
+
+            is_wednesday_valid = potential_expiry_normalized in valid_days_for_check.values
+            is_friday_valid = third_friday_normalized in valid_days_for_check.values
+            logger.debug(f"[VX Rule Debug] Is Potential Wednesday {potential_expiry_normalized.date()} valid?: {is_wednesday_valid}")
+            logger.debug(f"[VX Rule Debug] Is 3rd Friday {third_friday_normalized.date()} valid?: {is_friday_valid}")
+
+            # If EITHER the Wednesday OR the 3rd Friday is NOT a valid trading day, step back
+            if not is_wednesday_valid or not is_friday_valid:
+                 logger.debug(f"[VX Rule Debug] Applying holiday adjustment. Finding day before {potential_expiry_normalized.date()}.")
+                 # Find the closest previous valid trading day before the calculated Wednesday
+                 previous_valid_days = valid_days_for_check[valid_days_for_check < potential_expiry_normalized]
+                 if not previous_valid_days.empty:
+                     expiry = previous_valid_days[-1].normalize()
+                     logger.debug(f"[VX Rule Debug - Final] Calculated expiration date for {symbol} (VX Rule, adjusted for holiday): {expiry.date()}")
                      return expiry
-                else:
-                     schedule = calendar.schedule(start_date=(potential_expiry - timedelta(days=5)).strftime('%Y-%m-%d'),
-                                                end_date=potential_expiry.strftime('%Y-%m-%d'))
-                     if not schedule.empty:
-                         expiry = schedule.index[-1].normalize()
-                         logger.debug(f"Calculated expiration date for {symbol} (VX Rule, adjusted): {expiry.date()}")
-                         return expiry
-                     else:
-                          logger.warning(f"Could not find previous trading day for VX calculated expiry {potential_expiry.date()} for {symbol}.")
-                          return None
+                 else:
+                      logger.warning(f"[VX Rule Debug] Holiday adjustment needed, but could not find previous trading day before {potential_expiry.date()} for {symbol}.")
+                      return None
             else:
-                logger.warning(f"Could not find 3rd Friday in {next_year}-{next_month} for VX expiry calc for {symbol}. Rule: {rule}")
-                return None
+                 # Both Wednesday and Friday are valid, use the calculated Wednesday
+                 expiry = potential_expiry_normalized
+                 logger.debug(f"[VX Rule Debug - Final] Calculated expiration date for {symbol} (VX Rule, no holiday adjustment): {expiry.date()}")
+                 return expiry
 
         # Fallback if no rule matched
         else:
@@ -807,29 +1045,27 @@ class MarketDataFetcher:
             return None
         # --- End reuse --- 
 
-    def process_symbol(self, symbol: str, update_history: bool = False, force: bool = False) -> None:
+    def process_symbol(self, symbol: str, update_history: bool = False, force: bool = False, interval_value: Optional[int] = None, interval_unit: Optional[str] = None) -> None:
         """Process a single symbol, fetching and storing its data.
         
         Args:
             symbol: The symbol to process (can be equity, index, base future, or specific contract)
             update_history: If True, fetch from start_date in config to current date, skipping existing data
             force: If True, overwrite existing data in the database
+            interval_value: Optional specific interval value to fetch.
+            interval_unit: Optional specific interval unit to fetch.
         """
         try:
             logger.info(f"Processing {symbol}")
             
-            # Find symbol configuration using the updated logic
             symbol_info = self._get_symbol_config(symbol)
             if not symbol_info:
                 logger.error(f"No configuration found for symbol {symbol}")
                 return
                 
-            # Determine the actual symbol to use for API calls and DB storage
-            # If it was a specific contract, use that. Otherwise, use the config symbol.
             actual_symbol = symbol_info.get('specific_contract', symbol_info.get('symbol', symbol))
             logger.debug(f"Found configuration for {symbol}. Actual symbol for fetch/store: {actual_symbol}")
             
-            # Get latest date from DB for the actual symbol
             latest_date = self.get_latest_date_in_db(actual_symbol)
             logger.debug(f"Latest date in DB for {actual_symbol}: {latest_date}")
             
@@ -837,108 +1073,206 @@ class MarketDataFetcher:
             start_date = None
             config_start_date_str = symbol_info.get('start_date', self.start_date.strftime('%Y-%m-%d'))
             config_start_date = pd.Timestamp(config_start_date_str)
-
-            # If it's a specific futures contract, calculate its typical trading start (~9 months before expiry)
             is_specific_contract = 'specific_contract' in symbol_info
             if is_specific_contract:
-                expiry_date = self.calculate_expiration_date(actual_symbol) # Use actual symbol (e.g. ESH25)
+                expiry_date = self.calculate_expiration_date(actual_symbol)
                 logger.debug(f"Calculated expiry date for {actual_symbol}: {expiry_date}")
                 if expiry_date:
-                    # Set a sensible start, e.g., ~9 months before expiry, but not before config start
                     contract_start_calc = expiry_date - timedelta(days=270) 
-                    # Ensure both are naive before comparing
                     start_date = max(contract_start_calc.tz_localize(None), config_start_date)
                     logger.info(f"Calculated fetch start date for specific contract {actual_symbol}: {start_date.date()}")
                 else:
                     logger.warning(f"Could not calculate expiry for {actual_symbol}, using config start date {config_start_date.date()}")
                     start_date = config_start_date
             else:
-                # For base symbols or non-futures, use the config start date
                  start_date = config_start_date
             
             # Adjust start date based on mode and existing data
             if latest_date and not force and not update_history:
-                # Normal mode: fetch only new data since last timestamp in DB
-                fetch_start_date = latest_date # Use the actual last timestamp as the boundary
+                fetch_start_date = latest_date
                 logger.info(f"Found existing data for {actual_symbol}, last timestamp: {latest_date}. Fetching backward to include data since this time.")
             elif update_history:
-                # Update history mode: fetch from the determined start_date to now
                 fetch_start_date = start_date
                 logger.info(f"Update history mode: fetching {actual_symbol} from {fetch_start_date.date()} to current date")
             elif force:
-                 # Force mode: fetch from the determined start_date to now, will overwrite
                  fetch_start_date = start_date
                  logger.info(f"Force mode: overwriting {actual_symbol} data from {fetch_start_date.date()} to current date")
-            else: # No existing data
+            else: 
                  fetch_start_date = start_date
                  logger.info(f"No existing data for {actual_symbol}, fetching from {fetch_start_date.date()} to current date")
             
-            # Ensure fetch_start_date is not in the future
             if fetch_start_date > pd.Timestamp.now():
                  logger.info(f"Fetch start date {fetch_start_date} is in the future. Skipping {actual_symbol}.")
                  return
                  
-            # Get frequencies from symbol_info, defaulting to daily if none specified
-            frequencies = symbol_info.get('frequencies', ['daily'])
-            if not frequencies:
-                frequencies = ['daily']
+            # --- Get Frequencies to Process (Handles simple list and list of dicts) --- #
+            config_frequencies_setting = symbol_info.get('frequencies', [])
+            frequencies_to_process = []
+            # Get symbol-level defaults, falling back to hardcoded script defaults
+            default_source = symbol_info.get('default_source', 'tradestation')
+            default_raw_table = symbol_info.get('default_raw_table', 'market_data')
+
+            # Check if a specific interval was passed via CLI args
+            if interval_value is not None and interval_unit is not None:
+                # --- Handle CLI Override --- #
+                # Standardize unit for matching/name generation
+                cli_unit_standardized = interval_unit
+                if interval_unit == 'day': cli_unit_standardized = 'daily'
                 
-            logger.debug(f"Processing frequencies for {actual_symbol}: {frequencies}")
-            
-            # Fetch data for each frequency
-            for freq_name in frequencies:
-                try:
-                    # Map frequency name to interval and unit
-                    interval = None
-                    unit = None
-                    if freq_name == 'daily':
-                        interval = 1
-                        unit = 'daily'
-                    elif freq_name.endswith('min'):
-                         try:
-                             interval = int(freq_name[:-3])
-                             unit = 'minute'
-                         except ValueError:
-                             logger.warning(f"Could not parse interval from frequency '{freq_name}' for {actual_symbol}, skipping")
-                             continue
-                    # Add other frequency mappings if needed (e.g., 'weekly', 'monthly')
-                    else:
-                        logger.warning(f"Unsupported frequency '{freq_name}' for {actual_symbol}, skipping")
-                        continue
-                        
-                    logger.info(f"Fetching {freq_name} ({interval} {unit}) data for {actual_symbol} from {fetch_start_date}")
+                freq_name = f"{interval_value}{cli_unit_standardized}" # Basic name
+                if cli_unit_standardized == 'daily': freq_name = 'daily'
+                elif cli_unit_standardized == 'minute': freq_name = f"{interval_value}min"
+                
+                source = default_source # Start with default
+                target_table = default_raw_table # Start with default
+                
+                # Check if config_frequencies is list of dicts to find specific override
+                if isinstance(config_frequencies_setting, list) and config_frequencies_setting and isinstance(config_frequencies_setting[0], dict):
+                    for freq_dict in config_frequencies_setting:
+                        if freq_dict.get('interval') == interval_value and freq_dict.get('unit') == cli_unit_standardized:
+                            source = freq_dict.get('source', default_source) # Use specific, fallback to default
+                            target_table = freq_dict.get('raw_table', default_raw_table) # Use specific, fallback to default
+                            freq_name = freq_dict.get('name', freq_name) # Use configured name if available
+                            logger.info(f"Found matching frequency config for CLI args: Name='{freq_name}', Source='{source}', Table='{target_table}'")
+                            break # Found match
+                    else: # If loop completes without break
+                         logger.warning(f"CLI interval {interval_value} {cli_unit_standardized} not explicitly in config dict for {actual_symbol}. Using symbol defaults: Source='{source}', Table='{target_table}'")
+                else:
+                    logger.warning(f"Frequencies for {actual_symbol} not a list of dicts. Using symbol defaults for CLI args: Source='{source}', Table='{target_table}'")
                     
-                    # Use the actual symbol for fetching
-                    data = self.fetch_data_since(actual_symbol, interval, unit, start_date=fetch_start_date)
+                frequencies_to_process.append({
+                    'name': freq_name,
+                    'interval': interval_value,
+                    'unit': cli_unit_standardized,
+                    'source': source,
+                    'raw_table': target_table # Pass the determined table
+                })
+                logger.info(f"Processing ONLY specific interval from command line: {freq_name}")
+                
+            # --- Handle Config Frequencies (No CLI override) --- #
+            elif isinstance(config_frequencies_setting, list):
+                if not config_frequencies_setting: # Handle empty list
+                     logger.warning(f"No frequencies defined in config for {actual_symbol}. Nothing to process.")
+                
+                elif isinstance(config_frequencies_setting[0], str): # Check if it's the simple list format
+                    logger.debug(f"Processing simple frequency list for {actual_symbol} using defaults (Source: {default_source}, Table: {default_raw_table})")
+                    for freq_name_str in config_frequencies_setting:
+                        interval, unit = None, None
+                        # Parse interval/unit from string
+                        if freq_name_str == 'daily':
+                            interval, unit = 1, 'daily'
+                        elif freq_name_str.endswith('min'):
+                            try:
+                                interval = int(freq_name_str[:-3])
+                                unit = 'minute'
+                            except ValueError:
+                                logger.warning(f"Could not parse interval from legacy frequency '{freq_name_str}', skipping.")
+                                continue
+                        # Add more parsing logic here if other string formats are used (e.g., '1hour')
+                        
+                        if interval is not None and unit is not None:
+                            frequencies_to_process.append({
+                                'name': freq_name_str,
+                                'interval': interval,
+                                'unit': unit,
+                                'source': default_source, # Use symbol default
+                                'raw_table': default_raw_table # Use symbol default
+                            })
+                        else:
+                            logger.warning(f"Could not parse frequency string '{freq_name_str}', skipping.")
+                            
+                elif isinstance(config_frequencies_setting[0], dict): # Check if it's the list of dictionaries format
+                    logger.debug(f"Processing frequency list of dictionaries for {actual_symbol}")
+                    for freq_dict in config_frequencies_setting:
+                        # Validate required keys
+                        if not all(k in freq_dict for k in ('name', 'interval', 'unit')):
+                            logger.warning(f"Skipping frequency dict due to missing keys: {freq_dict}")
+                            continue
+                        
+                        # Get source and raw_table, falling back to defaults
+                        source = freq_dict.get('source', default_source)
+                        raw_table = freq_dict.get('raw_table', default_raw_table)
+                        
+                        frequencies_to_process.append({
+                            'name': freq_dict['name'],
+                            'interval': freq_dict['interval'],
+                            'unit': freq_dict['unit'],
+                            'source': source,
+                            'raw_table': raw_table
+                        })
+                else:
+                     logger.error(f"Invalid format for 'frequencies' in config for {actual_symbol}: {config_frequencies_setting}")
+            else:
+                 logger.error(f"Invalid type for 'frequencies' in config for {actual_symbol}: {type(config_frequencies_setting)}")
+            # -------------------------------------------------------------------------- #
+            
+            # --- Process Each Determined Frequency --- #
+            logger.info(f"Starting fetch loop for {len(frequencies_to_process)} frequencies for {actual_symbol}")
+            for freq_info in frequencies_to_process:
+                try:
+                    # --- Get frequency details (already resolved with defaults) --- #
+                    freq_name = freq_info['name']
+                    interval = freq_info['interval']
+                    unit = freq_info['unit']
+                    source = freq_info['source']
+                    target_table = freq_info['raw_table'] # Use the resolved raw_table
+                    # ------------------------------------------------------------------ #
+
+                    logger.info(f"Fetching {freq_name} ({interval} {unit}) data for {actual_symbol} from {source} (start: {fetch_start_date}) -> Target Table: {target_table}")
+                    
+                    data = None # Initialize data DataFrame
+                    # --- Source-specific Fetching --- #
+                    if source == 'cboe':
+                        # --- MODIFIED: Call direct CBOE download for daily ---
+                        if unit == 'daily':
+                            data = self._fetch_cboe_vx_daily(actual_symbol, interval, unit, fetch_start_date)
+                        else:
+                            # Handle non-daily CBOE sources if they ever exist
+                            logger.error(f"Fetching non-daily data from CBOE source is not currently supported for {actual_symbol} ({interval} {unit}). Skipping.")
+                            continue # Skip this frequency
+                    elif source == 'tradestation':
+                        # Check TradeStation authentication before attempting fetch
+                        if not self.ts_agent.access_token:
+                             if not self.ts_agent.authenticate(): # Try to authenticate if needed
+                                 logger.error("Failed to authenticate with TradeStation API for tradestation source. Skipping.")
+                                 continue
+                             
+                        data = self.fetch_data_since(actual_symbol, interval, unit, start_date=fetch_start_date)
+                    else:
+                        logger.error(f"Unsupported source '{source}' defined for {actual_symbol} frequency {freq_name}. Skipping.")
+                        continue # Skip this frequency
+                    # -------------------------------- #
                     
                     if data is not None and not data.empty:
-                        logger.info(f"Retrieved {len(data)} rows of {freq_name} data for {actual_symbol}")
+                        # Overwrite the 'source' column in the dataframe with the correct source from config
+                        data['source'] = source 
+                        logger.info(f"Retrieved {len(data)} rows of {freq_name} data for {actual_symbol} from {source}")
+                        
                         if force:
-                            # In force mode, delete existing data for this symbol and frequency
-                            logger.info(f"Force mode: Deleting existing {freq_name} data for {actual_symbol}")
-                            self.delete_existing_data(actual_symbol, interval, unit)
-                        self.save_to_db(data)
+                            logger.info(f"Force mode: Deleting existing {freq_name} data for {actual_symbol} from {target_table}")
+                            self.delete_existing_data(actual_symbol, interval, unit, target_table)
+                        # Pass target_table to save_to_db
+                        self.save_to_db(data, target_table)
                     else:
-                        logger.warning(f"No new {freq_name} data retrieved for {actual_symbol} from {fetch_start_date}")
+                        logger.warning(f"No new {freq_name} data retrieved for {actual_symbol} from {source} starting {fetch_start_date}")
                 except Exception as e:
                     logger.error(f"Error processing {actual_symbol} for frequency {freq_name}: {str(e)}", exc_info=True)
                     continue # Continue to next frequency
         except Exception as e:
             logger.error(f"General error processing symbol {symbol}: {str(e)}", exc_info=True)
-            # Decide whether to raise or just log and continue with other symbols
-            # raise # Uncomment to stop execution on error for a symbol
 
-    def delete_existing_data(self, symbol: str, interval: int, unit: str) -> None:
-        """Delete existing data for a symbol and frequency from the database.
+    def delete_existing_data(self, symbol: str, interval: int, unit: str, table_name: str = "market_data") -> None:
+        """Delete existing data for a symbol and frequency from the specified database table.
         
         Args:
             symbol: The symbol to delete data for
             interval: The interval value
             unit: The interval unit
+            table_name: The table to delete from (defaults to market_data)
         """
         try:
             query = f"""
-            DELETE FROM market_data 
+            DELETE FROM "{table_name}" 
             WHERE symbol = ? 
             AND interval_value = ? 
             AND interval_unit = ?
@@ -1070,6 +1404,9 @@ class MarketDataFetcher:
         hist_contracts_config = symbol_config.get('historical_contracts', {})
         month_patterns = hist_contracts_config.get('patterns', [])
         start_year_config = hist_contracts_config.get('start_year', datetime.now().year - 10) # Default to 10 years back
+        # --- ADDED: Get exclusion list --- #
+        exclude_list = set(hist_contracts_config.get('exclude_contracts', []))
+        # --------------------------------- #
         num_active_contracts = symbol_config.get('num_active_contracts', 3) # Default to 3 active contracts
         # Assuming cycle_type from patterns (quarterly if H,M,U,Z, monthly otherwise)
         cycle_type = 'quarterly' if set(month_patterns) == {'H', 'M', 'U', 'Z'} else 'monthly' 
@@ -1098,27 +1435,34 @@ class MarketDataFetcher:
                 contract_month = month_map.get(month_code)
                 if not contract_month: continue
                 
+                # --- ADDED: Create symbol and check exclusion list --- #
+                contract_symbol = f"{root_symbol}{month_code}{yr_code}"
+                if contract_symbol in exclude_list:
+                    logger.debug(f"Skipping excluded contract: {contract_symbol}")
+                    continue # Skip this contract
+                # ---------------------------------------------------- #
+
                 # Estimate expiry date to check if contract is relevant
-                expiry_estimate = self.calculate_expiration_date(f"{root_symbol}{month_code}{yr_code}")
+                expiry_estimate = self.calculate_expiration_date(contract_symbol)
                 
                 if expiry_estimate:
                     # Include contracts whose expiry is after our overall start_date
                     # and whose potential *start* (e.g., expiry - 9mo) is before our overall end_date
                     potential_start = expiry_estimate - timedelta(days=270) # Approx 9 months
                     if expiry_estimate >= start_date and potential_start <= end_date:
-                         contracts.add(f"{root_symbol}{month_code}{yr_code}")
+                         contracts.add(contract_symbol)
                 else:
                     # If expiry calculation fails, maybe still include based on year/month range? Risky.
-                    logger.warning(f"Could not estimate expiry for {root_symbol}{month_code}{yr_code}, including based on year/month.")
+                    logger.warning(f"Could not estimate expiry for {contract_symbol}, including based on year/month.")
                     # Crude check: include if the contract month is within range
                     contract_date_est = pd.Timestamp(f'{year}-{contract_month:02d}-01')
                     if contract_date_est >= start_date and contract_date_est <= end_date + pd.DateOffset(months=num_active_contracts*2):
-                        contracts.add(f"{root_symbol}{month_code}{yr_code}")
+                        contracts.add(contract_symbol)
 
         logger.info(f"Generated {len(contracts)} potential contracts for {root_symbol} between {start_date.date()} and {end_date.date()}")
         return sorted(list(contracts))
 
-    def run(self, symbol=None, update_history=False, force=False):
+    def run(self, symbol=None, update_history=False, force=False, interval_value: Optional[int] = None, interval_unit: Optional[str] = None):
         """
         Run the data fetcher for all symbols in the config or a specific symbol.
         
@@ -1126,6 +1470,8 @@ class MarketDataFetcher:
             symbol: Optional symbol to process (if None, process all symbols)
             update_history: If True, fetch from start_date in config to current date
             force: If True, overwrite existing data in the database
+            interval_value: Optional specific interval value to fetch.
+            interval_unit: Optional specific interval unit to fetch.
         """
         try:
             # Connect to TradeStation
@@ -1134,32 +1480,36 @@ class MarketDataFetcher:
                 return
                 
             if symbol:
-                # Process the single specified symbol (could be base, index, equity, or specific contract)
-                self.process_symbol(symbol, update_history, force)
+                # Process the single specified symbol, passing interval args
+                self.process_symbol(symbol, update_history, force, interval_value, interval_unit)
             else:
                 # Process all symbols from config
+                # If specific intervals are given, warn that it only applies if a single symbol is specified
+                if interval_value is not None or interval_unit is not None:
+                     logger.warning("Interval arguments (--interval-value, --interval-unit) are ignored when processing all symbols (no --symbol specified).")
+                     
                 logger.info("Processing all symbols defined in the configuration...")
                 processed_symbols = set()
                 
-                # Process equities
+                # Process equities (without passing intervals)
                 for equity in self.config.get('equities', []):
                     sym = equity['symbol']
                     if sym not in processed_symbols:
                         self.process_symbol(sym, update_history, force)
                         processed_symbols.add(sym)
                     
-                # Process indices
+                # Process indices (without passing intervals)
                 for index in self.config.get('indices', []):
                     sym = index['symbol']
                     if sym not in processed_symbols:
                         self.process_symbol(sym, update_history, force)
                         processed_symbols.add(sym)
                         
-                # Process futures (by generating contracts for each base symbol)
+                # Process futures (without passing intervals)
                 for future_config in self.config.get('futures', []):
                     base_symbol = future_config['base_symbol']
                     if base_symbol in processed_symbols:
-                        continue # Skip if base symbol was processed individually
+                        continue 
                         
                     logger.info(f"--- Processing base future: {base_symbol} ---")
                     # Determine start date for contract generation
@@ -1177,6 +1527,7 @@ class MarketDataFetcher:
                     
                     for contract in contracts_to_process:
                          if contract not in processed_symbols:
+                            # Process specific contract without interval override
                             self.process_symbol(contract, update_history, force)
                             processed_symbols.add(contract)
                          else:
@@ -1188,7 +1539,6 @@ class MarketDataFetcher:
                 
         except Exception as e:
             logger.error(f"Error running data fetcher: {e}", exc_info=True)
-            # Decide whether to raise or let main handle
             raise 
         finally:
              # Ensure DB connection is closed
@@ -1222,8 +1572,8 @@ def main():
         # Initialize fetcher with config path and db path
         fetcher = MarketDataFetcher(config_path=args.config, db_path=args.db_path)
         
-        # Run the fetcher
-        fetcher.run(args.symbol, args.updatehistory, args.force)
+        # Pass interval args to run method
+        fetcher.run(args.symbol, args.updatehistory, args.force, args.interval_value, args.interval_unit)
         
     except Exception as e:
         logger.error(f"Critical error in main execution: {e}", exc_info=True)

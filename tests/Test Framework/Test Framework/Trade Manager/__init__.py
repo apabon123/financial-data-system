@@ -1,0 +1,1 @@
+# This file makes the Trade Manager directory a Python package 

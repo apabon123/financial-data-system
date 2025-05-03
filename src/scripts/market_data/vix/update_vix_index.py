@@ -22,6 +22,7 @@ logger = logging.getLogger(__name__)
 DEFAULT_DB_PATH = "data/financial_data.duckdb"
 VIX_INDEX_URL = "https://cdn.cboe.com/api/global/us_indices/daily_prices/VIX_History.csv"
 VIX_INDEX_SYMBOL = "$VIX.X"
+TARGET_TABLE_VIX = "market_data_cboe" # Target the CBOE specific table
 
 # --- Database Operations ---
 def connect_db(db_path):
@@ -58,7 +59,7 @@ def download_vix_index_data():
 
 # --- Data Preparation & DB Update ---
 def prepare_vix_index_data_for_db(df: pd.DataFrame):
-    """Prepares the downloaded VIX index DataFrame for insertion into market_data."""
+    """Prepares the downloaded VIX index DataFrame for insertion into the target table."""
     required_cols_in = ['DATE', 'OPEN', 'HIGH', 'LOW', 'CLOSE']
     if not all(col in df.columns for col in required_cols_in):
         logger.error(f"VIX index data missing one or more required columns: {required_cols_in}")
@@ -105,13 +106,14 @@ def prepare_vix_index_data_for_db(df: pd.DataFrame):
         return pd.DataFrame()
 
 def update_market_data(conn, df_insert: pd.DataFrame):
-    """Updates the market_data table using INSERT OR REPLACE."""
+    """Updates the target table using INSERT OR REPLACE."""
     if df_insert.empty:
         logger.info("No valid data prepared for database update.")
         return
 
     symbol_code = df_insert['symbol'].iloc[0] # Get symbol for logging
-    logger.info(f"Attempting to INSERT OR REPLACE {len(df_insert)} rows for {symbol_code}...")
+    target_table = TARGET_TABLE_VIX
+    logger.info(f"Attempting to INSERT OR REPLACE {len(df_insert)} rows for {symbol_code} into {target_table}...")
     try:
         conn.register('df_insert_view', df_insert)
         # Construct column list dynamically from the DataFrame
@@ -121,17 +123,17 @@ def update_market_data(conn, df_insert: pd.DataFrame):
 
         # Use INSERT OR REPLACE INTO ... SELECT ... FROM view
         sql = f"""
-            INSERT OR REPLACE INTO market_data ({col_names_db})
+            INSERT OR REPLACE INTO {target_table} ({col_names_db})
             SELECT {col_names_df} FROM df_insert_view
         """
         conn.execute(sql)
         conn.commit() # Commit changes
-        logger.info(f"Successfully updated database for {symbol_code}.")
+        logger.info(f"Successfully updated {target_table} for {symbol_code}.")
     except duckdb.Error as e:
-        logger.error(f"Database error updating data for {symbol_code}: {e}")
+        logger.error(f"Database error updating data for {symbol_code} in {target_table}: {e}")
         conn.rollback() # Rollback on error
     except Exception as e:
-        logger.error(f"Unexpected error updating database for {symbol_code}: {e}")
+        logger.error(f"Unexpected error updating database for {symbol_code} in {target_table}: {e}")
         conn.rollback()
 
 # --- Main Execution ---

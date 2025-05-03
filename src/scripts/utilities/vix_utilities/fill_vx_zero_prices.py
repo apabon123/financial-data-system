@@ -20,7 +20,7 @@ import argparse
 
 # --- Configuration ---
 DEFAULT_DB_PATH = "data/financial_data.duckdb"
-TARGET_SYMBOLS = ['VXc1', 'VXc2', 'VXc3', 'VXc4', 'VXc5']
+TARGET_SYMBOLS = [f'@VX={i}01XN' for i in range(1, 6)]
 REFERENCE_SYMBOL = '$VIX.X'  
 FILL_START_DATE = '2004-01-01'
 FILL_END_DATE = '2007-12-31'
@@ -49,7 +49,7 @@ def load_data_for_period(conn, symbol, start_date, end_date):
     try:
         query = f"""
             SELECT timestamp, open, high, low, close, settle
-            FROM market_data
+            FROM continuous_contracts
             WHERE symbol = ? AND timestamp BETWEEN ? AND ?
             ORDER BY timestamp
         """
@@ -67,7 +67,7 @@ def load_data_for_period(conn, symbol, start_date, end_date):
 
 def load_all_vx_data(conn, start_date, end_date):
     """Loads data for all VX continuous contracts and VIX for the period."""
-    symbols = TARGET_SYMBOLS + ['VXc1', REFERENCE_SYMBOL]
+    symbols = TARGET_SYMBOLS + [TARGET_SYMBOLS[0], REFERENCE_SYMBOL]
     data_dict = {}
     for symbol in symbols:
         data_dict[symbol] = load_data_for_period(conn, symbol, start_date, end_date)
@@ -91,7 +91,7 @@ def is_market_holiday(conn, date):
     """
     query = f"""
     SELECT COUNT(*) as data_count
-    FROM market_data
+    FROM continuous_contracts
     WHERE timestamp::DATE = '{date.strftime('%Y-%m-%d')}'
       AND settle IS NOT NULL
       AND settle != 0.0
@@ -234,12 +234,16 @@ def fill_from_other_contracts(data_dict, zero_rows_idx, symbol):
         return filled_data
     
     # Get the positions of the target symbol in the contract hierarchy
-    target_position = int(symbol.replace('VXc', ''))
+    try:
+        target_position = int(symbol.split('=')[1][0])
+    except (IndexError, ValueError):
+        logger.error(f"Could not determine target position from symbol: {symbol}")
+        return filled_data
     
     # Loop through each zero timestamp
     for idx in zero_rows_idx:
         # For VXc1, we'll use VIX data directly with a ratio
-        if symbol == 'VXc1':
+        if symbol == TARGET_SYMBOLS[0]:
             if idx in data_dict[REFERENCE_SYMBOL].index and not np.isclose(data_dict[REFERENCE_SYMBOL].loc[idx, 'settle'], 0.0):
                 # Calculate the ratio between VXc1 and VIX
                 vix_ratio = None
@@ -273,13 +277,13 @@ def fill_from_other_contracts(data_dict, zero_rows_idx, symbol):
                     filled_data[idx]['values']['close'] = filled_data[idx]['values']['settle']
             
         # For VXc2-VXc5, first try to use VXc1 if it's not zero
-        elif idx in data_dict['VXc1'].index and not np.isclose(data_dict['VXc1'].loc[idx, 'settle'], 0.0):
+        elif idx in data_dict[TARGET_SYMBOLS[0]].index and not np.isclose(data_dict[TARGET_SYMBOLS[0]].loc[idx, 'settle'], 0.0):
             # Use the VXc1 data with a ratio
             vxc1_ratio = None
             
             # First try to use calculated ratio if we have one
             ratio_to_vxc1 = calculate_ratio_to_vxc1(
-                data_dict['VXc1'], 
+                data_dict[TARGET_SYMBOLS[0]],
                 data_dict[symbol],
                 RATIO_CALC_DAYS
             )
@@ -295,8 +299,8 @@ def fill_from_other_contracts(data_dict, zero_rows_idx, symbol):
             
             # Calculate all price fields based on the ratio
             for field in ['open', 'high', 'low', 'close', 'settle']:
-                if field in data_dict['VXc1'].columns and not np.isclose(data_dict['VXc1'].loc[idx, field], 0.0):
-                    value = data_dict['VXc1'].loc[idx, field] * vxc1_ratio
+                if field in data_dict[TARGET_SYMBOLS[0]].columns and not np.isclose(data_dict[TARGET_SYMBOLS[0]].loc[idx, field], 0.0):
+                    value = data_dict[TARGET_SYMBOLS[0]].loc[idx, field] * vxc1_ratio
                     if idx not in filled_data:
                         filled_data[idx] = {'method': method, 'values': {}}
                     filled_data[idx]['values'][field] = value
@@ -448,7 +452,7 @@ def main(args_dict=None):
                     'volume': None,
                     'open_interest': None,
                     'interval_value': 1,
-                    'interval_unit': 'day',
+                    'interval_unit': 'daily',
                     'source': f"{DERIVED_SOURCE_TAG}_INTERP",
                     'changed': True,
                     'adjusted': False,
@@ -470,7 +474,7 @@ def main(args_dict=None):
                     'volume': None,
                     'open_interest': None,
                     'interval_value': 1,
-                    'interval_unit': 'day',
+                    'interval_unit': 'daily',
                     'source': f"{DERIVED_SOURCE_TAG}_{fill_info['method'].upper()}",
                     'changed': True,
                     'adjusted': False,
@@ -488,12 +492,12 @@ def main(args_dict=None):
             logger.info("No derived data generated. Nothing to insert.")
         else:
             df_to_insert = pd.concat(all_derived_data, ignore_index=True)
-            logger.info(f"Attempting to insert {len(df_to_insert)} derived rows into market_data...")
+            logger.info(f"Attempting to insert {len(df_to_insert)} derived rows into continuous_contracts...")
             
             try:
                 # Check if UnderlyingSymbol column exists
                 try:
-                    conn.execute("SELECT UnderlyingSymbol FROM market_data LIMIT 1")
+                    conn.execute("SELECT UnderlyingSymbol FROM continuous_contracts LIMIT 1")
                     df_to_insert['UnderlyingSymbol'] = None
                 except Exception:
                     logger.debug("UnderlyingSymbol column not found, not adding to derived data.")
@@ -504,9 +508,20 @@ def main(args_dict=None):
                 col_names_view = ", ".join([f'v."{c}"' for c in cols])
                 
                 sql = f"""
-                    INSERT OR REPLACE INTO market_data ({col_names_db})
+                    INSERT INTO continuous_contracts ({col_names_db})
                     SELECT {col_names_view}
                     FROM df_derived_view v
+                    ON CONFLICT (timestamp, symbol, interval_value, interval_unit)
+                    DO UPDATE SET
+                        open = excluded.open,
+                        high = excluded.high,
+                        low = excluded.low,
+                        close = excluded.close,
+                        settle = excluded.settle,
+                        volume = excluded.volume,
+                        open_interest = excluded.open_interest,
+                        source = excluded.source,
+                        changed = excluded.changed
                 """
                 logger.debug(f"Executing INSERT OR REPLACE SQL: {sql}")
                 conn.execute(sql)

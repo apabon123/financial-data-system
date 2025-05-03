@@ -1,3 +1,11 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+"""
+Analyzes dates where VIX data exists but continuous futures contracts data is missing.
+Helps identify patterns in missing data, such as holidays or specific time periods.
+"""
+
 import duckdb
 import pandas as pd
 import argparse
@@ -6,55 +14,131 @@ import calendar
 from tabulate import tabulate
 
 def load_vix_data(db_path, start_date, end_date):
-    """Load VIX and VX continuous contract data from the database."""
-    # Connect to the database
-    conn = duckdb.connect(db_path, read_only=True)
+    """Load VIX from market_data_cboe and VX continuous contracts from continuous_contracts."""
+    conn = None
+    try:
+        conn = duckdb.connect(db_path, read_only=True)
+        
+        # --- Load Continuous Contracts --- 
+        continuous_symbols = [f'@VX={i}01XN' for i in range(1, 6)]
+        symbols_in_clause = ", ".join([f"'{s}'" for s in continuous_symbols])
+        query_vx = f"""
+            SELECT 
+                timestamp AS date,
+                symbol,
+                settle,
+                source
+            FROM continuous_contracts
+            WHERE symbol IN ({symbols_in_clause})
+            AND timestamp >= ? AND timestamp <= ?
+            ORDER BY timestamp, symbol
+        """
+        vx_df = conn.execute(query_vx, [start_date, end_date]).fetchdf()
+        
+        # --- Load VIX Data --- 
+        query_vix = f"""
+            SELECT 
+                timestamp AS date,
+                settle, -- Use settle for VIX price
+                source
+            FROM market_data_cboe
+            WHERE symbol = '$VIX.X'
+            AND interval_unit = 'daily' -- Ensure we get daily VIX
+            AND timestamp >= ? AND timestamp <= ?
+            ORDER BY timestamp
+        """
+        vix_df = conn.execute(query_vix, [start_date, end_date]).fetchdf()
+
+    except Exception as e:
+        print(f"Error loading data: {e}")
+        return pd.DataFrame() # Return empty df on error
+    finally:
+        if conn:
+            conn.close()
+
+    # --- Prepare VIX Data --- 
+    if not vix_df.empty:
+        vix_df['date'] = pd.to_datetime(vix_df['date'])
+        vix_df = vix_df.rename(columns={'settle': 'VIX', 'source': 'VIX_Source'})
+        vix_df = vix_df.set_index('date')
+    else:
+        print("Warning: No VIX data loaded.")
+        vix_df = pd.DataFrame(columns=['VIX', 'VIX_Source']) # Create empty df with expected columns
+
+    # --- Prepare and Pivot VX Data ---
+    if not vx_df.empty:
+        vx_df['date'] = pd.to_datetime(vx_df['date'])
+        # Pivot to get contracts as columns, keep source info separate for now
+        vx_pivot_settle = vx_df.pivot(index='date', columns='symbol', values='settle')
+        vx_pivot_source = vx_df.pivot(index='date', columns='symbol', values='source')
+        vx_pivot_source.columns = [f'{{col}}_source' for col in vx_pivot_source.columns] # Rename source columns
+        # Combine settle and source pivots
+        vx_pivot = pd.concat([vx_pivot_settle, vx_pivot_source], axis=1)
+    else:
+        print("Warning: No VX continuous contract data loaded.")
+        vx_pivot = pd.DataFrame()
+
+    # --- Merge VIX and VX data --- 
+    # Use an outer join to keep all dates from both
+    if not vix_df.empty and not vx_pivot.empty:
+        # Ensure both have datetime index before joining
+        vix_df.index = pd.to_datetime(vix_df.index)
+        vx_pivot.index = pd.to_datetime(vx_pivot.index)
+        result_df = vix_df.join(vx_pivot, how='outer')
+    elif not vix_df.empty:
+        result_df = vix_df
+        result_df.index = pd.to_datetime(result_df.index) # Ensure index is datetime
+    elif not vx_pivot.empty:
+        result_df = vx_pivot
+        result_df.index = pd.to_datetime(result_df.index) # Ensure index is datetime
+    else:
+        result_df = pd.DataFrame()
+        
+    # Reset index to make date a column ONLY if the DataFrame is not empty
+    if not result_df.empty:
+        result_df = result_df.reset_index().rename(columns={'date': 'Date'}) # Use 'date' from index name
+    else:
+        # If empty, ensure it has a Date column for downstream compatibility
+        result_df = pd.DataFrame(columns=['Date']) 
+
+    # --- Ensure all expected columns exist --- 
+    # Define continuous symbols and their source columns
+    continuous_symbols = [f'@VX={i}01XN' for i in range(1, 6)]
+    expected_vx_cols = continuous_symbols + [f'{s}_source' for s in continuous_symbols]
+    expected_cols = ['Date', 'VIX', 'VIX_Source'] + expected_vx_cols
+
+    # Add missing columns, filling with NaN for data cols and 'N/A' for source cols
+    for col in expected_cols:
+        if col not in result_df.columns:
+            if col.endswith('_source'):
+                result_df[col] = 'N/A' # Fill missing source columns
+            elif col != 'Date': # Don't overwrite Date if it exists
+                 result_df[col] = pd.NA # Fill missing data columns (use pd.NA for consistency)
+            elif 'Date' not in result_df.columns: # Ensure Date column if absolutely missing
+                 result_df['Date'] = pd.NaT 
+
+    # Ensure correct column order (optional but good practice)
+    # Filter expected_cols to only those actually present in result_df to avoid errors
+    present_expected_cols = [col for col in expected_cols if col in result_df.columns]
+    result_df = result_df[present_expected_cols] 
+
+    # --- Fill Missing Source Columns (redundant now but keep for safety) ---
+    # Define continuous symbols again for this scope
+    continuous_symbols = [f'@VX={i}01XN' for i in range(1, 6)]
     
-    # Query to get the data for all symbols
-    query = f"""
-    SELECT 
-        timestamp AS date,
-        symbol,
-        settle,
-        source
-    FROM market_data
-    WHERE symbol IN ('$VIX.X', 'VXc1', 'VXc2', 'VXc3', 'VXc4', 'VXc5')
-    AND timestamp >= '{start_date}'
-    AND timestamp <= '{end_date}'
-    ORDER BY timestamp, symbol
-    """
-    
-    # Execute the query
-    df = conn.execute(query).fetchdf()
-    
-    # Close the connection
-    conn.close()
-    
-    # Pivot the data to wide format
-    pivot_df = df.pivot(index=['date'], columns='symbol', values=['settle', 'source'])
-    
-    # Flatten the multi-level columns
-    pivot_df.columns = [f"{col[1]}_{col[0]}" if col[0] == 'source' else col[1] for col in pivot_df.columns]
-    
-    # Reset index to make date a column
-    result_df = pivot_df.reset_index()
-    
-    # Create a combined source column for each symbol
-    for symbol in ['$VIX.X', 'VXc1', 'VXc2', 'VXc3', 'VXc4', 'VXc5']:
-        col_name = f"{symbol}_source"
+    # Fill NaN source columns that might have been created or missing
+    for symbol in continuous_symbols:
+        col_name = f"{{symbol}}_source"
         if col_name in result_df.columns:
             result_df[col_name] = result_df[col_name].fillna('N/A')
-    
-    # Rename columns for clarity
-    rename_dict = {
-        'date': 'Date',
-        '$VIX.X': 'VIX',
-        '$VIX.X_source': 'VIX_Source'
-    }
-    
-    # Don't rename VXcN columns as they're already named correctly
-    result_df = result_df.rename(columns=rename_dict)
-    
+        else: # Add column if it wasn't created 
+             result_df[col_name] = 'N/A'
+             
+    if 'VIX_Source' in result_df.columns:
+         result_df['VIX_Source'] = result_df['VIX_Source'].fillna('N/A')
+    elif 'Date' in result_df.columns: # Add VIX_Source only if Date exists
+         result_df['VIX_Source'] = 'N/A'
+
     return result_df
 
 def categorize_missing_data(df):
@@ -62,8 +146,8 @@ def categorize_missing_data(df):
     # Convert Date to datetime for easier manipulation
     df['Date'] = pd.to_datetime(df['Date'])
     
-    # Define continuous contracts to check
-    contracts = ['VXc1', 'VXc2', 'VXc3', 'VXc4', 'VXc5']
+    # Define continuous contracts to check - Use the new format
+    contracts = [f'@VX={i}01XN' for i in range(1, 6)]
     
     # Initialize dictionary to hold missing data frames
     missing_data = {}
@@ -169,12 +253,12 @@ def main():
     print(f"\nAnalysis from {args.start_date} to {args.end_date}")
     print(f"Total dates analyzed: {len(df)}")
     
-    # Check available contracts in data
-    available_contracts = [col for col in ['VXc1', 'VXc2', 'VXc3', 'VXc4', 'VXc5'] if col in df.columns]
-    print(f"Available contracts in data: {', '.join(available_contracts)}")
+    # Check available contracts in data - Use new format
+    available_contracts_in_df = [col for col in [f'@VX={i}01XN' for i in range(1, 6)] if col in df.columns]
+    print(f"Available contracts in data: {', '.join(available_contracts_in_df)}")
     
     # Display missing data for each contract
-    for contract in available_contracts:
+    for contract in available_contracts_in_df:
         if contract in missing_data:
             missing_df = missing_data[contract]
             print(f"\nDates where VIX exists but {contract} is missing: {len(missing_df)}")
@@ -199,43 +283,34 @@ def main():
                 contract = key.split("_by_holiday")[0]
                 print(f"\n{contract} Missing by Holiday:")
                 print(value)
-        
+            
         for key, value in patterns.items():
             if "_by_weekday" in key:
                 contract = key.split("_by_weekday")[0]
                 print(f"\n{contract} Missing by Weekday:")
                 print(value)
+            
+        for key, value in patterns.items():
+            if "_by_month" in key:
+                contract = key.split("_by_month")[0]
+                print(f"\n{contract} Missing by Month:")
+                print(value)
     
-    # Output to CSV if specified
+    # Save to CSV if output path specified
     if args.output:
-        # Combine results from all contracts
-        all_missing = pd.DataFrame()
-        
+        # Create a single DataFrame with all missing data
+        all_missing = []
         for contract, missing_df in missing_data.items():
             if not missing_df.empty:
-                missing_df['Missing_Contract'] = contract
-                all_missing = pd.concat([all_missing, missing_df])
+                missing_df['Contract'] = contract
+                all_missing.append(missing_df)
         
-        if not all_missing.empty:
-            all_missing.to_csv(args.output, index=False)
-            print(f"\nResults saved to {args.output}")
-    
-    # Separate missing data by pre-2006 and post-2005
-    print("\n--- Analysis of Missing Data by Time Period ---")
-    for contract, missing_df in missing_data.items():
-        if not missing_df.empty:
-            try:
-                missing_df['Year'] = missing_df['Year'].astype(int)
-                pre_2006 = missing_df[missing_df['Year'] < 2006]
-                post_2005 = missing_df[missing_df['Year'] >= 2006]
-                print(f"\n{contract} missing pre-2006: {len(pre_2006)} dates")
-                print(f"{contract} missing post-2005: {len(post_2005)} dates")
-            except:
-                print(f"\nCould not analyze {contract} by year")
+        if all_missing:
+            combined_df = pd.concat(all_missing, ignore_index=True)
+            combined_df.to_csv(args.output, index=False)
+            print(f"\nMissing data saved to {args.output}")
+        else:
+            print("\nNo missing data to save.")
 
 if __name__ == "__main__":
-    try:
-        main()
-    except Exception as e:
-        print(f"Error: {e}")
-        print("Please install required libraries: pip install duckdb pandas tabulate") 
+    main() 

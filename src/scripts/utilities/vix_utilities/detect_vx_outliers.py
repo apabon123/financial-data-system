@@ -12,14 +12,19 @@ def load_vx_data(db_path, start_date, end_date):
     conn = duckdb.connect(db_path, read_only=True)
     
     # Query to get the data for all symbols
+    # Define symbols using the new format
+    continuous_symbols = [f'@VX={i}01XN' for i in range(1, 6)]
+    # Add $VIX.X to the list of symbols to query
+    symbols_to_query = continuous_symbols + ['$VIX.X']
+    symbols_in_clause = ", ".join([f"'{s}'" for s in symbols_to_query])
     query = f"""
     SELECT 
         timestamp AS date,
         symbol,
         settle,
         source
-    FROM market_data
-    WHERE symbol IN ('$VIX.X', 'VXc1', 'VXc2', 'VXc3', 'VXc4', 'VXc5')
+    FROM continuous_contracts
+    WHERE symbol IN ({symbols_in_clause})
     AND timestamp >= '{start_date}'
     AND timestamp <= '{end_date}'
     ORDER BY timestamp, symbol
@@ -41,19 +46,20 @@ def load_vx_data(db_path, start_date, end_date):
     result_df = pivot_df.reset_index()
     
     # Create a combined source column for each symbol
-    for symbol in ['$VIX.X', 'VXc1', 'VXc2', 'VXc3', 'VXc4', 'VXc5']:
+    # Use the symbols_to_query list for iteration
+    for symbol in symbols_to_query:
         col_name = f"{symbol}_source"
         if col_name in result_df.columns:
             result_df[col_name] = result_df[col_name].fillna('N/A')
     
     # Rename columns for clarity
+    # Keep the VIX renaming, but the VXc renaming is no longer needed
+    # as the columns will be named @VX=101XN etc.
     rename_dict = {
         'date': 'Date',
         '$VIX.X': 'VIX',
         '$VIX.X_source': 'VIX_Source'
     }
-    
-    # Don't rename VXcN columns as they're already named correctly
     result_df = result_df.rename(columns=rename_dict)
     
     return result_df
@@ -84,13 +90,14 @@ def detect_outliers(df, methods=None, zscore_threshold=4.0, iqr_multiplier=3.0, 
     # Sort by date
     df = df.sort_values('Date')
     
-    # Contracts to check
-    contracts = [col for col in ['VXc1', 'VXc2', 'VXc3', 'VXc4', 'VXc5'] if col in df.columns]
+    # Contracts to check - Use the new format
+    contracts = [f'@VX={{i}}01XN' for i in range(1, 6)]
+    contracts_in_df = [col for col in contracts if col in df.columns]
     
     # Store outliers
     outliers = []
     
-    for contract in contracts:
+    for contract in contracts_in_df:
         # Skip if contract not in data
         if contract not in df.columns:
             continue
@@ -205,23 +212,24 @@ def plot_data(df, outliers_df, output_dir=None):
     # Ensure Date is datetime
     df['Date'] = pd.to_datetime(df['Date'])
     
-    # Contracts to plot
-    contracts = [col for col in ['VXc1', 'VXc2', 'VXc3', 'VXc4', 'VXc5'] if col in df.columns]
+    # Contracts to plot - Use the new format
+    contracts = [f'@VX={{i}}01XN' for i in range(1, 6)]
+    contracts_in_df = [col for col in contracts if col in df.columns]
     
     # Plot all contracts
     plt.figure(figsize=(12, 8))
     
-    for contract in contracts:
+    for contract in contracts_in_df:
         plt.plot(df['Date'], df[contract], label=contract, alpha=0.7)
     
     # If we have outliers, plot them
     if not outliers_df.empty:
-        for contract in contracts:
+        for contract in contracts_in_df:
             contract_outliers = outliers_df[outliers_df['Contract'] == contract]
             if not contract_outliers.empty:
                 dates = pd.to_datetime(contract_outliers['Date'])
                 values = contract_outliers['Value']
-                plt.scatter(dates, values, s=100, marker='o', edgecolors='red', facecolors='none', label=f"{contract} Outliers" if contract == contracts[0] else "")
+                plt.scatter(dates, values, s=100, marker='o', edgecolors='red', facecolors='none', label=f"{contract} Outliers" if contract == contracts_in_df[0] else "")
     
     plt.title('VX Continuous Contracts with Potential Outliers')
     plt.xlabel('Date')
@@ -235,7 +243,7 @@ def plot_data(df, outliers_df, output_dir=None):
         plt.show()
     
     # Plot each contract separately with outliers
-    for contract in contracts:
+    for contract in contracts_in_df:
         plt.figure(figsize=(12, 6))
         plt.plot(df['Date'], df[contract], label=contract, color='blue', alpha=0.7)
         
@@ -304,9 +312,10 @@ def main():
     print(f"\nAnalysis from {args.start_date} to {args.end_date}")
     print(f"Total dates analyzed: {len(df)}")
     
-    # Check available contracts in data
-    available_contracts = [col for col in ['VXc1', 'VXc2', 'VXc3', 'VXc4', 'VXc5'] if col in df.columns]
-    print(f"Available contracts in data: {', '.join(available_contracts)}")
+    # Check available contracts in data - Use the new format
+    available_contracts = [f'@VX={{i}}01XN' for i in range(1, 6)]
+    available_contracts_in_df = [col for col in available_contracts if col in df.columns]
+    print(f"Available contracts in data: {', '.join(available_contracts_in_df)}")
     
     # Print outliers summary
     if not outliers_df.empty:

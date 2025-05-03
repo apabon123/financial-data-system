@@ -60,7 +60,7 @@ def load_vx_futures(source_dir, db_path):
             df_renamed['symbol'] = symbol
             df_renamed['source'] = 'CBOE'
             df_renamed['interval_value'] = 1
-            df_renamed['interval_unit'] = 'day'
+            df_renamed['interval_unit'] = 'daily'
             df_renamed['adjusted'] = False
 
             # Ensure correct data types for numeric columns - Including Settle

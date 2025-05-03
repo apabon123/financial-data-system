@@ -12,6 +12,23 @@ from rich.table import Table
 # This assumes the script is located in src/scripts/market_data/
 project_root = Path(__file__).resolve().parent.parent.parent.parent # Go up four levels
 db_path = project_root / "data" / "financial_data.duckdb"
+METADATA_TABLE_NAME = "symbol_metadata" # Added constant
+
+def _get_metadata_table(conn, base_symbol: str, interval_unit: str, interval_value: int) -> Optional[str]:
+    """Helper to query symbol_metadata for the correct data table based on symbol and interval."""
+    try:
+        query = f"SELECT data_table FROM {METADATA_TABLE_NAME} WHERE base_symbol = ? AND interval_unit = ? AND interval_value = ? LIMIT 1"
+        params = [base_symbol, interval_unit, interval_value]
+        result = conn.execute(query, params).fetchone()
+        if result:
+            return result[0]
+        else:
+            # Fallback logic if metadata not found
+            print(f"[Warning] Metadata not found for {base_symbol} ({interval_value} {interval_unit}). Cannot determine target table.", file=sys.stderr)
+            return None
+    except Exception as e:
+        print(f"[Error] querying symbol_metadata for {base_symbol} ({interval_value} {interval_unit}): {e}", file=sys.stderr)
+        return None
 
 def format_value(value) -> str:
     """Helper function to format table cell values nicely."""
@@ -56,33 +73,102 @@ def summarize_inventory(db_connection: duckdb.DuckDBPyConnection, base_symbol_fi
             print(f"--- Filtering for Base Symbol: {base_symbol_filter} ---")
         
         # Determine target table based on filter (existing logic)
-        target_table = "market_data"
-        symbol_column = "symbol"
-        if base_symbol_filter and base_symbol_filter.startswith('@'):
-            target_table = "continuous_contracts"
-            print(f"--- Querying continuous_contracts table for {base_symbol_filter} ---")
-        elif base_symbol_filter: 
-             print(f"--- Querying market_data table for {base_symbol_filter} ---")
-        else:
-             print(f"--- Querying market_data table for all symbols ---")
+        # target_table = "market_data"
+        # symbol_column = "symbol"
+        # if base_symbol_filter and base_symbol_filter.startswith('@'):
+        #     target_table = "continuous_contracts"
+        #     print(f"--- Querying continuous_contracts table for {base_symbol_filter} ---")
+        #     # Query for specific continuous base symbol
+        #     query = f\"\"\" ... \"\"\" # Old query kept for reference
+        #     query_params = (f"{base_symbol_filter}%",)
+        # elif base_symbol_filter:
+        #      target_table = "market_data" # Assume specific non-continuous is in market_data for now
+        #      print(f"--- Querying {target_table} table for Base Symbol: {base_symbol_filter} ---")
+        #      # This part might need refinement if filtered base symbols exist in market_data_cboe
+        #      query = f\"\"\" ... \"\"\" # Old query kept for reference
+        #      query_params = (f"{base_symbol_filter}%",)
+        # else: # <-- This part remains the same for Option O1 (no filter)
+        #      print(f"--- Querying market_data and market_data_cboe tables for all symbols ---")
+        #      # Query to get symbol, interval, counts, and dates from BOTH tables
+        #      query = f\"\"\" ... \"\"\" # UNION ALL Query
+        #      query_params = ()
 
-        # Query to get symbol, interval, counts, and dates (existing logic)
-        query = f"""
-        SELECT 
-            {symbol_column} as symbol, 
-            interval_unit,
-            interval_value,
-            strftime(MIN(timestamp)::TIMESTAMP, '%Y-%m-%d') as first_date,
-            strftime(MAX(timestamp)::TIMESTAMP, '%Y-%m-%d') as last_date,
-            COUNT(*) as record_count
-        FROM {target_table} 
-        GROUP BY {symbol_column}, interval_unit, interval_value
-        ORDER BY {symbol_column}, interval_unit, interval_value;
-        """
-        
+        # --- NEW LOGIC using Metadata Table --- # 
+        if base_symbol_filter:
+            # When filtering, we need *an* interval to look up the table.
+            # Default to daily for this summary view, or make it configurable?
+            # For now, assume daily (day, 1) is the primary interval for filtered summary.
+            lookup_interval_unit = 'day'
+            lookup_interval_value = 1
+            # Special case for continuous - they use a placeholder interval
+            if base_symbol_filter.startswith('@'):
+                lookup_interval_unit = 'continuous'
+                lookup_interval_value = 0
+                
+            target_table = _get_metadata_table(db_connection, base_symbol_filter, lookup_interval_unit, lookup_interval_value)
+            if not target_table:
+                print(f"Could not find metadata for base symbol {base_symbol_filter} and interval ({lookup_interval_value} {lookup_interval_unit}). Aborting.", file=sys.stderr)
+                return # Exit if no metadata found
+                
+            print(f"--- Querying table '{target_table}' for Base Symbol: {base_symbol_filter} (metadata for {lookup_interval_value} {lookup_interval_unit}) ---")
+            symbol_column = "symbol" # Column name is usually symbol
+            # Query the specific target table based on metadata
+            query = f"""
+            SELECT
+                {symbol_column} as symbol, 
+                interval_unit,
+                interval_value,
+                strftime(MIN(timestamp)::TIMESTAMP, '%Y-%m-%d') as first_date,
+                strftime(MAX(timestamp)::TIMESTAMP, '%Y-%m-%d') as last_date,
+                COUNT(*) as record_count
+            FROM {target_table}
+            WHERE {symbol_column} LIKE ? -- Parameter binding for safety
+            GROUP BY {symbol_column}, interval_unit, interval_value
+            ORDER BY {symbol_column}, interval_unit, interval_value;
+            """
+            # Adjust LIKE pattern based on symbol type if necessary (e.g., continuous)
+            like_pattern = f"{base_symbol_filter}%" 
+            query_params = (like_pattern,)
+        else:
+            # --- UNFILTERED O1 Case - Keep UNION ALL --- #
+            print(f"--- Querying market_data and market_data_cboe tables for all symbols (UNION ALL) ---")
+            query = f"""
+            WITH combined_data AS (
+                 SELECT
+                     symbol,
+                     interval_unit,
+                     interval_value,
+                     timestamp
+                 FROM market_data
+                 UNION ALL
+                 SELECT
+                     symbol,
+                     'day' as interval_unit, -- Assume CBOE data is daily
+                     1 as interval_value,   -- Assume CBOE data is daily
+                     timestamp
+                 FROM market_data_cboe
+             )
+             SELECT
+                 symbol,
+                 interval_unit,
+                 interval_value,
+                 strftime(MIN(timestamp)::TIMESTAMP, '%Y-%m-%d') as first_date,
+                 strftime(MAX(timestamp)::TIMESTAMP, '%Y-%m-%d') as last_date,
+                 COUNT(*) as record_count
+             FROM combined_data
+             GROUP BY symbol, interval_unit, interval_value
+             ORDER BY symbol, interval_unit, interval_value;
+            """
+            query_params = () # No parameters for the combined query
+            # --- END UNFILTERED O1 Case ---
+
     try:
-        metadata_df = db_connection.execute(query).fetchdf()
-        
+        # Use execute with parameters if they exist
+        if query_params:
+            metadata_df = db_connection.execute(query, query_params).fetchdf()
+        else:
+            metadata_df = db_connection.execute(query).fetchdf()
+
         if metadata_df.empty:
             if continuous_only:
                 print("No data found in the continuous_contracts table.")
@@ -135,21 +221,39 @@ def summarize_inventory(db_connection: duckdb.DuckDBPyConnection, base_symbol_fi
         def get_base(symbol):
             if symbol.startswith('@') and '=' in symbol:
                  return symbol.split('=')[0] # Handle continuous like @ES=101XN -> @ES
-            elif symbol.startswith('$VIX'):
+            elif symbol.startswith('$VIX'): # Explicitly handle VIX index
                 return "$VIX.X"
-            elif symbol.startswith('VX') and len(symbol) >= 4 and not symbol.startswith('VXc'): # Avoid matching VXc1 etc.
-                return "VX"
-            elif len(symbol) >= 4 and symbol[-3:-2].isalpha() and symbol[-2:].isdigit():
-                 return symbol[:-3]
-            else:
-                return symbol # Return original if no pattern matches
-        
+            elif symbol.startswith('VX'): # Handle VX futures (e.g., VXK25)
+                 # Check if the rest looks like a contract code (e.g., M25)
+                 if len(symbol) >= 4 and symbol[2].isalpha() and symbol[3:].isdigit():
+                     return "VX"
+                 # Fallback for other VX symbols if necessary, or return original
+                 return symbol # Or maybe "VX" if all VX... should group
+            elif symbol == 'SPY' or symbol == 'QQQ' or symbol == 'AAPL' or symbol == 'GS': # Handle specific equities
+                 return symbol
+            # General futures pattern (e.g., ESM25 -> ES)
+            elif len(symbol) >= 4 and symbol[-3].isalpha() and symbol[-2:].isdigit():
+                 # Crude check for futures code like M24, Z23 etc.
+                 if symbol[-3] in 'FGHJKMNQUVXZ':
+                     return symbol[:-3]
+            # Default: return original symbol if no pattern matches
+            return symbol
+
         metadata_df['base_symbol'] = metadata_df['symbol'].apply(get_base)
         
         # Create the combined interval string (e.g., '1d', '15m') early on
-        metadata_df['interval'] = metadata_df.apply(lambda row: f"{row['interval_value']}{row['interval_unit'][0]}", axis=1)
+        # Handle potential missing interval_unit/value (e.g., from CBOE part if query changes)
+        def safe_interval_format(row):
+            unit = getattr(row, 'interval_unit', None)
+            value = getattr(row, 'interval_value', None)
+            if unit and value is not None:
+                unit_char = unit[0] if isinstance(unit, str) and len(unit) > 0 else '?'
+                return f"{value}{unit_char}"
+            return 'N/A' # Fallback if columns are missing
+
+        metadata_df['interval'] = metadata_df.apply(safe_interval_format, axis=1)
         
-        # Filter by base symbol if provided *before* generating summaries
+        # Filter by base symbol if provided *after* combining data and extracting base
         if base_symbol_filter:
             metadata_df = metadata_df[metadata_df['base_symbol'] == base_symbol_filter].copy()
             if metadata_df.empty:

@@ -1,46 +1,108 @@
-# Futures Configuration Guide
+# Futures Configuration Guide (`config/market_symbols.yaml`)
 
-This document provides a comprehensive guide to configuring futures contracts in the financial data system.
+This document provides a comprehensive guide to configuring futures contracts in the `config/market_symbols.yaml` file, which dictates how the financial data system fetches, processes, and stores data.
 
-## Contract Configuration Fields
+## `futures` Section Structure
+
+Each entry under the `futures:` list in the YAML file represents a futures instrument and requires several fields:
 
 ### Basic Information
-- `base_symbol`: The root symbol for the futures contract (e.g., 'ES' for E-mini S&P 500)
-- `calendar`: The trading calendar to use (e.g., 'US' for United States)
-- `description`: Human-readable description of the contract
-- `exchange`: The exchange where the contract trades (e.g., 'CME', 'NYMEX')
-- `start_date`: The earliest date for which data should be collected
+- `base_symbol`: The root symbol (e.g., 'ES', 'NQ', 'VX'). *Required*.
+- `description`: Human-readable description (e.g., 'E-mini S&P 500 Futures'). *Required*.
+- `exchange`: The primary exchange (e.g., 'CME', 'CBOE', 'NYMEX'). *Required*.
+- `calendar`: The specific trading calendar identifier used for date calculations and holiday adjustments (e.g., 'CME_Equity', 'CFE', 'CMEGlobex_CL'). Get valid names from `exchange_calendars` or `pandas_market_calendars`. *Required*.
+- `start_date`: The earliest date (YYYY-MM-DD) for which data should ideally be available or fetched. *Required*.
+- `source`: Specifies where the data for this future comes from. This dictates which fetching logic is used. Valid values:
+    - `cboe`: Data fetched from CBOE website CSVs (Used for VIX).
+    - `tradestation`: Data fetched via TradeStation API (Used for ES, NQ).
+    *Required*.
 
-### Data Collection
-- `frequencies`: List of data frequencies to collect
-  - Available options: '1min', '15min', 'daily'
-- `num_active_contracts`: Number of front-month contracts to maintain
+### Data Collection Parameters
+- `frequencies`: List of data frequencies to collect for this symbol (affects individual contracts fetched from TradeStation and potentially local generation if implemented).
+    - Available options configured in `settings.data_frequencies`: typically '1min', '15min', 'daily'. *Required*.
+- `num_active_contracts`: Number of nearest-expiry contracts the system should track/update (e.g., 2 for ES/NQ means front month and second month). *Required*.
+- `is_continuous`: Boolean flag (true/false) indicating if continuous contract data should be maintained for this symbol. *Required*.
 
-### Historical Contracts
-- `historical_contracts`: Configuration for historical data collection
-  - `patterns`: List of month codes (e.g., 'H' for March, 'M' for June)
-  - `start_month`: Starting month (1-12)
-  - `start_year`: Year to begin collecting historical data
+### Historical Contract Identification (Primarily for Local Generation/Mapping)
+- `historical_contracts`: Configuration for identifying historical contract symbols.
+    - `patterns`: List of standard futures month codes (e.g., ['H', 'M', 'U', 'Z'] for quarterly contracts). *Required if local generation is used*.
+    - `start_year`: The year when historical data collection/generation should begin. *Required if local generation is used*.
+    - `start_month`: (Optional) The starting month within the `start_year` (1-12). Defaults to 1 if omitted.
 
-### Expiry Rules
-The `expiry_rule` section defines when contracts expire:
+### Expiry Rules (Primarily for VIX Local Continuous Generation/Mapping)
+The `expiry_rule` section defines when individual contracts expire, which is crucial for determining roll dates when generating continuous contracts *locally* (like for VIX). It may be less critical for symbols where continuous data is fetched directly (ES/NQ).
 
-#### Day Type Options
-1. **Specific Day of Month**
-   ```yaml
-   day_type: friday
-   day_number: 3  # Third Friday
-   ```
+- `day_type`: Defines the type of rule. Options:
+    - `friday`: Nth Friday of the month (e.g., `day_number: 3` for 3rd Friday).
+    - `wednesday`: Nth Wednesday of the month (e.g., `day_number: 3` for 3rd Wednesday).
+    - `business_day`: N business days before/after a reference point.
+        - `days_before`: Number of business days *before* the reference.
+        - `reference_day`: (Optional) Specific day of the month (e.g., 25) to count back from.
+        - `reference_point`: (Optional) Can be 'last_business_day' to count back from the last business day of the month.
+    - `special_rule`: Custom rule identifier (e.g., `VX_expiry` handled by specific logic).
+*Required if local generation is used*.
 
-2. **Business Days Before Date**
-   ```yaml
-   day_type: business_day
-   days_before: 3  # Three business days before the target date
-   ```
+- `day_number`: (Used with `friday`/`wednesday`) The occurrence number (e.g., 3 for the third).
+- `adjust_for_holiday`: (true/false) Whether to adjust the calculated expiry date if it falls on a holiday according to the specified `calendar`. Defaults to `true`.
+- `holiday_calendar`: (Deprecated - use `calendar`) Calendar for holidays.
 
-#### Common Settings
-- `adjust_for_holiday`: Whether to adjust for holidays (true/false)
-- `holiday_calendar`: Calendar to use for holiday adjustments
+## Month Codes
+
+Standard futures month codes used in `historical_contracts.patterns`:
+- F: Jan, G: Feb, H: Mar, J: Apr, K: May, M: Jun
+- N: Jul, Q: Aug, U: Sep, V: Oct, X: Nov, Z: Dec
+
+## Example Configurations
+
+```yaml
+futures:
+  - base_symbol: ES
+    calendar: CME_Equity # Specific calendar
+    description: E-mini S&P 500 Futures
+    exchange: CME
+    frequencies: # Daily and Intraday
+      - 1min
+      - 15min
+      - daily
+    historical_contracts: # Define patterns even if not locally generated
+      patterns: [H, M, U, Z]
+      start_year: 2003
+    num_active_contracts: 2
+    expiry_rule: # Rule defined, but less critical for direct fetch
+      day_type: friday
+      day_number: 3
+      adjust_for_holiday: true
+    start_date: '2003-01-01'
+    is_continuous: true
+    source: tradestation # Fetched via TradeStation
+
+  - base_symbol: VX
+    calendar: CFE # Specific calendar
+    description: CBOE Volatility Index Futures
+    exchange: CBOE
+    frequencies: # Daily and 15min as per current config
+      - 15min
+      - daily
+    historical_contracts: # Required for local generation
+      patterns: [F, G, H, J, K, M, N, Q, U, V, X, Z] # All months
+      start_year: 2004
+    num_active_contracts: 9 # Track 9 near contracts
+    expiry_rule: # Crucial for local generation mapping
+      day_type: wednesday
+      special_rule: VX_expiry # Specific logic applies
+      adjust_for_holiday: true
+    start_date: '2004-01-01'
+    is_continuous: true
+    source: cboe # Fetched from CBOE website
+```
+
+## Best Practices
+
+1.  **Source Accuracy:** Ensure the `source` field correctly reflects where the data originates (`cboe` or `tradestation`).
+2.  **Calendar Specificity:** Use precise calendar names (e.g., `CME_Equity`, `CFE`) for accurate date calculations.
+3.  **Expiry Rules:** Define `expiry_rule` carefully, especially for symbols like VX where continuous contracts are generated locally based on these rules.
+4.  **Frequencies:** List all desired frequencies. Note that availability might depend on the `source`.
+5.  **Consistency:** Keep configurations aligned with the actual data fetching and processing logic implemented in the scripts.
 
 ## Common Futures Configurations
 

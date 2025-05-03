@@ -15,6 +15,13 @@ Run this script daily to keep the database up-to-date.
 
 import os
 import sys
+from pathlib import Path
+
+# Add project root to the Python path
+project_root = str(Path(__file__).resolve().parent.parent.parent.parent) # Go up four levels from the script's location
+if project_root not in sys.path:
+    sys.path.append(project_root)
+
 import argparse
 import logging
 import subprocess
@@ -577,19 +584,19 @@ def verify_continuous_data(conn, config_path: str, start_date_str=None, end_date
         _verify_symbol_group(es_nq_symbols_to_verify, "ES/NQ (TradeStation)")
         _verify_symbol_group(vx_symbols_to_verify, "VX (Generated)")
 
-        # 3. Check active VX futures counts (in 'market_data') - Kept separate
+        # 3. Check active VX futures counts (in 'market_data_cboe') - Kept separate
         if vx_symbols_to_verify: # Only check this if VX was supposed to be processed
-            logger.info("--- Verifying Active VX Futures Count (in market_data) ---")
+            logger.info("--- Verifying Active VX Futures Count (in market_data_cboe) ---")
             try:
                 result = conn.execute(
                     """SELECT COUNT(DISTINCT symbol) 
-                       FROM market_data 
+                       FROM market_data_cboe 
                        WHERE symbol LIKE 'VX%' AND symbol NOT LIKE '@VX=%'"""
                 ).fetchone()
                 if result:
                      logger.info(f"Active VX futures contracts count: {result[0]} distinct symbols")
                 else:
-                     logger.warning("Could not get active VX futures count from 'market_data'.")
+                     logger.warning("Could not get active VX futures count from 'market_data_cboe'.")
                      all_verified = False # Consider this a verification failure
             except Exception as vx_count_e:
                  logger.error(f"Error verifying active VX futures count: {vx_count_e}", exc_info=True)
@@ -694,13 +701,58 @@ def main():
     else:
         logger.info("--- Step 2: Skipping VX Futures update ---")
 
-    # Step 3: Generate Continuous VX Contracts (@VX=...) (from CBOE data in DB)
+    # Step 3a: Update the VX continuous contract mapping table
+    # This creates/updates the lookup table that maps each date to the
+    # appropriate contract for each continuous contract (@VX=101XN, etc.)
+    if not args.skip_vx:
+        if vx_futures_updated:
+            logger.info("--- Step 3a: Updating VX Continuous Contract Mapping Table ---")
+            try:
+                # Import the create_continuous_mapping function
+                from src.utils.continuous_contracts import create_continuous_mapping
+                
+                # Load config to get the start date
+                with open(args.config_path, 'r') as f:
+                    config = yaml.safe_load(f)
+                    vx_config = next((item for item in config.get('futures', []) if item['base_symbol'] == 'VX'), None)
+                    if not vx_config:
+                        raise ValueError("VX configuration not found in market_symbols.yaml")
+                    mapping_start_date = vx_config.get('start_date', '2004-01-01')
+                
+                # Set end date to 25 years in the future
+                mapping_end_date = (date.today() + timedelta(days=365*25)).strftime('%Y-%m-%d')
+                
+                logger.info(f"Updating continuous contract mapping for VX from {mapping_start_date} to {mapping_end_date}")
+                
+                # Create the mapping
+                mapping_success = create_continuous_mapping(
+                    root_symbol='VX',
+                    start_date=mapping_start_date,
+                    end_date=mapping_end_date,
+                    num_contracts=9,
+                    db_path=args.db_path
+                )
+                
+                if mapping_success:
+                    logger.info("Successfully updated VX continuous contract mapping table.")
+                else:
+                    logger.error("Failed to update VX continuous contract mapping table.")
+                    success = False
+            except Exception as mapping_e:
+                logger.error(f"Error updating VX continuous contract mapping table: {mapping_e}", exc_info=True)
+                success = False
+        else:
+            logger.warning("--- Step 3a: Skipping VX continuous contract mapping update (VX futures update failed) ---")
+    else:
+        logger.info("--- Step 3a: Skipping VX continuous contract mapping update (related to --skip-vx) ---")
+
+    # Step 3b: Generate Continuous VX Contracts (@VX=...) (from CBOE data in DB)
     # This step *builds* the continuous contracts by stitching together the individual
     # futures data downloaded in Step 2, using roll rules.
-    # It MUST run after Step 2.
+    # It MUST run after Step 2 and 3a.
     if not args.skip_vx: # Also depends on not skipping VX futures
         if vx_futures_updated:
-            logger.info("--- Step 3: Generating Continuous VX Contracts (@VX=...) ---")
+            logger.info("--- Step 3b: Generating Continuous VX Contracts (@VX=...) ---")
             try:
                 # Determine date range and force flag based on --full-update
                 gen_end_date = date.today().strftime('%Y-%m-%d')
@@ -733,9 +785,9 @@ def main():
                 logger.error(f"Error generating VX continuous contracts: {gen_e}", exc_info=True)
                 success = False
         else:
-            logger.warning("--- Step 3: Skipping VX continuous contract generation (VX futures update failed) ---")
+            logger.warning("--- Step 3b: Skipping VX continuous contract generation (VX futures update failed) ---")
     else:
-        logger.info("--- Step 3: Skipping VX Continuous generation (related to --skip-vx) ---")
+        logger.info("--- Step 3b: Skipping VX Continuous generation (related to --skip-vx) ---")
 
     # Step 4: Update Individual ES & NQ Futures Contracts (via TradeStation)
     # This uses a subprocess because the target script has complex internal logic
