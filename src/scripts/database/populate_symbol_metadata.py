@@ -34,6 +34,13 @@ DEFAULT_DB_PATH = os.path.join(project_root, "data", "financial_data.duckdb")
 CONFIG_PATH = os.path.join(project_root, "config", "market_symbols.yaml")
 METADATA_TABLE_NAME = "symbol_metadata"
 
+def get_ordinal_suffix(number: int) -> str:
+    """Return the ordinal suffix for a number (e.g., 1st, 2nd, 3rd, 4th)."""
+    if 10 <= number % 100 <= 20:
+        return str(number) + 'th'
+    else:
+        return str(number) + {1: 'st', 2: 'nd', 3: 'rd'}.get(number % 10, 'th')
+
 def parse_frequency(freq_str: str) -> tuple[Optional[str], Optional[int]]:
     """Parse frequency string like '1min', '15min', 'daily' into unit and value."""
     if freq_str == 'daily':
@@ -46,6 +53,35 @@ def parse_frequency(freq_str: str) -> tuple[Optional[str], Optional[int]]:
             return None, None
     # Add other parsers if needed (e.g., 'hourly')
     return None, None
+
+def _parse_symbol_frequencies(yaml_freq_list, base_symbol_for_logging: str = "symbol") -> list:
+    """Parse a list of frequency configurations (strings or dicts) into a standardized list of tuples."""
+    parsed_list = []
+    if not isinstance(yaml_freq_list, list):
+        logging.warning(f"Invalid 'frequencies' format for {base_symbol_for_logging} (should be a list, got {type(yaml_freq_list)}). Skipping frequencies.")
+        return parsed_list
+
+    if all(isinstance(f, dict) for f in yaml_freq_list):
+        for freq_dict in yaml_freq_list:
+            unit = freq_dict.get('unit')
+            value = freq_dict.get('interval')
+            # name = freq_dict.get('name') # Also available if needed
+            if unit and value is not None:
+                parsed_list.append((unit, value, freq_dict))
+            else:
+                logging.warning(f"Skipping frequency dict due to missing unit/interval: {freq_dict} for {base_symbol_for_logging}")
+    elif all(isinstance(f, str) for f in yaml_freq_list):
+        for freq_str in yaml_freq_list:
+            unit, value = parse_frequency(freq_str) # Uses the existing global parse_frequency helper
+            if unit and value is not None:
+                # For string frequencies, freq_dict is None, which is handled by determine_metadata_for_interval
+                parsed_list.append((unit, value, None))
+            else:
+                logging.warning(f"Could not parse frequency string '{freq_str}' for {base_symbol_for_logging}. Skipping.")
+    elif yaml_freq_list: # If list is not empty but mixed or invalid types
+        logging.warning(f"Mixed or invalid frequency types in list for {base_symbol_for_logging}. Skipping frequencies: {yaml_freq_list}")
+    
+    return parsed_list
 
 def determine_metadata_for_interval(symbol_config: dict, interval_unit: str, interval_value: int, freq_config: Optional[dict] = None) -> dict:
     """Determine the table, source, and script paths for a specific symbol and interval.
@@ -92,20 +128,26 @@ def determine_metadata_for_interval(symbol_config: dict, interval_unit: str, int
 
     # --- Continuous Contracts Handling (AFTER specific source logic) --- #
     if asset_type == 'continuous_future':
-        data_table = 'continuous_contracts'
-        # Determine continuous source based on base symbol convention
-        if base_symbol == '@VX':
-             data_source = 'generated'
-        elif base_symbol in ('@ES', '@NQ'):
-             data_source = 'tradestation' 
-        else:
-             # Use symbol-level source if available for other continuous types
-             data_source = symbol_config.get('source', 'unknown') 
+        data_table = 'continuous_contracts' # Table is specific to continuous futures
+        
+        # The 'data_source' variable should have been correctly set by the preceding
+        # 'if source == 'cboe': ... elif source == 'tradestation': ...' blocks
+        # based on the initial 'source' resolution (which considers default_source).
+        # We only need to override 'data_source' here for truly special continuous future types
+        # that have a source different from what their original symbol_config might imply.
+        if base_symbol == '@VX': # The generic @VX symbol, typically locally-generated.
+             data_source = 'generated' # Override source to 'generated' for this specific case.
+        # For other continuous futures like @ES, @NQ, or our @VX=...XN symbols,
+        # the 'data_source' (e.g., 'tradestation') is assumed to be correctly set
+        # by the logic that processed the 'source' variable just before this block.
+        # No 'elif' or 'else' is needed to re-set it if that prior logic is sound.
              
         # Continuous contracts use the loader script for both operations
         hist_script = 'src/scripts/market_data/continuous_contract_loader.py' 
         upd_script = 'src/scripts/market_data/continuous_contract_loader.py' 
-        asset_type = 'continuous_future'
+        # asset_type is already 'continuous_future' due to the surrounding if condition.
+        # Ensure it's explicitly part of the return if this block is entered.
+        asset_type = 'continuous_future' 
         
     # --- Final Overrides --- #
     # NOTE: These overrides apply AFTER all other logic. Use with caution.
@@ -185,13 +227,28 @@ def populate_metadata(conn: duckdb.DuckDBPyConnection, config_file: str):
         logging.error(f"Error parsing configuration file {config_file}: {e}")
         return
 
-    # --- Clean up old 'day' and 'continuous' entries --- #
+    # --- Clean up old 'day' and 'continuous' interval_unit entries --- #
     try:
         conn.execute(f"DELETE FROM {METADATA_TABLE_NAME} WHERE interval_unit IN ('day', 'continuous')")
-        logging.info(f"Attempted to delete any old entries with interval_unit='day' or 'continuous'.") 
+        logging.info(f"Attempted to delete any old entries with interval_unit='day' or 'continuous'.")
     except duckdb.Error as e:
-        logging.error(f"Error trying to delete old 'day'/'continuous' entries: {e}")
-    # --- End clean up --- #
+        logging.error(f"Error trying to delete old 'day'/'continuous' interval_unit entries: {e}")
+
+    # --- ADDED: Explicitly delete old generic continuous_future metadata for @ES, @NQ, @VX ---
+    specific_symbols_to_delete = ('@ES', '@NQ', '@VX')
+    try:
+        for sym_to_del in specific_symbols_to_delete:
+            # Delete any metadata entries for these specific base_symbols, regardless of other attributes,
+            # as they represent the old generic continuous entries we want to remove.
+            # The new, correct entries (e.g. for @ES=102XC) will be re-added later.
+            deleted_rows = conn.execute(f"DELETE FROM {METADATA_TABLE_NAME} WHERE base_symbol = ? RETURNING 1", [sym_to_del]).fetchall()
+            if deleted_rows and len(deleted_rows) > 0:
+                logging.info(f"Deleted {len(deleted_rows)} old metadata entries for generic symbol '{sym_to_del}'.")
+            else:
+                logging.info(f"No old metadata entries found/deleted for generic symbol '{sym_to_del}'.")
+    except duckdb.Error as e:
+        logging.error(f"Error deleting specific old generic symbol metadata (@ES, @NQ, @VX): {e}")
+    # --- End explicit clean up ---
 
     entries_to_insert = []
     now = datetime.now()
@@ -204,85 +261,113 @@ def populate_metadata(conn: duckdb.DuckDBPyConnection, config_file: str):
 
     for config_list, default_asset_type in asset_configs:
         for item_config in config_list:
+            # --- ADDED: Handle continuous_group ---
+            if 'continuous_group' in item_config:
+                group_details = item_config['continuous_group']
+                identifier_base = group_details.get('identifier_base')
+                month_codes = group_details.get('month_codes', [])
+                settings_code = group_details.get('settings_code', "") # Ensure it's a string
+                description_template = group_details.get('description_template', "Continuous Future {symbol}")
+
+                if not identifier_base or not month_codes:
+                    logging.warning(f"Skipping continuous_group due to missing 'identifier_base' or 'month_codes': {group_details}")
+                    continue
+
+                # Prepare a base item_config for the generated symbols
+                generated_item_config_base = {
+                    'exchange': group_details.get('exchange'),
+                    'type': group_details.get('type', 'continuous_future'), # Default to continuous_future
+                    'default_source': group_details.get('default_source'),
+                    'default_raw_table': group_details.get('default_raw_table'),
+                    'start_date': group_details.get('start_date'),
+                    'calendar': group_details.get('calendar')
+                }
+
+                # Parse frequencies ONCE from the group config
+                group_yaml_frequencies = group_details.get('frequencies', [])
+                group_parsed_frequencies = _parse_symbol_frequencies(group_yaml_frequencies, identifier_base)
+
+                if not group_parsed_frequencies:
+                    logging.warning(f"No valid frequencies defined for continuous_group '{identifier_base}'. Skipping this group.")
+                    continue
+                
+                for idx, month_code in enumerate(month_codes):
+                    actual_symbol_val = f"{identifier_base}={str(month_code)}{settings_code}" # Ensure month_code is string
+                    
+                    current_generated_item_config = generated_item_config_base.copy()
+                    current_generated_item_config['symbol'] = actual_symbol_val
+                    current_generated_item_config['description'] = description_template.format(
+                        nth_month=get_ordinal_suffix(idx + 1), symbol=actual_symbol_val
+                    )
+                    # 'type' is already in current_generated_item_config from generated_item_config_base
+
+                    for unit, value, freq_dict_for_interval in group_parsed_frequencies:
+                        interval_metadata = determine_metadata_for_interval(
+                            current_generated_item_config,
+                            unit,
+                            value,
+                            freq_dict_for_interval
+                        )
+                        entries_to_insert.append({
+                            'base_symbol': actual_symbol_val, # Use the fully generated symbol
+                            'interval_unit': unit,
+                            'interval_value': value,
+                            'data_table': interval_metadata['data_table'],
+                            'data_source': interval_metadata['data_source'],
+                            'historical_script_path': interval_metadata['historical_script_path'],
+                            'update_script_path': interval_metadata['update_script_path'],
+                            'asset_type': interval_metadata['asset_type'],
+                            'config_path': config_file,
+                            'last_updated': now
+                        })
+                continue # Move to the next item_config in the outer loop
+            # --- END ADDED: Handle continuous_group ---
+
             base_symbol = item_config.get('base_symbol') or item_config.get('symbol')
             if not base_symbol: continue
 
-            frequencies_config = item_config.get('frequencies', [])
-            parsed_frequencies_with_config = [] # List of tuples (unit, value, freq_dict or None)
-
-            if isinstance(frequencies_config, list):
-                 if all(isinstance(f, dict) for f in frequencies_config):
-                     # New structure: list of dicts
-                     for freq_dict in frequencies_config:
-                          unit = freq_dict.get('unit')
-                          value = freq_dict.get('interval')
-                          if unit and value is not None:
-                               parsed_frequencies_with_config.append((unit, value, freq_dict))
-                          else:
-                               logging.warning(f"Skipping frequency dict due to missing unit/interval: {freq_dict} for {base_symbol}")
-                 elif all(isinstance(f, str) for f in frequencies_config):
-                     # Old structure: list of strings
-                     for freq_str in frequencies_config:
-                          unit, value = parse_frequency(freq_str)
-                          if unit and value is not None:
-                               parsed_frequencies_with_config.append((unit, value, None)) # No freq_dict for old format
-                          else:
-                               logging.warning(f"Could not parse frequency string '{freq_str}' for {base_symbol}. Skipping.")
-                 else:
-                     logging.warning(f"Mixed or invalid frequency types for {base_symbol}. Skipping frequencies.")
-            else:
-                logging.warning(f"Invalid 'frequencies' format for {base_symbol} (should be a list). Skipping.")
-                continue # Skip this symbol if frequencies are invalid
-                
+            # MODIFIED: Use the new _parse_symbol_frequencies helper
+            frequencies_config_list = item_config.get('frequencies', [])
+            parsed_frequencies_with_config = _parse_symbol_frequencies(frequencies_config_list, base_symbol)
+            
             if not parsed_frequencies_with_config:
-                 logging.warning(f"No valid frequencies determined for {base_symbol}. Skipping metadata entry.")
-                 continue
+                logging.warning(f"No valid frequencies determined for {base_symbol}. Skipping metadata entry.")
+                continue
 
             asset_type = item_config.get('type', default_asset_type).lower()
             item_config['type'] = asset_type 
             
             # Process Individual Symbol/Intervals (Non-Continuous)
-            for unit, value, freq_dict in parsed_frequencies_with_config: # Pass freq_dict now
-                # Pass freq_dict to the determination function
-                interval_metadata = determine_metadata_for_interval(item_config, unit, value, freq_dict)
-                entries_to_insert.append({
-                    'base_symbol': base_symbol,
-                    'interval_unit': unit,
-                    'interval_value': value,
-                    'data_table': interval_metadata['data_table'],
-                    'data_source': interval_metadata['data_source'],
-                    'historical_script_path': interval_metadata['historical_script_path'],
-                    'update_script_path': interval_metadata['update_script_path'],
-                    'asset_type': interval_metadata['asset_type'], 
-                    'config_path': config_file,
-                    'last_updated': now
-                })
-            
-            # Add entries for continuous version if applicable
-            if default_asset_type == 'future' and item_config.get('is_continuous', False):
-                 continuous_base = f"@{base_symbol}"
-                 logging.info(f"Processing continuous symbol {continuous_base} based on {base_symbol} frequencies...")
-                 for unit, value, freq_dict in parsed_frequencies_with_config: 
-                     # Determine metadata for continuous, passing original base symbol info and interval
-                     cont_config_for_determine = {
-                         'type': 'continuous_future', 
-                         'base_symbol': continuous_base, 
-                         'source': item_config.get('source') # Pass base source hint
-                     }
-                     # Pass the specific freq_dict if available (though continuous loader might ignore it)
-                     cont_metadata = determine_metadata_for_interval(cont_config_for_determine, unit, value, freq_dict)
-                     entries_to_insert.append({
-                         'base_symbol': continuous_base,
-                         'interval_unit': unit,
-                         'interval_value': value,
-                         'data_table': cont_metadata['data_table'],
-                         'data_source': cont_metadata['data_source'],
-                         'historical_script_path': cont_metadata['historical_script_path'],
-                         'update_script_path': cont_metadata['update_script_path'],
-                         'asset_type': cont_metadata['asset_type'],
-                         'config_path': config_file,
-                         'last_updated': now
-                     })
+            for unit, value, freq_config_for_interval in parsed_frequencies_with_config:
+                interval_specific_metadata = determine_metadata_for_interval(item_config, unit, value, freq_config_for_interval)
+                
+                # Debug logging for individual symbol items (which includes explicitly defined continuous_future types)
+                if base_symbol in ['@ES=102XC', '@VX=101XN', '@ES=101XN', '@NQ=101XN', '@NQ=102XC']:
+                    logging.info(f"DEBUG_POPULATOR (individual_symbol): Preparing to insert for {base_symbol} | {unit} | {value} with metadata: {interval_specific_metadata}")
+
+                try:
+                    conn.execute(f"""
+                        INSERT INTO {METADATA_TABLE_NAME} (base_symbol, interval_unit, interval_value, data_table, data_source, asset_type, config_path, last_updated)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT (base_symbol, interval_unit, interval_value) DO UPDATE SET
+                            data_table = EXCLUDED.data_table,
+                            data_source = EXCLUDED.data_source,
+                            asset_type = EXCLUDED.asset_type,
+                            config_path = EXCLUDED.config_path,
+                            last_updated = EXCLUDED.last_updated;
+                    """, (
+                        base_symbol,
+                        unit,
+                        value,
+                        interval_specific_metadata['data_table'],
+                        interval_specific_metadata['data_source'],
+                        interval_specific_metadata['asset_type'],
+                        config_file,
+                        now
+                    ))
+                except duckdb.Error as e:
+                    logging.error(f"Database error populating metadata: {e}")
+                    raise
 
     # Insert/Replace entries into the database
     if not entries_to_insert:

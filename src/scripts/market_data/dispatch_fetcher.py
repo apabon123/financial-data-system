@@ -47,42 +47,55 @@ def get_base_symbol(symbol: str) -> str:
     # Assume it's already a base symbol if no pattern matches
     return symbol
 
-def get_fetch_metadata(conn: duckdb.DuckDBPyConnection, base_symbol: str) -> Optional[dict]:
-    """Query metadata for the specific base symbol."""
-    logging.info(f"Querying metadata for base symbol '{base_symbol}'.")
+def get_fetch_metadata(conn: duckdb.DuckDBPyConnection, symbol_to_query: str) -> Optional[dict]:
+    """Query metadata for the specific symbol (which could be a base or a direct symbol)."""
+    logging.info(f"Querying metadata in get_fetch_metadata for symbol: '{symbol_to_query}' (Type: {type(symbol_to_query)}))")
     try:
-        # Query based only on base_symbol, fetching both script paths
+        # WARNING: Using f-string for direct embedding - only for diagnostics
+        # Ensure the symbol is treated as a string literal in SQL by adding quotes
+        # Basic escaping of single quotes within the symbol itself (though unlikely for $VIX.X)
+        sql_safe_symbol = str(symbol_to_query).replace("'", "''") 
+        
         query = f"""
             SELECT historical_script_path, update_script_path, asset_type 
             FROM {METADATA_TABLE_NAME} 
-            WHERE base_symbol = ?
+            WHERE base_symbol = '{sql_safe_symbol}'  -- Symbol directly embedded
             LIMIT 1
         """
-        params = [base_symbol]
-        result = conn.execute(query, params).fetchone()
+        logging.info(f"Executing direct query: {query}") # Log the exact query
+        # params = [str(symbol_to_query)] 
+        result = conn.execute(query).fetchone() # No params needed now
+        
         if result:
+            logging.info(f"Metadata FOUND for symbol '{symbol_to_query}' in get_fetch_metadata.")
             return {
                 'historical_script_path': result[0],
                 'update_script_path': result[1],
                 'asset_type': result[2]
-                # Removed data_table, data_source as they are not needed for dispatching script
             }
         else:
-            logging.warning(f"Metadata not found for base '{base_symbol}'. Cannot dispatch fetcher.")
+            logging.warning(f"Metadata NOT FOUND for symbol '{symbol_to_query}' in get_fetch_metadata.")
             return None
     except Exception as e:
-        logging.error(f"Error querying {METADATA_TABLE_NAME} for base '{base_symbol}': {e}")
+        logging.error(f"Error querying {METADATA_TABLE_NAME} for symbol '{symbol_to_query}' in get_fetch_metadata: {e}")
         return None
 
 def main():
     parser = argparse.ArgumentParser(description='Dispatch data fetching based on symbol metadata.')
-    parser.add_argument("--symbol", required=True, help="Symbol to fetch (e.g., SPY, $VIX.X, ES, ESH25).")
-    parser.add_argument("--interval-unit", required=False, default='daily', help="Interval unit (e.g., daily, minute). Default: daily") # Make optional, default daily
-    parser.add_argument("--interval-value", type=int, required=False, default=1, help="Interval value (e.g., 1, 15). Default: 1") # Make optional, default 1
+    parser.add_argument("--symbol", required=True, help="Symbol to fetch (e.g., SPY, VIX_INDEX, ES, ESH25).")
+    parser.add_argument("--interval-unit", required=False, default='daily', help="Interval unit (e.g., daily, minute). Default: daily")
+    parser.add_argument("--interval-value", type=int, required=False, default=1, help="Interval value (e.g., 1, 15). Default: 1")
     parser.add_argument("--force", action='store_true', help="Force fetch (overwrite existing data).")
     parser.add_argument("--db-path", default=DEFAULT_DB_PATH, help="Path to the DuckDB database file.")
     parser.add_argument("--operation-type", choices=['fetch', 'update'], default='fetch', help="Specify operation: 'fetch' for historical/new data, 'update' for raw source data.")
     args = parser.parse_args()
+
+    # --- ADDED: Handle symbol alias for $VIX.X ---
+    symbol_to_process = args.symbol
+    if args.symbol == "VIX_INDEX":
+        symbol_to_process = "$VIX.X"
+        logging.info(f"Received symbol alias 'VIX_INDEX', processing as '{symbol_to_process}'")
+    # --- END ADDED ---
 
     db_file = Path(args.db_path).resolve()
     if not db_file.exists():
@@ -91,21 +104,39 @@ def main():
 
     metadata = None
     conn = None
-    base_symbol = get_base_symbol(args.symbol) # Get base symbol early
+    # Use symbol_to_process for metadata lookup logic
+    symbol_for_metadata_lookup = symbol_to_process 
+    
     try:
         conn = duckdb.connect(database=str(db_file), read_only=True)
         logging.info(f"Connected to database to read metadata: {db_file}")
-        metadata = get_fetch_metadata(conn, base_symbol) # Use base_symbol
+        
+        logging.info(f"Attempting metadata lookup with exact symbol: '{symbol_to_process}'")
+        metadata = get_fetch_metadata(conn, symbol_to_process)
+        
+        if not metadata:
+            logging.info(f"Exact symbol '{symbol_to_process}' not found in metadata. Trying derived base symbol.")
+            # Pass symbol_to_process to get_base_symbol
+            derived_base = get_base_symbol(symbol_to_process) 
+            if derived_base != symbol_to_process: 
+                logging.info(f"Derived base symbol: '{derived_base}'. Attempting metadata lookup with derived base.")
+                metadata = get_fetch_metadata(conn, derived_base)
+                symbol_for_metadata_lookup = derived_base 
+            else:
+                logging.info(f"Derived base symbol '{derived_base}' is the same as input '{symbol_to_process}'. No second lookup needed.")
+
     except duckdb.Error as e:
-         logging.error(f"Database connection error while reading metadata: {e}")
-         sys.exit(1)
+        logging.error(f"Database connection error while reading metadata: {e}")
+        sys.exit(1)
     finally:
         if conn:
             conn.close()
             logging.info("Closed metadata database connection.")
             
     if not metadata:
-        logging.error(f"Could not find fetch metadata for base symbol '{base_symbol}' (derived from '{args.symbol}'). Aborting.")
+        # Use symbol_for_metadata_lookup for the error message
+        # The input symbol in the message should be the original args.symbol
+        logging.error(f"Could not find fetch metadata using '{symbol_for_metadata_lookup}' (derived from input '{args.symbol}'). Aborting.")
         sys.exit(1)
             
     # --- Select script path based on operation type --- #
@@ -113,13 +144,13 @@ def main():
     if args.operation_type == 'fetch':
         target_script = metadata.get('historical_script_path')
         if not target_script:
-            logging.warning(f"No historical_script_path found for {base_symbol}, falling back to default: {DEFAULT_FETCHER_SCRIPT}")
+            logging.warning(f"No historical_script_path found for {symbol_for_metadata_lookup}, falling back to default: {DEFAULT_FETCHER_SCRIPT}")
             target_script = DEFAULT_FETCHER_SCRIPT
         logging.info(f"Operation type 'fetch': using historical script: {target_script}")
     elif args.operation_type == 'update':
         target_script = metadata.get('update_script_path')
         if not target_script:
-            logging.error(f"Operation type 'update' requested, but no update_script_path found for {base_symbol}. Aborting.")
+            logging.error(f"Operation type 'update' requested, but no update_script_path found for {symbol_for_metadata_lookup}. Aborting.")
             sys.exit(1)
         logging.info(f"Operation type 'update': using update script: {target_script}")
     # ------------------------------------------------- #
@@ -137,19 +168,18 @@ def main():
              sys.exit(1)
 
     # --- Construct command arguments --- #
-    cmd = [sys.executable, target_script_path] # Use sys.executable for python path
+    cmd = [sys.executable, target_script_path] 
     
-    # Argument handling now depends MORE on the operation type and script
     if args.operation_type == 'fetch':
-        # Assume scripts intended for fetching take symbol, interval, unit, force
-        cmd.extend(["--symbol", args.symbol])
+        # Pass the potentially translated symbol_to_process to the downstream script
+        cmd.extend(["--symbol", symbol_to_process]) 
         cmd.extend(["--interval-value", str(args.interval_value)]) 
         cmd.extend(["--interval-unit", args.interval_unit])       
         if args.force:
             cmd.append("--force")
-        # Log specific message if running the default fetcher for VX daily (as it uses CBOE source internally)
-        if target_script == DEFAULT_FETCHER_SCRIPT and base_symbol == 'VX' and args.interval_unit == 'daily':
-             logging.info(f"Note: Fetching daily VX data for {args.symbol} using '{target_script}', which will query the CBOE source table.")
+        # Use symbol_for_metadata_lookup for the VX CBOE note condition
+        if target_script == DEFAULT_FETCHER_SCRIPT and symbol_for_metadata_lookup == 'VX' and args.interval_unit == 'daily':
+             logging.info(f"Note: Fetching daily VX data for {symbol_to_process} using '{target_script}', which will query the CBOE source table.")
              
     elif args.operation_type == 'update':
         # Update scripts might have different arg needs
@@ -165,7 +195,8 @@ def main():
         else:
             # Unknown update script, pass basic args?
             logging.warning(f"Dispatching to unknown update script {target_script}. Passing --symbol and --force only.")
-            cmd.extend(["--symbol", args.symbol])
+            # Pass the potentially translated symbol_to_process
+            cmd.extend(["--symbol", symbol_to_process])
             if args.force:
                 cmd.append("--force")
 

@@ -1,71 +1,61 @@
 # Continuous Futures Contracts Guide
 
-This document explains how continuous futures contracts are handled within the system, covering both locally generated contracts (VIX) and source-provided contracts (ES, NQ).
+This document explains how continuous futures contracts are handled within the system. All continuous contracts specified in `symbol_metadata` with `data_source = 'tradestation'` are now built using a unified process that leverages underlying contract data from TradeStation.
 
 ## Overview
 
-Continuous futures contracts provide a synthetic, unbroken price series for a futures instrument by stitching together individual monthly or quarterly contracts based on predefined roll rules. This system uses two distinct methods depending on the root symbol:
+Continuous futures contracts provide a synthetic, unbroken price series for a futures instrument. In this system, all such contracts (e.g., `@ES=...`, `@NQ=...`, `@VX=...`) are built by the `src/scripts/market_data/continuous_contract_loader.py` script. This script fetches the necessary data for the underlying individual contracts from TradeStation and then stitches them together based on TradeStation's roll logic.
 
-1.  **Local Generation (VIX):** Continuous VIX contracts (`@VX=...`) are generated locally using data from individual VIX contracts (`VXK25`, `VXM25`, etc.) stored in the `market_data` table. The stitching logic relies on a pre-calculated mapping table (`continuous_contract_mapping`).
-2.  **Direct Fetching (ES, NQ):** Continuous ES (`@ES=...`) and NQ (`@NQ=...`) contracts are fetched *directly* from the TradeStation API, which provides its own pre-calculated continuous series. These are *not* generated locally by stitching individual contracts.
+The distinction between "locally generated VIX from CBOE data" and "directly fetched ES/NQ from TradeStation" is no longer accurate. **All continuous contracts sourced from TradeStation are now built by `continuous_contract_loader.py` using TradeStation underlying data.**
 
-All continuous contract data, regardless of origin, is stored in the `continuous_contracts` table.
+All resulting continuous contract data is stored in the `continuous_contracts` table.
 
 ## Naming Conventions
 
-*   **VIX (Generated):** `@VX=N01XN`
-    *   `@VX`: Indicates the VIX root symbol.
-    *   `N`: The contract number (1-9, representing front month, second month, etc.).
-    *   `01XN`: A fixed suffix used for locally generated VIX contracts.
-    *   *Example:* `@VX=101XN` (Front month continuous VIX), `@VX=201XN` (Second month continuous VIX).
+The naming convention for continuous contracts is defined in `config/market_symbols.yaml` and reflected in the `symbol_metadata` table (typically in the `data_table` column for `asset_type = 'continuous_future'`). Examples include:
 
-*   **ES/NQ (TradeStation):** `@ROOT=N02XT` (where T is C or N)
-    *   `@ROOT`: Indicates the root symbol (ES or NQ).
-    *   `N`: The contract number (typically 1 or 2 for front/second month provided by TradeStation).
-    *   `02`: A prefix indicating TradeStation's continuous contract type.
-    *   `X`: Separator.
-    *   `T`: Calculation type (`C` for Calendar-Weighted, `N` for Nearest).
-    *   *Example:* `@ES=102XC` (ES front month, calendar-weighted), `@NQ=202XN` (NQ second month, nearest).
+*   `@ES=102XC`: ES continuous contract (e.g., front month, calendar-weighted).
+*   `@NQ=202XN`: NQ continuous contract (e.g., second month, nearest).
+*   `@VX=101XN`: VIX continuous contract (e.g., front month, nearest).
 
-## VIX: Local Generation Process
+The exact meaning of the suffices (e.g., `102XC`, `101XN`) is determined by TradeStation's conventions for identifying continuous contract calculation methods and series.
 
-The generation of continuous VIX contracts (`@VX=...`) is a two-step process integrated into the main data update (`update_all_market_data.py`):
+## Unified Continuous Contract Generation Process
 
-1.  **Update Mapping Table (`continuous_contract_mapping`):**
-    *   **Script:** `src.scripts.market_data.vix.create_continuous_contract_mapping.main()`
-    *   **Purpose:** Creates/updates a table that maps every trading date to the specific underlying VIX contract (e.g., `VXK25`) that represents the 1st, 2nd, ..., 9th continuous contract on that day.
-    *   **Inputs:** Uses the `futures_roll_calendar` table (for expiry dates) and trading dates derived from `market_data`. Relies on expiry rules defined in `config/market_symbols.yaml`.
-    *   **Frequency:** Run during every `update_all_market_data.py` execution to ensure the mapping is current.
+The generation of all TradeStation-sourced continuous contracts is managed by `src/scripts/market_data/update_all_market_data.py`, which calls `src/scripts/market_data/continuous_contract_loader.py` for each relevant symbol.
 
-2.  **Generate Continuous Data:**
-    *   **Script:** `src.scripts.market_data.generate_continuous_futures.main()` (called with `root_symbol='VX'`)
-    *   **Purpose:** Uses the `continuous_contract_mapping` table to identify the correct underlying contract for each date and stitches their price data (`market_data` table) together to form the continuous series (`@VX=101XN`, `@VX=201XN`, etc.).
-    *   **Output:** Upserts the resulting continuous time series data into the `continuous_contracts` table.
-    *   **Frequency:** Run during every `update_all_market_data.py` execution. By default, it updates the last ~90 days, but can perform a full regeneration if specified.
+1.  **Identification of Continuous Contracts:**
+    *   The `update_all_market_data.py` script queries the `symbol_metadata` table.
+    *   It selects `data_table` values where `asset_type = 'continuous_future'` and `data_source = 'tradestation'`.
 
-## ES/NQ: Direct Fetching Process
+2.  **Invocation of `continuous_contract_loader.py`:**
+    *   For each continuous symbol identified, `update_all_market_data.py` executes `continuous_contract_loader.py` as a Python module, passing the specific continuous symbol name (e.g., `@ES=102XC`) and other necessary parameters (`--db-path`, `--config-path`, `--fetch-mode='auto'`, `--lookback-days`, `--roll-proximity-threshold-days`).
 
-Continuous contracts for ES and NQ are updated as part of the main data update (`update_all_market_data.py`) using the `MarketDataFetcher`:
+3.  **Logic within `continuous_contract_loader.py`:**
+    *   **Initialization:** Initializes its own `MarketDataFetcher` instance.
+    *   **Determine Processing Mode:** Based on the `fetch_mode` (defaulting to 'auto'), `force` flag (if passed, though not by the orchestrator in 'auto' mode), and `is_near_roll()` status (for adjusted contracts), it decides whether to fetch full history, a recent chunk, or full history due to roll proximity.
+    *   **Fetch Underlying Data:** Calls `fetcher.fetch_data_for_continuous_builder()` method. This crucial method in `MarketDataFetcher` is responsible for:
+        *   Interpreting the continuous symbol (e.g., `@ES=102XC`) to understand which series it represents.
+        *   Fetching the historical price data for the required *individual underlying contracts* from the TradeStation API for the determined period.
+    *   **Build Continuous Series:** Stitches the data from the fetched underlying contracts. The logic for how TradeStation rolls from one contract to the next is implicitly handled by how `fetch_data_for_continuous_builder` retrieves and prepares the data for stitching.
+    *   **Store Data:** Upserts the resulting continuous time series data into the `continuous_contracts` table.
 
-1.  **Fetch Continuous Data:**
-    *   **Mechanism:** `fetch_market_data.py`'s `update_continuous_contracts` function.
-    *   **Data Source:** TradeStation API.
-    *   **Action:** Fetches the latest *daily* data points for the configured continuous symbols (e.g., `@ES=102XC`, `@NQ=102XN`).
+## Key Points of the New System:
 
-2.  **Store Data:**
-    *   **Action:** Upserts the fetched data directly into the `continuous_contracts` table.
-
-*Note:* There is no local stitching or mapping table involved for ES/NQ continuous contracts in the current workflow.
+*   **Unified Builder:** `continuous_contract_loader.py` is the single point of logic for building all continuous contracts that rely on TradeStation underlying data.
+*   **TradeStation as Underlying Source:** Even for VIX continuous contracts (e.g., `@VX=101XN`), the underlying individual VIX futures data is now fetched from TradeStation, not CBOE, for the purpose of building these continuous series.
+*   **No Local VIX Mapping Table:** The previous `continuous_contract_mapping` table (specific to VIX and CBOE data) is no longer used for generating the primary continuous VIX series stored in `continuous_contracts` if they are configured as `data_source='tradestation'`.
+*   **Configuration Driven:** The `symbol_metadata` table (populated from `config/market_symbols.yaml`) dictates which continuous contracts are processed by this mechanism.
 
 ## Accessing Continuous Data
 
 Continuous contract data can be queried directly from the `continuous_contracts` table using standard SQL or viewed via the `DB_inspect.bat` tool.
 
 ```sql
--- Example: Get recent front-month continuous VIX data
+-- Example: Get recent front-month continuous VIX data (now built from TS underlying)
 SELECT *
 FROM continuous_contracts
-WHERE symbol = '@VX=101XN'
+WHERE symbol = '@VX=101XN' -- Or whatever specific @VX symbol is in symbol_metadata
   AND interval_unit = 'daily'
 ORDER BY timestamp DESC
 LIMIT 10;

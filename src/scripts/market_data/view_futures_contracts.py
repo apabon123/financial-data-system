@@ -40,7 +40,8 @@ def _get_metadata_table(conn, base_symbol: str, interval_unit: str, interval_val
     """Helper to query symbol_metadata for the correct data table based on symbol and interval."""
     try:
         query = "SELECT data_table FROM symbol_metadata WHERE base_symbol = ? AND interval_unit = ? AND interval_value = ? LIMIT 1"
-        params = [base_symbol, interval_unit, interval_value]
+        # Ensure base_symbol is uppercase for the query to match how it's stored from market_symbols.yaml
+        params = [base_symbol.upper(), interval_unit, interval_value]
         result = conn.execute(query, params).fetchone()
         if result:
             return result[0]

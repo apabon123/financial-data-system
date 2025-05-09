@@ -55,7 +55,7 @@ def summarize_inventory(db_connection: duckdb.DuckDBPyConnection, base_symbol_fi
         symbol_column = "symbol"
         query = f"""
         SELECT 
-            symbol, 
+            {symbol_column}, 
             interval_unit,
             interval_value,
             adjusted,
@@ -64,9 +64,10 @@ def summarize_inventory(db_connection: duckdb.DuckDBPyConnection, base_symbol_fi
             strftime(MAX(timestamp)::TIMESTAMP, '%Y-%m-%d') as last_date,
             COUNT(*) as record_count
         FROM {target_table} 
-        GROUP BY symbol, interval_unit, interval_value, adjusted, built_by
-        ORDER BY symbol, interval_unit, interval_value, adjusted, built_by;
+        GROUP BY {symbol_column}, interval_unit, interval_value, adjusted, built_by
+        ORDER BY {symbol_column}, interval_unit, interval_value, adjusted, built_by;
         """
+        query_params = None # Initialize query_params for this branch
     else:
         print("--- Fetching Symbol Inventory Metadata ---")
         if base_symbol_filter:
@@ -147,9 +148,16 @@ def summarize_inventory(db_connection: duckdb.DuckDBPyConnection, base_symbol_fi
                      1 as interval_value,   -- Assume CBOE data is daily
                      timestamp
                  FROM market_data_cboe
+                 UNION ALL
+                 SELECT
+                     symbol,            -- Already contains the specific continuous symbol, e.g., @ES=102XC
+                     interval_unit,     -- Has its own interval_unit
+                     interval_value,    -- Has its own interval_value
+                     timestamp          -- Has its own timestamp
+                 FROM continuous_contracts
              )
              SELECT
-                 symbol,
+                 symbol,                 -- This will be the specific symbol like @ES=102XC, ESM24, etc.
                  interval_unit,
                  interval_value,
                  strftime(MIN(timestamp)::TIMESTAMP, '%Y-%m-%d') as first_date,
@@ -163,8 +171,8 @@ def summarize_inventory(db_connection: duckdb.DuckDBPyConnection, base_symbol_fi
             # --- END UNFILTERED O1 Case ---
 
     try:
-        # Use execute with parameters if they exist
-        if query_params:
+        # Use execute with parameters if they exist (and are not None)
+        if query_params is not None:
             metadata_df = db_connection.execute(query, query_params).fetchdf()
         else:
             metadata_df = db_connection.execute(query).fetchdf()

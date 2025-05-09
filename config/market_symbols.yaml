@@ -5,13 +5,13 @@ indices:
     description: CBOE Volatility Index
     exchange: CBOE
     type: Index
-    default_source: cboe
-    default_raw_table: market_data_cboe
+    default_source: tradestation
+    default_raw_table: market_data
     frequencies: # Kept as list of dictionaries
       - name: daily # Uses defaults
         interval: 1
         unit: daily
-    start_date: '1993-01-29'
+    start_date: '2005-01-01'
     calendar: CFE
 
 
@@ -32,7 +32,6 @@ futures:
       day_number: 3
       adjust_for_holiday: true
     start_date: '2003-01-01'
-    is_continuous: true
 
   - base_symbol: NQ
     default_source: tradestation
@@ -50,7 +49,6 @@ futures:
       day_number: 3
       adjust_for_holiday: true
     start_date: '2003-01-01'
-    is_continuous: true
 
   - base_symbol: CL
     default_source: tradestation
@@ -95,11 +93,9 @@ futures:
     calendar: CFE
     description: CBOE Volatility Index Futures
     exchange: CBOE
-    frequencies: # Kept as list of dictionaries due to override
+    frequencies: # MODIFIED - removed CBOE override for daily
       - name: daily
-        source: cboe              # Explicit override
-        raw_table: market_data_cboe # Explicit override
-        interval: 1
+        interval: 1 # Now uses default_source (tradestation) and default_raw_table (market_data)
         unit: daily
       - name: 1min               # Uses defaults
         interval: 1
@@ -109,7 +105,7 @@ futures:
         unit: minute
     historical_contracts:
       patterns: [F, G, H, J, K, M, N, Q, U, V, X, Z]
-      start_year: 2004
+      start_year: 2004 # This will be overridden by the symbol-level start_date for fetching, but retain for reference
       exclude_contracts: # Added list of known non-trading contracts
         - VXF04
         - VXG04
@@ -123,9 +119,57 @@ futures:
     expiry_rule:
       day_type: wednesday
       special_rule: VX_expiry
-    start_date: '2004-01-01'
-    is_continuous: True
+    start_date: '2005-01-01' # MODIFIED
 
+  # REPLACED: 9 individual @VX=...XN entries with a continuous_group
+  - continuous_group:
+      identifier_base: "@VX"
+      month_codes: ["1", "2", "3", "4", "5", "6", "7", "8", "9"]
+      settings_code: "01XN"
+      description_template: "TradeStation Continuous VIX Future ({nth_month} month)"
+      exchange: CFE
+      type: continuous_future
+      default_source: tradestation
+      default_raw_table: market_data
+      frequencies: [daily]
+      start_date: '2005-01-01'
+      calendar: CFE
+
+  - symbol: "@ES=102XC"
+    type: continuous_future
+    description: "ES Continuous Contract (Adjusted, Backwards Ratio, TradeStation)"
+    default_source: tradestation
+    exchange: CME
+    calendar: CME_Equity
+    frequencies: [1min,15min, daily]
+    start_date: '2003-01-01'
+
+  - symbol: "@ES=101XN"
+    type: continuous_future
+    description: "ES Continuous Contract (Unadjusted, TradeStation)"
+    default_source: tradestation
+    exchange: CME
+    calendar: CME_Equity
+    frequencies: [1min, 15min, daily]
+    start_date: '2003-01-01'
+
+  - symbol: "@NQ=102XC"
+    type: continuous_future
+    description: "NQ Continuous Contract (Adjusted, Backwards Ratio, TradeStation)"
+    default_source: tradestation
+    exchange: CME
+    calendar: CME_Equity
+    frequencies: [1min, 15min, daily]
+    start_date: '2003-01-01'
+
+  - symbol: "@NQ=101XN"
+    type: continuous_future
+    description: "NQ Continuous Contract (Unadjusted, TradeStation)"
+    default_source: tradestation
+    exchange: CME
+    calendar: CME_Equity
+    frequencies: [1min, 15min, daily]
+    start_date: '2003-01-01'
 
 equities:
   - symbol: SPY

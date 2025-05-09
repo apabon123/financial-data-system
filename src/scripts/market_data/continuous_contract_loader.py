@@ -17,7 +17,7 @@ from typing import Optional
 load_dotenv(os.path.join(os.path.dirname(__file__), 'config', '.env'))
 
 # Add the project root directory to the Python path
-project_root = str(Path(__file__).resolve().parent.parent)
+project_root = str(Path(__file__).resolve().parent.parent.parent.parent)
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
@@ -249,45 +249,61 @@ def get_next_roll_date(symbol_root: str, config: dict, fetcher: MarketDataFetche
     logger.info(f"Calculated expiry for {final_next_symbol}: {final_expiry_date.date()}, Roll Date: {roll_date.date()}")
     return roll_date.normalize() # Normalize to remove time component
 
-def is_near_roll(symbol_root: str, config: dict, fetcher: MarketDataFetcher) -> bool:
+def is_near_roll(symbol_root: str, config: dict, fetcher: MarketDataFetcher, proximity_days: int = 7) -> bool:
     """
-    Check if we're near a roll date for the given symbol using its specific cycle.
-    We'll consider "near roll" as within 5 trading days of the roll.
+    Check if the current date is near the roll date for the given futures symbol.
+    "Near roll" is defined as being within `proximity_days` trading days OF or AFTER 
+    the calculated roll date (which is typically 2 days before expiry).
+    Effectively, this means we are past the ideal roll point or very close to it.
+
+    Args:
+        symbol_root: The root symbol (ES, NQ, VX, etc.)
+        config: Market symbols configuration dictionary
+        fetcher: An initialized MarketDataFetcher instance
+        proximity_days: Number of calendar days to define the "near roll" window. 
+                        If today is within roll_date - proximity_days and roll_date, it's near.
+                        Actually, it's more like if roll_date is within today to today + proximity_days.
+                        Let's redefine: True if today is within `proximity_days` of the next roll date,
+                        OR if today is past the next roll date.
+
+    Returns:
+        True if near roll date, False otherwise.
     """
     try:
-        # Pass fetcher to get_next_roll_date
-        next_roll = get_next_roll_date(symbol_root, config, fetcher) 
-        today = pd.Timestamp.now().normalize()
+        next_roll_timestamp = get_next_roll_date(symbol_root, config, fetcher)
+        if not next_roll_timestamp:
+            logger.warning(f"Could not determine next roll date for {symbol_root}. Assuming not near roll.")
+            return False
+
+        # Ensure next_roll_timestamp is a timezone-naive pd.Timestamp for comparison
+        if isinstance(next_roll_timestamp, datetime):
+            next_roll_timestamp = pd.Timestamp(next_roll_timestamp)
         
-        futures_config = next(
-            (f for f in config.get('futures', []) if f['base_symbol'] == symbol_root),
-            None
-        )
-        if not futures_config:
-             logger.warning(f"No futures config found for {symbol_root} during roll check.")
-             return False 
-        if 'calendar' not in futures_config:
-             logger.warning(f"No 'calendar' key found for {symbol_root} in config during roll check.")
-             return False 
-             
-        # Use fetcher to get calendar instance
-        calendar = get_trading_calendar(futures_config['calendar'])
+        if next_roll_timestamp.tzinfo is not None:
+            next_roll_timestamp = next_roll_timestamp.tz_localize(None)
+
+        today = pd.Timestamp.now().normalize() # Today, also timezone-naive
+
+        # Check if today is on or after the roll date
+        if today >= next_roll_timestamp:
+            logger.info(f"Today ({today.date()}) is ON or AFTER the roll date ({next_roll_timestamp.date()}) for {symbol_root}. Considered near roll.")
+            return True
         
-        # Ensure next_roll is timezone-naive if today is
-        if today.tz is None and next_roll.tz is not None:
-             next_roll = next_roll.tz_localize(None)
-             
-        trading_days = calendar.valid_days(start_date=today, end_date=next_roll)
+        # Check if the roll date is within the proximity window from today
+        # e.g. proximity_days = 7. If roll is 5 days from now, today + 7 days > roll_date. TRUE.
+        if next_roll_timestamp <= today + pd.Timedelta(days=proximity_days):
+            logger.info(f"Roll date ({next_roll_timestamp.date()}) for {symbol_root} is within {proximity_days} days from today ({today.date()}). Considered near roll.")
+            return True
+            
+        logger.info(f"Today ({today.date()}) is not near roll date ({next_roll_timestamp.date()}) for {symbol_root} (proximity: {proximity_days} days).")
+        return False
         
-        # Check if roll date is today or in the future, and <= 5 trading days away
-        is_near = (next_roll >= today) and (len(trading_days) <= 5)
-        logger.debug(f"Roll check for {symbol_root}: Today={today.date()}, NextRoll={next_roll.date()}, TradingDays={len(trading_days)}, IsNear={is_near}")
-        return is_near
-        
+    except ValueError as e:
+        logger.error(f"Error calculating roll date for {symbol_root} in is_near_roll: {e}. Assuming not near roll.")
+        return False
     except Exception as e:
-        # Log error but don't crash the whole update if roll check fails for one symbol
-        logger.error(f"Error checking roll date for {symbol_root}: {e}", exc_info=True)
-        return False # Default to False if error occurs
+        logger.error(f"Unexpected error in is_near_roll for {symbol_root}: {e}", exc_info=True)
+        return False # Default to False on any other unexpected error
 
 def get_start_date(symbol_root: str, config: dict, force: bool = False, interval_unit: str = 'daily') -> str:
     """
@@ -334,167 +350,274 @@ def get_start_date(symbol_root: str, config: dict, force: bool = False, interval
         # For intraday data, use a shorter lookback to avoid API limitations
         return (datetime.now() - timedelta(days=7)).strftime('%Y-%m-%d')
 
-def load_continuous_data(fetcher: MarketDataFetcher, symbol_root: str, config: dict, force: bool = False, interval_value: int = 1, interval_unit: str = 'daily', specific_symbol: Optional[str] = None):
+def load_continuous_data(fetcher: MarketDataFetcher, symbol_root: str, config: dict, force: bool = False, interval_value: int = 1, interval_unit: str = 'daily', specific_symbol: Optional[str] = None, fetch_mode: str = 'auto', lookback_days: int = 90, roll_proximity_threshold_days: int = 7):
     """
     Load continuous contract data for a given symbol root using the existing MarketDataFetcher.
-    If specific_symbol is provided, only that symbol is fetched.
-    
-    Args:
-        fetcher: Instance of MarketDataFetcher
-        symbol_root: The root symbol (e.g., 'ES' or 'NQ') used for config lookups.
-        config: Market symbols configuration
-        force: Whether to force update the entire series
-        interval_value: The interval value (e.g., 1 for daily, 15 for 15-minute)
-        interval_unit: The interval unit (e.g., 'daily' or 'minute')
-        specific_symbol: If set, fetch only this exact continuous symbol.
-    """
-    # Check if we're near a roll date, passing the fetcher
-    # Only relevant if processing based on root, not specific symbol
-    near_roll = False
-    if not specific_symbol:
-        near_roll = is_near_roll(symbol_root, config, fetcher)
-        if near_roll:
-            logger.info(f"{symbol_root} is near roll date - will update entire constant-adjusted series")
-    
-    # Define the symbols to process
-    if specific_symbol:
-        symbols_to_process = [specific_symbol]
-        logger.info(f"Processing specific continuous symbol: {specific_symbol}")
-    else:
-        # Default: process both constant-adjusted and unadjusted continuous contract symbols
-        symbols_to_process = [
-            f"@{symbol_root}=102XC",  # First month, 02 days before expiry, constant adjustment
-            f"@{symbol_root}=102XN"   # First month, 02 days before expiry, no adjustment
-        ]
-        logger.info(f"Processing standard continuous symbols for root: {symbol_root}")
-    
-    for continuous_symbol in symbols_to_process:
-        # Determine adjusted flag based on the actual symbol being processed
-        is_adjusted = 'XC' in continuous_symbol
-        
-        try:
-            # Determine start date based on type and conditions
-            # Pass the correct interval_unit to get_start_date
-            if force:
-                # Force mode: Use base symbol's configured start date
-                start_date = get_start_date(symbol_root, config, True, interval_unit) 
-            elif is_adjusted and near_roll and not specific_symbol:
-                # For constant-adjusted contracts, update entire series if forced or near roll
-                # Only apply near_roll logic if NOT processing a specific symbol
-                start_date = get_start_date(symbol_root, config, True, interval_unit)
-            else:
-                # For unadjusted or normal updates, just get recent data
-                start_date = get_start_date(symbol_root, config, False, interval_unit)
-            
-            logger.info(f"Fetching {interval_value}-{interval_unit} data for {continuous_symbol} from {start_date}")
-            
-            # Get data using the existing fetcher
-            df = fetcher.fetch_data_since(
-                symbol=continuous_symbol,
-                interval=interval_value,
-                unit=interval_unit,
-                start_date=start_date,
-                end_date=datetime.now().strftime('%Y-%m-%d')
-            )
-            
-            if df is None or df.empty:
-                logger.error(f"No data returned for {continuous_symbol}. This could be due to:")
-                logger.error("1. Symbol not supporting this interval")
-                logger.error("2. No trading activity in the specified period")
-                logger.error("3. API limitations on historical data")
-                continue
-            
-            # Add metadata columns to match the existing schema
-            df['symbol'] = continuous_symbol
-            df['underlying_symbol'] = None  # Will be filled by TradeStation's data
-            df['source'] = 'tradestation'
-            df['interval_value'] = interval_value
-            df['interval_unit'] = interval_unit
-            df['adjusted'] = is_adjusted
-            df['quality'] = 100  # Direct from source
-            df['built_by'] = 'tradestation' # Added BuiltBy field
-            df['open_interest'] = None  # Not available in continuous contracts
-            df['up_volume'] = None
-            df['down_volume'] = None
-            df['settle'] = df['close']
-            
-            # Save to database using the fetcher's connection
-            # Ensure fetcher.conn is valid before using
-            if not hasattr(fetcher, 'conn') or not fetcher.conn:
-                 logger.error(f"Fetcher database connection not available. Cannot save data for {continuous_symbol}.")
-                 continue # Skip saving if connection invalid
-            try:
-                rows_before_query = "SELECT COUNT(*) FROM continuous_contracts"
-                rows_before_result = fetcher.conn.execute(rows_before_query).fetchone()
-                rows_before = rows_before_result[0] if rows_before_result else 0
-            except Exception as count_e:
-                logger.error(f"Error getting row count before save for {continuous_symbol}: {count_e}")
-                rows_before = -1 # Indicate error
-            
-            # Use DuckDB's efficient UPSERT capability via temp view registration
-            temp_view_name = f"temp_cont_{symbol_root}_{interval_value}{interval_unit}_view"
-            try:
-                 fetcher.conn.register(temp_view_name, df)
-                 
-                 # Define columns to insert/update dynamically
-                 insert_columns = list(df.columns) # Use columns present in the dataframe
-                 if 'built_by' not in insert_columns: insert_columns.append('built_by') # Ensure built_by is included
-                 insert_columns_str = ", ".join(insert_columns)
-                 update_setters_str = ", ".join([f"{col} = EXCLUDED.{col}" for col in insert_columns if col not in ['timestamp', 'symbol', 'interval_value', 'interval_unit', 'adjusted']]) # Don't update PK cols or adjusted
+    Handles different fetch modes and roll proximity for adjusted contracts.
 
-                 upsert_sql = f"""
-                 INSERT INTO continuous_contracts ({insert_columns_str})
-                 SELECT 
-                     {insert_columns_str}
-                 FROM {temp_view_name}
-                 ON CONFLICT (symbol, timestamp, interval_value, interval_unit) DO UPDATE SET 
-                     {update_setters_str}
-                 """
-                 fetcher.conn.execute(upsert_sql)
-                 fetcher.conn.commit() # Commit after each symbol pair (XC/XN) processing
+    Args:
+        fetcher: Initialized MarketDataFetcher instance.
+        symbol_root: The base future root (e.g., ES, NQ, VX).
+        config: The market symbols configuration dictionary.
+        force: If True, overrides fetch_mode to 'full'.
+        interval_value: Interval value (e.g., 1, 15).
+        interval_unit: The interval unit (e.g., 'daily' or 'minute').
+        specific_symbol: The exact continuous symbol to process (e.g., @ES, @VX=101XN).
+        fetch_mode: The mode of fetching data ('auto', 'latest', 'full').
+        lookback_days: Days to look back for 'latest' mode or 'auto' (not near roll).
+        roll_proximity_threshold_days: Days before expiry to consider 'near roll' in 'auto' mode.
+    """
+    logger.info(f"Starting load_continuous_data for: {specific_symbol or symbol_root}, Interval: {interval_value}{interval_unit}, Mode: {fetch_mode}, Force: {force}")
+
+    if not specific_symbol:
+        specific_symbol = f"@{symbol_root}"
+        logger.warning(f"specific_symbol was None, defaulting to {specific_symbol}. This might indicate an issue in the calling logic.")
+        logger.error("Cannot load continuous data without a specific symbol.")
+        return
+
+    logger.info(f"Requesting processing for: {specific_symbol}, Interval: {interval_value}{interval_unit}, Force Fetch: {force}")
+
+    # --- Determine Fetch Start Date --- 
+    fetch_start_date_str = None
+    config_start_date_str = None
+    try:
+        # Get config start date for the base symbol (ES, NQ, VX)
+        base_config = fetcher._get_symbol_config(symbol_root) # Use the root symbol
+        if base_config:
+            config_start_date_str = base_config.get('start_date')
+        
+        if force:
+            fetch_start_date_str = config_start_date_str or '1970-01-01' # Use config date or very old date if forced
+            logger.info(f"Force fetch requested. Fetching from: {fetch_start_date_str}")
+        else:
+            # Query continuous_contracts for the latest timestamp
+            latest_ts = None
+            try:
+                query_latest = "SELECT MAX(timestamp) FROM continuous_contracts WHERE symbol=? AND interval_unit=? AND interval_value=?"
+                result_latest = fetcher.conn.execute(query_latest, [specific_symbol, interval_unit, interval_value]).fetchone()
+                if result_latest and result_latest[0]:
+                    latest_ts = pd.Timestamp(result_latest[0])
+            except Exception as db_e:
+                logger.warning(f"Could not query latest timestamp for {specific_symbol} from continuous_contracts: {db_e}. Will fetch from config start date.")
+            
+            if latest_ts:
+                 # Fetch from the day after the latest timestamp found
+                 fetch_start_date = latest_ts + pd.Timedelta(seconds=1) # Add a second to avoid refetching last bar
+                 fetch_start_date_str = fetch_start_date.strftime('%Y-%m-%d')
+                 logger.info(f"Found existing data up to {latest_ts}. Fetching new data from {fetch_start_date_str}")
+            else:
+                 fetch_start_date_str = config_start_date_str or '1970-01-01'
+                 logger.info(f"No existing data found for {specific_symbol} in continuous_contracts. Fetching from: {fetch_start_date_str}")
                  
-                 try:
-                     rows_after_query = "SELECT COUNT(*) FROM continuous_contracts"
-                     rows_after_result = fetcher.conn.execute(rows_after_query).fetchone()
-                     rows_after = rows_after_result[0] if rows_after_result else 0
-                     rows_added = rows_after - rows_before if rows_before != -1 else -1
-                 except Exception as count_e:
-                     logger.error(f"Error getting row count after save for {continuous_symbol}: {count_e}")
-                     rows_after = -1
-                     rows_added = -1
-                     
-                 logger.info(f"Successfully loaded continuous contract data for {continuous_symbol}")
-                 if rows_added != -1:
-                      logger.info(f"Upserted {len(df)} rows (approx {rows_added} new) to the database")
-                 else:
-                      logger.info(f"Upserted {len(df)} rows to the database (count change unavailable)")
-                      
-            except Exception as save_e:
-                 logger.error(f"Error saving data to database for {continuous_symbol}: {save_e}", exc_info=True)
-                 try:
-                     fetcher.conn.rollback() # Attempt rollback on error
-                 except Exception as rb_e:
-                     logger.error(f"Rollback failed: {rb_e}")
-                 continue # Continue to next symbol even if save fails
-            finally:
-                 try:
-                      fetcher.conn.unregister(temp_view_name) # Clean up the view
-                 except Exception as unreg_e:
-                      logger.warning(f"Could not unregister temp view {temp_view_name}: {unreg_e}")
-                      
-        except Exception as e:
-            logger.error(f"Error processing {continuous_symbol}: {str(e)}", exc_info=True)
-            continue # Continue to the next symbol in XC/XN pair
+    except Exception as e:
+        logger.error(f"Error determining start date for {specific_symbol}: {e}. Aborting fetch.")
+        return
+
+    # --- Fetch Data using fetch_data_since --- 
+    try:
+        logger.info(f"Fetching {interval_value}{interval_unit} data for {specific_symbol} from {fetch_start_date_str}")
+        df = fetcher.fetch_data_since(
+            symbol=specific_symbol, 
+            interval=interval_value, 
+            unit=interval_unit, 
+            start_date=fetch_start_date_str
+        )
+
+        if df is None or df.empty:
+            logger.warning(f"No data returned by fetch_data_since for {specific_symbol} from {fetch_start_date_str}. Nothing to save.")
+            return # Exit function if no data
+            
+        logger.info(f"fetch_data_since returned {len(df)} rows for {specific_symbol}.")
+
+        # --- Process Dataframe for continuous_contracts table --- 
+        is_adjusted = False # Determine adjustment based on symbol name convention
+        if specific_symbol and "=" in specific_symbol and "C" in specific_symbol.split('=')[-1]:
+             is_adjusted = True
+        elif specific_symbol and specific_symbol.startswith(('@ES', '@NQ')) and '=' not in specific_symbol:
+             # Assume generic @ES/@NQ implies adjusted if no specific settings code provided?
+             # This might need refinement based on actual usage/config intent.
+             is_adjusted = True 
+             
+        df['symbol'] = specific_symbol
+        # fetch_data_since doesn't provide underlying symbol
+        df['underlying_symbol'] = None 
+        df['source'] = 'tradestation' # Source is TS, even though we build it
+        # interval_value, interval_unit are already correct from input
+        df['adjusted'] = is_adjusted
+        df['quality'] = 100  # Assume good quality 
+        df['built_by'] = 'continuous_contract_loader' # This script processed it
+        
+        # Ensure standard OHLCV columns exist, handle potential missing ones if needed
+        for col in ['open', 'high', 'low', 'close', 'volume']:
+            if col not in df.columns:
+                logger.warning(f"Column '{col}' missing from fetch_data_since output. Setting to NaN/0.")
+                df[col] = pd.NA if col != 'volume' else 0
+                
+        # Add other potentially missing columns expected by the database table
+        # Use .get() for safety, defaulting to None or another value
+        df['open_interest'] = df.get('open_interest', None)
+        df['up_volume'] = df.get('up_volume', None)
+        df['down_volume'] = df.get('down_volume', None)
+        df['settle'] = df.get('settle', df['close']) # Use settle if returned, else default to close
+
+        # Select only columns that exist in the target table to avoid errors
+        target_columns = []
+        try:
+            table_info = fetcher.conn.execute(f"PRAGMA table_info('continuous_contracts')").fetchall()
+            target_columns = [col[1] for col in table_info]
+        except Exception as pragma_e:
+            logger.error(f"Could not get columns for continuous_contracts table: {pragma_e}. Save might fail.")
+            # Define expected columns as fallback
+            target_columns = ['timestamp', 'symbol', 'underlying_symbol', 'open', 'high', 'low', 'close', 'volume', 'open_interest', 'up_volume', 'down_volume', 'source', 'built_by', 'interval_value', 'interval_unit', 'adjusted', 'quality', 'settle']
+
+        df_to_save = df[[col for col in target_columns if col in df.columns]].copy()
+        
+        # --- Delete existing data if force=True --- 
+        if force:
+            try:
+                logger.info(f"Force mode: Deleting existing data for {specific_symbol} ({interval_unit}/{interval_value}) from continuous_contracts table.")
+                delete_sql = "DELETE FROM continuous_contracts WHERE symbol=? AND interval_unit=? AND interval_value=?"
+                delete_params = [specific_symbol, interval_unit, interval_value]
+                cur = fetcher.conn.execute(delete_sql, delete_params)
+                logger.info(f"Deleted {cur.fetchone()[0]} rows.")
+                # No commit needed usually for DELETE in DuckDB unless in explicit transaction
+            except Exception as del_e:
+                 logger.error(f"Error deleting existing data for {specific_symbol}: {del_e}. Proceeding with upsert.")
+        
+        # --- Save to continuous_contracts table --- 
+        if not hasattr(fetcher, 'conn') or not fetcher.conn:
+             logger.error(f"Fetcher database connection not available. Cannot save data for {specific_symbol}.")
+             return # Skip saving if connection invalid
+             
+        try:
+            # Get row count before upsert (for logging)
+            rows_before_query = "SELECT COUNT(*) FROM continuous_contracts WHERE symbol=? AND interval_unit=? AND interval_value=?"
+            rows_before_result = fetcher.conn.execute(rows_before_query, [specific_symbol, interval_unit, interval_value]).fetchone()
+            rows_before = rows_before_result[0] if rows_before_result else 0
+        except Exception as count_e:
+            logger.error(f"Error getting row count before save for {specific_symbol}: {count_e}")
+            rows_before = -1 # Indicate error
+        
+        # Use DuckDB's efficient UPSERT capability via temp view registration
+        safe_symbol_name = re.sub(r'[^a-zA-Z0-9_]', '', specific_symbol)
+        temp_view_name = f"temp_cont_{safe_symbol_name}_{interval_value}{interval_unit}_view"
+        try:
+             fetcher.conn.register(temp_view_name, df_to_save) # Register the filtered dataframe
+             
+             # Define columns to insert/update dynamically based on df_to_save
+             insert_columns = list(df_to_save.columns) 
+             insert_columns_str = ", ".join([f'\"{col}\"' for col in insert_columns]) # Quote column names
+             pk_columns = ['symbol', 'timestamp', 'interval_value', 'interval_unit']
+             update_columns = [col for col in insert_columns if col not in pk_columns]
+             update_setters_str = ", ".join([f'\"{col}\" = EXCLUDED.\"{col}\"' for col in update_columns])
+
+             if not update_setters_str:
+                  # Handle case where only PK columns are present
+                  logger.warning(f"No columns to update for {specific_symbol}. Only inserting.")
+                  upsert_sql = f"""
+                  INSERT INTO continuous_contracts ({insert_columns_str})
+                  SELECT {insert_columns_str}
+                  FROM {temp_view_name}
+                  ON CONFLICT DO NOTHING
+                  """
+             else:
+                  upsert_sql = f"""
+                  INSERT INTO continuous_contracts ({insert_columns_str})
+                  SELECT {insert_columns_str}
+                  FROM {temp_view_name}
+                  ON CONFLICT (symbol, timestamp, interval_value, interval_unit) DO UPDATE SET 
+                      {update_setters_str}
+                  """
+             
+             logger.debug(f"Executing UPSERT SQL for {specific_symbol}:")#\n{upsert_sql}") 
+             fetcher.conn.execute(upsert_sql)
+             # fetcher.conn.commit() # Let context manager handle commit
+             
+             try:
+                 rows_after_query = "SELECT COUNT(*) FROM continuous_contracts WHERE symbol=? AND interval_unit=? AND interval_value=?"
+                 rows_after_result = fetcher.conn.execute(rows_after_query, [specific_symbol, interval_unit, interval_value]).fetchone()
+                 rows_after = rows_after_result[0] if rows_after_result else 0
+                 rows_added = rows_after - rows_before if rows_before != -1 else -1
+             except Exception as count_e:
+                 logger.error(f"Error getting row count after save for {specific_symbol}: {count_e}")
+                 rows_after = -1
+                 rows_added = -1
+                 
+             logger.info(f"Successfully saved continuous contract data for {specific_symbol} to continuous_contracts table")
+             if rows_added != -1:
+                  logger.info(f"Upserted {len(df_to_save)} rows (approx {rows_added} new) to the database")
+             else:
+                  logger.info(f"Upserted {len(df_to_save)} rows to the database (count change unavailable)")
+                  
+        except Exception as save_e:
+             logger.error(f"Error saving data to database for {specific_symbol}: {save_e}", exc_info=True)
+             try: fetcher.conn.rollback() 
+             except Exception as rb_e: logger.error(f"Rollback attempt failed: {rb_e}")
+             return # Stop processing this symbol on save error
+        finally:
+             try:
+                  fetcher.conn.unregister(temp_view_name) # Clean up the view
+             except Exception as unreg_e:
+                  logger.warning(f"Could not unregister temp view {temp_view_name}: {unreg_e}")
+                  
+    except Exception as e:
+        logger.error(f"Error processing {specific_symbol}: {str(e)}", exc_info=True)
+        return
 
 def main():
-    # Parse command line arguments
-    parser = argparse.ArgumentParser(description='Load continuous contract data')
-    parser.add_argument('--force', action='store_true', help='Force update entire series')
-    parser.add_argument('--interval-value', type=int, default=1, help='Interval value (e.g., 1 for daily, 15 for 15-minute)')
-    parser.add_argument('--interval-unit', type=str, default='daily', help='Interval unit (e.g., daily or minute)')
-    parser.add_argument('--symbol', type=str, default=None, help='Fetch a specific continuous contract symbol (e.g., @ES=102XC)')
+    DEFAULT_DB_PATH = os.path.join(project_root, "data", "financial_data.duckdb")
+    DEFAULT_CONFIG_PATH = os.path.join(project_root, "config", "market_symbols.yaml")
+
+    parser = argparse.ArgumentParser(description="Load and build continuous futures contracts from TradeStation data.")
+    parser.add_argument(
+        "symbol",
+        help="The continuous contract symbol to process (e.g., @ES, @VX=101XN, ES for generic @ES)."
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Force re-fetch of all historical data for underlying contracts."
+    )
+    parser.add_argument(
+        "--db-path",
+        default=DEFAULT_DB_PATH,
+        help=f"Path to the DuckDB database file (default: {DEFAULT_DB_PATH})."
+    )
+    parser.add_argument(
+        "--config-path",
+        default=DEFAULT_CONFIG_PATH,
+        help=f"Path to the market symbols YAML configuration file (default: {DEFAULT_CONFIG_PATH})."
+    )
+    # Add interval arguments, defaulting to daily
+    parser.add_argument("--interval-value", type=int, default=1, help="Interval value (default: 1).")
+    parser.add_argument("--interval-unit", type=str, default='daily', choices=['daily', 'minute', 'hour'], help="Interval unit (default: 'daily').")
+
+    # New arguments for fetch control
+    parser.add_argument(
+        "--fetch-mode",
+        type=str,
+        default='auto',
+        choices=['auto', 'latest', 'full'],
+        help="Fetch mode: 'auto' (default, intelligent roll handling), 'latest' (fetch recent N days), 'full' (fetch all history)."
+    )
+    parser.add_argument(
+        "--lookback-days",
+        type=int,
+        default=90,
+        help="Number of days to look back when fetch_mode is 'latest' or 'auto' (and not near roll for adjusted). Default: 90."
+    )
+    parser.add_argument(
+        "--roll-proximity-threshold-days",
+        type=int,
+        default=7,
+        help="Days before expiry to trigger full series rebuild for adjusted contracts in 'auto' mode (default: 7)"
+    )
+
     args = parser.parse_args()
-    
+
+    logger.info(f"Continuous Contract Loader started for: {args.symbol}")
+    logger.info(f"Using DB Path: {args.db_path}, Config Path: {args.config_path}") # DEBUG DB PATH
+
     # Setup database table
     # setup_continuous_db() # Removed setup call - should be handled by main orchestrator
     
@@ -506,67 +629,101 @@ def main():
         sys.exit(1)
     
     # Initialize the fetcher and authenticate with TradeStation
+    config_file_path = args.config_path # Define path used by load_config
+    
     fetcher = None
     try:
-        fetcher = MarketDataFetcher() # Manages its own connection if none passed
-        if not fetcher.ts_agent.authenticate():
-            logger.error("Failed to authenticate with TradeStation")
+        # Pass the config_path, not the loaded config dictionary
+        fetcher = MarketDataFetcher(
+            config_path=config_file_path, 
+            db_path=args.db_path # This db_path is from args
+        )
+        logger.info(f"DEBUG_LOADER: MarketDataFetcher initialized with db_path: {fetcher.db_path}") # Log the path fetcher is using
+        # Authenticate the fetcher's agent
+        if not fetcher.ts_agent or not fetcher.ts_agent.authenticate():
+            logger.error("Failed to initialize or authenticate TradeStation fetcher")
             sys.exit(1)
-        # Load config into fetcher if needed for its internal methods
-        fetcher.config = config 
     except Exception as e:
-        logger.error(f"Failed to initialize or authenticate TradeStation fetcher: {e}")
-        sys.exit(1)
-    
-    if args.symbol:
-        # Handle specific symbol fetch
-        logger.info(f"Processing specific continuous contract symbol: {args.symbol}...")
-        
-        # Extract root symbol from the continuous symbol for config lookup
-        match = re.match(r"^@([A-Z]{1,3})=[0-9]+[A-Z]{2}$", args.symbol)
-        root_symbol_for_config = match.group(1) if match else None
-        
-        if not root_symbol_for_config:
-            logger.error(f"Could not extract base symbol from {args.symbol}. Cannot proceed.")
-            sys.exit(1)
-            
-        # Find the config for this root symbol
-        symbol_config = next((f for f in config.get('futures', []) if f.get('base_symbol') == root_symbol_for_config), None)
-        
-        if not symbol_config:
-            logger.error(f"No configuration found for base symbol '{root_symbol_for_config}' derived from {args.symbol}.")
-            sys.exit(1)
-            
-        # Check the source defined in the config
-        source = symbol_config.get('source', '').lower()
-        
-        if source == 'tradestation':
-            logger.info(f"Symbol {args.symbol} uses 'tradestation' source. Proceeding with fetch/force fetch.")
-            load_continuous_data(fetcher, root_symbol_for_config, config, args.force, args.interval_value, args.interval_unit, specific_symbol=args.symbol)
-            logger.info(f"Completed processing {args.symbol}")
+        logger.error(f"Failed to initialize or authenticate TradeStation fetcher: {e}", exc_info=True)
+        sys.exit(1) 
+
+    # Determine the actual symbol to process and the root for config lookup
+    user_input_symbol = args.symbol
+    actual_symbol_to_process = ""
+    root_symbol_for_config = ""
+
+    if '=' in user_input_symbol: # Parameterized like @VX=101XN
+        actual_symbol_to_process = user_input_symbol
+        match = re.match(r"^(@[A-Z]{1,3})", user_input_symbol)
+        if match:
+            root_symbol_for_config = match.group(1).lstrip('@')
         else:
-            logger.error(f"Symbol {args.symbol} (base: {root_symbol_for_config}) is configured with source '{source}', not 'tradestation'.")
-            logger.error("This script only fetches/force-fetches continuous contracts directly from TradeStation.")
-            logger.error(f"To update locally generated symbols like {args.symbol}, use M3 (Full Update) or run generate_continuous_futures.py directly.")
-            sys.exit(1) # Exit as we cannot process this type of symbol here
+            logger.error(f"Invalid parameterized continuous symbol format: {user_input_symbol}")
+            sys.exit(1)
+    elif user_input_symbol.startswith('@'): # Generic like @ES
+        actual_symbol_to_process = user_input_symbol
+        root_symbol_for_config = user_input_symbol.lstrip('@')
+    else: # Base like ES, implies @ES
+        actual_symbol_to_process = "@" + user_input_symbol
+        root_symbol_for_config = user_input_symbol
+
+    logger.info(f"Processing continuous contract: {actual_symbol_to_process} (config root: {root_symbol_for_config})")
+
+    # Metadata Check (using actual_symbol_to_process for query)
+    metadata_source = ''
+    metadata_found = False
+    try:
+        logger.info(f"Querying metadata for continuous contract group based on: '{actual_symbol_to_process}' (derived root: '{root_symbol_for_config}') using existing fetcher connection.")
+        
+        # Attempt to find a specific entry first (e.g. for @VX=101XN where base_symbol IS @VX=101XN)
+        query_specific = """ 
+            SELECT data_source, base_symbol, data_table, asset_type
+            FROM symbol_metadata 
+            WHERE base_symbol = ? AND asset_type = 'continuous_future' AND data_table = ?
+            LIMIT 1
+        """
+        params_specific = [actual_symbol_to_process, actual_symbol_to_process]
+        logger.info(f"DEBUG_LOADER: specific_symbol_arg for metadata query_specific: '{actual_symbol_to_process}'") # DEBUG LINE 1
+        metadata_rows = fetcher.conn.execute(query_specific, params_specific).fetchall()
+        logger.info(f"DEBUG_LOADER: query_specific returned {len(metadata_rows)} rows.") # DEBUG LINE 2
+        if metadata_rows:
+            logger.info(f"DEBUG_LOADER: metadata_rows[0] from query_specific: {metadata_rows[0]}") # DEBUG LINE 3
+
+        if metadata_rows:
+            # We expect one row per interval. For now, just take the first to get common properties.
+            metadata_record = metadata_rows[0]
+            metadata_found = True # Set flag to True
+            metadata_source = metadata_record['data_source'] # Set variable
+            logger.info(f"Found base metadata for {actual_symbol_to_process} (Source: {metadata_source}): {metadata_record}")
+            logger.info(f"Will attempt to process for requested interval: {args.interval_unit}/{args.interval_value}.")
+
+            if metadata_source.lower() != 'tradestation':
+                logger.error(f"Symbol {actual_symbol_to_process} (or its group {metadata_record['base_symbol']}) is configured with data_source='{metadata_source}' in symbol_metadata, not 'tradestation'. Cannot proceed with this loader.")
+                sys.exit(1)
+            # No need to check base_symbol_from_meta vs root_symbol_for_config here as the query logic handles it.
+        else:
+            # This 'else' means neither the specific nor the generic query yielded results
+            logger.error(f"No 'continuous_future' metadata record found for symbol '{actual_symbol_to_process}' or its generic group ('{f'@{root_symbol_for_config}'}') in symbol_metadata. Cannot determine data_source.")
+            sys.exit(1) 
             
-    else:
-        # Default behavior: Load data for configured continuous symbols (e.g., ES, NQ from config)
-        logger.info("No specific symbol provided, loading configured continuous symbols sourced from TradeStation...")
-        loaded_count = 0
-        for future_config in config.get('futures', []):
-            root_symbol = future_config.get('base_symbol')
-            is_cont = future_config.get('is_continuous')
-            source = future_config.get('source', '').lower()
-            
-            # Load only if marked continuous and sourced from tradestation
-            if root_symbol and is_cont and source == 'tradestation': 
-                logger.info(f"Loading continuous contract data for base symbol {root_symbol} (source: {source})...")
-                load_continuous_data(fetcher, root_symbol, config, args.force, args.interval_value, args.interval_unit)
-                logger.info(f"Completed loading {root_symbol} data")
-                loaded_count += 1
-        if loaded_count == 0:
-            logger.warning("No continuous contracts configured with source 'tradestation' found in the config file.")
+    except Exception as e:
+        logger.error(f"CRITICAL ERROR querying metadata for {actual_symbol_to_process}: {e}", exc_info=True)
+        sys.exit(1) # Exit if metadata query fails critically
+
+    logger.info(f"Metadata source verified. Proceeding to load data for {actual_symbol_to_process}...")
+
+    load_continuous_data(
+        fetcher=fetcher,
+        symbol_root=root_symbol_for_config, 
+        config=config,
+        force=args.force,
+        interval_value=args.interval_value,
+        interval_unit=args.interval_unit,
+        specific_symbol=actual_symbol_to_process,
+        fetch_mode=args.fetch_mode,
+        lookback_days=args.lookback_days,
+        roll_proximity_threshold_days=args.roll_proximity_threshold_days
+    )
 
     # Close fetcher connection if opened
     if fetcher and hasattr(fetcher, 'conn') and fetcher.conn: # Check if fetcher manages its own conn
@@ -575,6 +732,8 @@ def main():
              logger.info("Fetcher database connection closed.")
          except Exception as e:
              logger.warning(f"Error closing fetcher connection: {e}")
-             
+
+    logger.info(f"Continuous contract loading finished for {args.symbol}.")
+
 if __name__ == '__main__':
     main() 

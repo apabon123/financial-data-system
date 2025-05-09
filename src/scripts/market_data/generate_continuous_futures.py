@@ -17,14 +17,14 @@ import pandas_market_calendars as mcal # Add pandas_market_calendars for fallbac
 from typing import Dict, List, Optional, Tuple # Import for type hints
 
 # Add import for continuous contract mapping utilities
-from src.utils.continuous_contracts import get_active_contract, get_all_active_contracts
+from src.scripts.utilities.continuous_contracts import get_active_contract, get_all_active_contracts
 
 # REMOVED: Basic logging setup here
 logger = logging.getLogger(__name__) # Get logger instance
 
 DEFAULT_END_DATE = datetime.today().strftime('%Y-%m-%d')
-DEFAULT_CONFIG_PATH = "config/market_symbols.yaml"
-DEFAULT_DB_PATH = "data/financial_data.duckdb" # Updated default
+DEFAULT_CONFIG_PATH = os.path.join(os.path.dirname(__file__), '..', '..', '..', 'config', 'market_symbols.yaml')
+DEFAULT_DB_PATH = os.path.join(os.path.dirname(__file__), '..', '..', '..', 'data', 'financial_data.duckdb') # Updated default
 
 # Configuration
 DEFAULT_START_DATE = '2004-01-01' # Example default, adjust as needed
@@ -351,7 +351,7 @@ def get_active_contracts_for_date(conn, date, root_symbol: str, roll_type: str, 
     return mapping
 
 # --- Main Generation Function ---
-def generate_continuous(conn, root_symbol, config, start_date, end_date, roll_type, force):
+def generate_continuous(conn, root_symbol, config, start_date_arg, end_date_arg, roll_type, force):
     """Generates continuous futures contracts (c1, c2, ...). Assumes conn is a valid DuckDB connection."""
     # Find the specific contract config within the main config
     contract_config = next((item for item in config.get('futures', []) if item['base_symbol'] == root_symbol), None)
@@ -361,6 +361,12 @@ def generate_continuous(conn, root_symbol, config, start_date, end_date, roll_ty
 
     num_contracts = contract_config.get('num_active_contracts', 1)
     calendar_name = contract_config.get('calendar') # Get calendar name from config
+
+    # --- Determine effective start_date ---
+    # Prioritize start_date from contract_config (YAML), then CLI/default arg
+    effective_start_date_str = contract_config.get('start_date', start_date_arg)
+    if effective_start_date_str != start_date_arg:
+        logger.info(f"Using start_date '{effective_start_date_str}' from '{root_symbol}' config in market_symbols.yaml (overriding '{start_date_arg}').")
 
     # --- Define Roll Type to Symbol Suffix Mapping ---
     # For VX, we specifically want the '01X' suffix for the '@VX=N01XN' format
@@ -375,7 +381,7 @@ def generate_continuous(conn, root_symbol, config, start_date, end_date, roll_ty
         }
         roll_suffix = roll_suffix_map.get(roll_type, roll_type) # Default to roll_type if not found
 
-    logger.info(f"Beginning continuous generation for {root_symbol} (Roll Type: {roll_type}, Suffix: {roll_suffix}N) from {start_date} to {end_date}")
+    logger.info(f"Beginning continuous generation for {root_symbol} (Roll Type: {roll_type}, Suffix: {roll_suffix}N) from {effective_start_date_str} to {end_date_arg}")
 
     # --- Delete existing data first if forced (runs ONCE for all years) ---
     if force:
@@ -388,8 +394,8 @@ def generate_continuous(conn, root_symbol, config, start_date, end_date, roll_ty
 
     # --- Determine Year Range ---
     try:
-        start_dt_obj = datetime.strptime(start_date, '%Y-%m-%d').date()
-        end_dt_obj = datetime.strptime(end_date, '%Y-%m-%d').date()
+        start_dt_obj = datetime.strptime(effective_start_date_str, '%Y-%m-%d').date()
+        end_dt_obj = datetime.strptime(end_date_arg, '%Y-%m-%d').date()
         start_year = start_dt_obj.year
         end_year = end_dt_obj.year
     except ValueError:
@@ -462,7 +468,7 @@ def generate_continuous(conn, root_symbol, config, start_date, end_date, roll_ty
                 """
                 market_dates_df = conn.execute(market_query, [supplement_symbol, actual_year_start_date, actual_year_end_date]).fetchdf()
                 if not market_dates_df.empty:
-                    market_data_dates = pd.to_datetime(market_dates_df['timestamp']).tolist() # Keep as Timestamp
+                    market_data_dates = pd.to_datetime(market_dates_df.iloc[:, 0]).tolist() # Access first column
                     logger.info(f"Found {len(market_data_dates)} {supplement_symbol} trading days for {current_year}.")
             except Exception as e:
                 logger.error(f"Error retrieving {supplement_symbol} dates: {e}")
@@ -704,8 +710,8 @@ def generate_continuous(conn, root_symbol, config, start_date, end_date, roll_ty
          logger.info("All requested contract positions had underlying data found for all processed dates.")
 
 # --- Constants ---
-DEFAULT_CONFIG_PATH = os.path.join(os.path.dirname(__file__), '..', '..', 'config', 'market_symbols.yaml')
-DEFAULT_DB_PATH = os.path.join(os.path.dirname(__file__), '..', '..', 'data', 'financial_data.duckdb')
+DEFAULT_CONFIG_PATH = os.path.join(os.path.dirname(__file__), '..', '..', '..', 'config', 'market_symbols.yaml')
+DEFAULT_DB_PATH = os.path.join(os.path.dirname(__file__), '..', '..', '..', 'data', 'financial_data.duckdb')
 DEFAULT_START_DATE = '1980-01-01'
 DEFAULT_END_DATE = datetime.now().strftime('%Y-%m-%d')
 DEFAULT_ROLL_TYPE = 'volume' # Default roll type changed to volume
@@ -721,7 +727,7 @@ def main(args_dict=None, existing_conn=None):
         parser.add_argument('--db-path', default=DEFAULT_DB_PATH, help='Path to DuckDB database')
         parser.add_argument('--config-path', default=DEFAULT_CONFIG_PATH, help='Path to YAML configuration file')
         parser.add_argument('--root-symbol', required=True, help='Root symbol (e.g., VX, ES, NQ)')
-        parser.add_argument('--start-date', default=DEFAULT_START_DATE, help='Start date (YYYY-MM-DD)')
+        parser.add_argument('--start-date', default=DEFAULT_START_DATE, help='Start date (YYYY-MM-DD), can be overridden by symbol config')
         parser.add_argument('--end-date', default=DEFAULT_END_DATE, help='End date (YYYY-MM-DD)')
         parser.add_argument('--roll-type', default=DEFAULT_ROLL_TYPE, help=f'Roll type from futures_roll_dates (default: {DEFAULT_ROLL_TYPE})')
         parser.add_argument('--force', action='store_true', help='Delete existing data before generating')

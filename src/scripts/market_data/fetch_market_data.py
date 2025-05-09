@@ -77,6 +77,11 @@ def get_trading_calendar(calendar_name='NYSE'): # Default to NYSE if not specifi
     return _calendar_cache[calendar_name]
 # -----------------------
 
+# --- Expiry Calendar Helper --- #
+# Placeholder definition - THIS WILL BE REMOVED
+# class ExpiryCalendar: ... 
+# --- End Expiry Calendar Helper --- #
+
 class MarketDataFetcher:
     """Class to fetch market data from TradeStation and update the database."""
     
@@ -91,7 +96,7 @@ class MarketDataFetcher:
         """
         # Set up logger
         self.logger = logging.getLogger(__name__)
-        self.logger.setLevel(logging.DEBUG)
+        self.logger.setLevel(logging.INFO)
         
         # Load configuration
         self.config = self._load_config(config_path) if config_path else {}
@@ -114,7 +119,7 @@ class MarketDataFetcher:
         self._setup_database()
         
         # Initialize TradeStation agent
-        self.ts_agent = TradeStationMarketDataAgent(database_path=':memory:', verbose=True)
+        self.ts_agent = TradeStationMarketDataAgent(database_path=':memory:', verbose=False)
         
         # Add VALID_UNITS attribute to the ts_agent if it doesn't exist
         if not hasattr(self.ts_agent, 'VALID_UNITS'):
@@ -124,6 +129,9 @@ class MarketDataFetcher:
         self.session = requests.Session()
         self.max_retries = 3
         self.retry_delay = 1  # seconds
+        
+        # Store config path for potential reloads or use by other methods
+        self._config_path = config_path 
             
     def set_connection(self, new_conn):
         """Update the internal database connection object."""
@@ -877,173 +885,190 @@ class MarketDataFetcher:
             logger.error(f"Error getting existing data for {symbol}: {e}")
             return pd.DataFrame()
     
-    def calculate_expiration_date(self, symbol: str) -> Optional[pd.Timestamp]:
+    # --- NEW Expiry Calculation Method (Adapted from calculate_volume_roll_dates.py) --- #
+    def _calculate_expiry_date_from_config(self, calendar, symbol_config, contract_year, contract_month_code):
         """
-        Calculate the expiration date for a futures contract using pandas_market_calendars.
-        
-        Args:
-            symbol: The futures contract symbol (e.g., 'ESH24')
-            
-        Returns:
-            pd.Timestamp: The expiration date, or None if invalid symbol/config.
+        Calculates the expiry date using pandas_market_calendars and rules from config.
+        Internal helper method.
         """
-        if len(symbol) < 4:
-            logger.warning(f"Invalid futures symbol format: {symbol}")
-            return None
-        
-        # Extract components (handle 1 or 2 digit year)
-        match = re.match(r"([A-Z]{1,2})([FGHJKMNQUVXZ])([0-9]{1,2})$", symbol)
-        if not match:
-             logger.warning(f"Could not parse futures symbol: {symbol}")
-             return None
-        base_symbol, month_code, year_code = match.groups()
-        
-        logger.debug(f"Calculating expiration for {symbol} (base: {base_symbol}, month: {month_code}, year: {year_code})")
-        
-        # Get base symbol config
-        symbol_config = self._get_symbol_config(symbol) # Use the existing logic to get base config
-        if not symbol_config:
-             logger.warning(f"No configuration found for base symbol derived from {symbol}")
-             return None
-
-        # Get calendar
-        calendar_name = symbol_config.get('calendar', 'NYSE') # Default to NYSE
-        calendar = get_trading_calendar(calendar_name)
-
-        # Convert year code to full year (handle century correctly)
-        year_int = int(year_code)
-        current_year = datetime.now().year
-        current_century = (current_year // 100) * 100
-        if len(year_code) == 1: # Assume 202X for single digit year
-             year = current_century + year_int if year_int <= (current_year % 100 + 10) else current_century - 100 + year_int
-        else: # 2-digit year
-             year = (current_century - 100 + year_int) if year_int > (current_year % 100 + 10) else (current_century + year_int)
-
-        # --- Reuse logic from calculate_volume_roll_dates.py's get_expiry_date --- 
         rule = symbol_config.get('expiry_rule', {})
         month_map = {'F': 1, 'G': 2, 'H': 3, 'J': 4, 'K': 5, 'M': 6,
                      'N': 7, 'Q': 8, 'U': 9, 'V': 10, 'X': 11, 'Z': 12}
-        contract_month = month_map.get(month_code)
+        contract_month = month_map.get(contract_month_code)
         if not contract_month:
-            logger.error(f"Invalid contract month code: {month_code} in {symbol}")
-            return None
+            raise ValueError(f"Invalid contract month code: {contract_month_code}")
 
-        month_start = pd.Timestamp(f'{year}-{contract_month:02d}-01')
+        # Define start and end of the contract month for calendar searching
+        month_start = pd.Timestamp(f'{contract_year}-{contract_month:02d}-01')
         search_start = month_start - timedelta(days=5)
         search_end = month_start + timedelta(days=40)
-        valid_days = calendar.valid_days(start_date=search_start.strftime('%Y-%m-%d'),
-                                         end_date=search_end.strftime('%Y-%m-%d'))
 
-        # Rule: Nth specific weekday
+        # Get valid trading days within the potential range
+        try:
+            valid_days = calendar.valid_days(start_date=search_start.strftime('%Y-%m-%d'),
+                                         end_date=search_end.strftime('%Y-%m-%d'))
+            # --- ADDED: Ensure valid_days is timezone-naive for comparisons ---
+            if valid_days.tz is not None:
+                 self.logger.debug(f"Converting valid_days from {valid_days.tz} to timezone-naive.")
+                 valid_days = valid_days.tz_localize(None)
+            # --------------------------------------------------------------------
+        except Exception as e:
+            self.logger.error(f"Error getting valid days from calendar for {symbol_config.get('base_symbol')} {contract_year}-{contract_month_code}: {e}")
+            return None # Cannot proceed without valid days
+
+        # --- Apply Specific Expiry Rules ---
+        base_sym_for_log = symbol_config.get('base_symbol', 'UnknownSymbol') # For logging
+
+        # Rule: Nth specific weekday of the month (e.g., 3rd Friday)
         if rule.get('day_type') in ['monday', 'tuesday', 'wednesday', 'thursday', 'friday'] and rule.get('day_number'):
             day_name_map = {'monday': 0, 'tuesday': 1, 'wednesday': 2, 'thursday': 3, 'friday': 4}
             target_weekday = day_name_map[rule['day_type']]
             occurrence = int(rule['day_number'])
-            month_days = valid_days[(valid_days.month == contract_month) & (valid_days.year == year)]
+            month_days = valid_days[(valid_days.month == contract_month) & (valid_days.year == contract_year)]
             target_days = month_days[month_days.weekday == target_weekday]
             if len(target_days) >= occurrence:
-                expiry = target_days[occurrence - 1]
-                logger.debug(f"Calculated expiration date for {symbol} (Nth Weekday): {expiry.date()}")
-                return expiry
+                return target_days[occurrence - 1].normalize() # Return Timestamp
             else:
-                logger.warning(f"Could not find {occurrence} {rule['day_type']}s in {year}-{contract_month} for {symbol}. Rule: {rule}")
-                return None # Indicate failure
+                self.logger.warning(f"Could not find {occurrence} occurrences of {rule['day_type']} in {contract_year}-{contract_month} for {base_sym_for_log}. Rule: {rule}")
+                return None
 
-        # Rule: N business days before reference day
+        # Rule: N business days before a specific day of the month (e.g., 3 days before 25th for CL)
         elif rule.get('day_type') == 'business_day' and rule.get('days_before') and rule.get('reference_day'):
             days_before = int(rule['days_before'])
             reference_day_num = int(rule['reference_day'])
-            try:
-                 reference_date = pd.Timestamp(f'{year}-{contract_month:02d}-{reference_day_num:02d}').normalize()
-            except ValueError: # Handle invalid day like Feb 30
-                 logger.warning(f"Invalid reference day {reference_day_num} for {year}-{contract_month}. Using last day of month.")
-                 reference_date = pd.Timestamp(f'{year}-{contract_month:02d}-01') + pd.offsets.MonthEnd(0)
-
+            reference_date = pd.Timestamp(f'{contract_year}-{contract_month:02d}-{reference_day_num:02d}').normalize()
             days_strictly_before_ref = valid_days[valid_days < reference_date]
             if len(days_strictly_before_ref) >= days_before:
-                 expiry = days_strictly_before_ref[-days_before]
-                 logger.debug(f"Calculated expiration date for {symbol} (Days Before Ref): {expiry.date()}")
-                 return expiry
+                 return days_strictly_before_ref[-days_before].normalize() # Return Timestamp
             else:
-                 logger.warning(f"Not enough trading days found before {reference_date.date()} for {days_before} days rule for {symbol}. Rule: {rule}")
+                 self.logger.warning(f"Not enough trading days found before {reference_date.date()} to satisfy {days_before} days_before rule for {base_sym_for_log}. Rule: {rule}")
                  return None
 
-        # Rule: N business days before last business day
+        # Rule: N business days before the last business day of the month (e.g., GC)
         elif rule.get('day_type') == 'business_day' and rule.get('days_before') and rule.get('reference_point') == 'last_business_day':
             days_before = int(rule['days_before'])
-            month_trading_days = valid_days[(valid_days.month == contract_month) & (valid_days.year == year)]
+            month_trading_days = valid_days[(valid_days.month == contract_month) & (valid_days.year == contract_year)]
             if len(month_trading_days) >= days_before + 1:
-                expiry = month_trading_days[-(days_before + 1)]
-                logger.debug(f"Calculated expiration date for {symbol} (Days Before Last): {expiry.date()}")
-                return expiry
+                return month_trading_days[-(days_before + 1)].normalize() # Return Timestamp
             else:
-                logger.warning(f"Not enough trading days in {year}-{contract_month} for {days_before} days before last rule for {symbol}. Rule: {rule}")
+                self.logger.warning(f"Not enough trading days in {contract_year}-{contract_month} to find {days_before} days before last business day for {base_sym_for_log}. Rule: {rule}")
                 return None
 
-        # Rule: Special VX expiry
+        # Rule: Special VX expiry (Wednesday 30 days prior to 3rd Friday of *following* month)
         elif rule.get('special_rule') == 'VX_expiry':
             next_month = contract_month + 1
-            next_year = year
+            next_year = contract_year
             if next_month > 12:
                 next_month = 1
                 next_year += 1
+            next_month_start = pd.Timestamp(f'{next_year}-{next_month:02d}-01')
+            search_end_spx = next_month_start + timedelta(days=35)
+            try:
+                 valid_days_spx = calendar.valid_days(start_date=next_month_start.strftime('%Y-%m-%d'),
+                                                      end_date=search_end_spx.strftime('%Y-%m-%d'))
+            except Exception as e:
+                 self.logger.error(f"Error getting valid days from calendar for VX rule next month ({next_year}-{next_month}): {e}")
+                 return None
             
-            # --- Find the 3rd *Calendar* Friday ---
-            first_day_next_month = pd.Timestamp(f'{next_year}-{next_month:02d}-01')
-            first_friday = first_day_next_month + pd.Timedelta(days=(4 - first_day_next_month.weekday() + 7) % 7)
-            third_calendar_friday = first_friday + pd.Timedelta(days=14)
-            logger.debug(f"[VX Rule Debug] Symbol: {symbol}, 3rd Calendar Friday: {third_calendar_friday.date()}")
+            next_month_days = valid_days_spx[(valid_days_spx.month == next_month) & (valid_days_spx.year == next_year)]
+            fridays_next_month = next_month_days[next_month_days.weekday == 4]
+            if len(fridays_next_month) >= 3:
+                spx_expiry_friday = fridays_next_month[2]
+                target_date = spx_expiry_friday - timedelta(days=30)
+                potential_expiry = target_date
+                while potential_expiry.weekday() != 2:
+                    potential_expiry -= timedelta(days=1)
+                try:
+                    # --- MODIFIED CHECK: Use valid_days index instead of is_session ---
+                    # Ensure potential_expiry is normalized and timezone-naive for comparison
+                    potential_expiry_normalized = potential_expiry.normalize()
+                    # We need valid_days covering the *potential_expiry* date's month, not just the *next* month.
+                    # Re-fetch valid_days around the potential_expiry date.
+                    check_start = potential_expiry_normalized - timedelta(days=5)
+                    check_end = potential_expiry_normalized + timedelta(days=5)
+                    valid_days_check = calendar.valid_days(start_date=check_start.strftime('%Y-%m-%d'),
+                                                           end_date=check_end.strftime('%Y-%m-%d'))
+                    if valid_days_check.tz is not None:
+                         valid_days_check = valid_days_check.tz_localize(None)
 
-            # --- Calculate the Target Wednesday ---
-            target_date = third_calendar_friday - timedelta(days=30)
-            logger.debug(f"[VX Rule Debug] Target Date (3rd Cal Fri - 30d): {target_date.date()}")
-            potential_expiry = target_date
-            while potential_expiry.weekday() != 2: # Wednesday
-                potential_expiry -= timedelta(days=1)
-            logger.debug(f"[VX Rule Debug] Potential Expiry (Prev Wed): {potential_expiry.date()}")
-
-            # --- Get valid trading days around BOTH the 3rd Friday and potential expiry ---
-            check_start = min(potential_expiry, third_calendar_friday) - timedelta(days=10)
-            check_end = max(potential_expiry, third_calendar_friday) + timedelta(days=10)
-            valid_days_for_check = calendar.valid_days(start_date=check_start.strftime('%Y-%m-%d'),
-                                                          end_date=check_end.strftime('%Y-%m-%d'))
-            # Ensure valid_days are naive for comparison
-            if valid_days_for_check.tz is not None:
-                 valid_days_for_check = valid_days_for_check.tz_localize(None)
-                 logger.debug("[VX Rule Debug] Converted valid_days_for_check to timezone-naive.")
-
-            # --- Apply CBOE Holiday Rule ---
-            potential_expiry_normalized = potential_expiry.normalize()
-            third_friday_normalized = third_calendar_friday.normalize()
-
-            is_wednesday_valid = potential_expiry_normalized in valid_days_for_check.values
-            is_friday_valid = third_friday_normalized in valid_days_for_check.values
-            logger.debug(f"[VX Rule Debug] Is Potential Wednesday {potential_expiry_normalized.date()} valid?: {is_wednesday_valid}")
-            logger.debug(f"[VX Rule Debug] Is 3rd Friday {third_friday_normalized.date()} valid?: {is_friday_valid}")
-
-            # If EITHER the Wednesday OR the 3rd Friday is NOT a valid trading day, step back
-            if not is_wednesday_valid or not is_friday_valid:
-                 logger.debug(f"[VX Rule Debug] Applying holiday adjustment. Finding day before {potential_expiry_normalized.date()}.")
-                 # Find the closest previous valid trading day before the calculated Wednesday
-                 previous_valid_days = valid_days_for_check[valid_days_for_check < potential_expiry_normalized]
-                 if not previous_valid_days.empty:
-                     expiry = previous_valid_days[-1].normalize()
-                     logger.debug(f"[VX Rule Debug - Final] Calculated expiration date for {symbol} (VX Rule, adjusted for holiday): {expiry.date()}")
-                     return expiry
-                 else:
-                      logger.warning(f"[VX Rule Debug] Holiday adjustment needed, but could not find previous trading day before {potential_expiry.date()} for {symbol}.")
-                      return None
+                    if potential_expiry_normalized in valid_days_check:
+                    # -----------------------------------------------------------------
+                        return potential_expiry_normalized # Return Timestamp
+                    else:
+                        # Fallback: get previous trading day before non-session Wednesday
+                        # Use the schedule from the original `calendar` object
+                        schedule = calendar.schedule(start_date=(potential_expiry_normalized - timedelta(days=5)).strftime('%Y-%m-%d'),
+                                                    end_date=potential_expiry_normalized.strftime('%Y-%m-%d'))
+                        if not schedule.empty:
+                             # Ensure the index is timezone-naive before returning
+                             last_trading_day = schedule.index[-1]
+                             if last_trading_day.tz is not None:
+                                  last_trading_day = last_trading_day.tz_localize(None)
+                             return last_trading_day.normalize() # Return Timestamp
+                        else:
+                            self.logger.warning(f"Could not find previous trading day for VX calculated expiry {potential_expiry_normalized.date()} for {base_sym_for_log}.")
+                            return None # Fallback failed
+                except Exception as e:
+                     self.logger.error(f"Error checking calendar session for VX expiry {potential_expiry.date()}: {e}", exc_info=True)
+                     return None
             else:
-                 # Both Wednesday and Friday are valid, use the calculated Wednesday
-                 expiry = potential_expiry_normalized
-                 logger.debug(f"[VX Rule Debug - Final] Calculated expiration date for {symbol} (VX Rule, no holiday adjustment): {expiry.date()}")
-                 return expiry
+                self.logger.warning(f"Could not find 3rd Friday in {next_year}-{next_month} for VX expiry calculation for {base_sym_for_log}. Rule: {rule}")
+                return None
 
-        # Fallback if no rule matched
+        # --- Fallback for unhandled rules ---
         else:
-            logger.warning(f"No specific expiry rule matched for {symbol}. Rule: {rule}. Returning None.")
+            self.logger.warning(f"Expiry rule calculation not implemented or rule invalid for {base_sym_for_log}: {rule}. Using fallback.")
+            # Fallback might be just None, or a very simple estimate like mid-month
+            # Returning None is safer as it signals calculation failure.
             return None
-        # --- End reuse --- 
+    # --- END NEW Expiry Calculation Method --- #
+
+    def calculate_expiration_date(self, symbol: str) -> Optional[pd.Timestamp]:
+        """Calculate the expiration date for a specific futures contract symbol.
+           Uses the detailed _calculate_expiry_date_from_config method.
+        """
+        # 1. Parse symbol to get base, month code, year
+        match = re.match(r"^([A-Z]{1,3})([FGHJKMNQUVXZ])([0-9]{1,2})$", symbol)
+        if not match:
+            self.logger.warning(f"Cannot parse futures contract symbol format: {symbol}")
+            return None
+        base_symbol, month_code, year_code = match.groups()
+        
+        # Convert year code to full year (assuming 20xx)
+        try:
+            year_int = int(year_code)
+            contract_year = 2000 + year_int
+            # Add simple validation for sensible year range if needed
+            current_year = pd.Timestamp.now().year
+            if not (2000 <= contract_year <= current_year + 5): # Allow some future years
+                 self.logger.warning(f"Parsed year {contract_year} from symbol {symbol} seems unlikely. Check symbol format.")
+                 # Continue for now, but could return None
+        except ValueError:
+             self.logger.error(f"Could not convert year code '{year_code}' to integer for symbol {symbol}")
+             return None
+
+        # 2. Get config for the base symbol
+        symbol_config = self._get_symbol_config(base_symbol)
+        if not symbol_config:
+            self.logger.warning(f"No configuration found for base symbol '{base_symbol}' when calculating expiry for {symbol}.")
+            return None
+            
+        # 3. Get the correct trading calendar
+        calendar_name = symbol_config.get('calendar', 'NYSE') # Default to NYSE if not specified
+        try:
+             calendar = get_trading_calendar(calendar_name) # Use the helper function in this file
+        except Exception as e:
+             self.logger.error(f"Failed to get trading calendar '{calendar_name}' for {symbol}: {e}")
+             return None
+             
+        # 4. Call the detailed calculation method
+        try:
+             expiry_date = self._calculate_expiry_date_from_config(calendar, symbol_config, contract_year, month_code)
+             # Method returns normalized Timestamp or None
+             return expiry_date 
+        except Exception as e:
+             self.logger.error(f"Error during detailed expiry calculation for {symbol}: {e}", exc_info=True)
+             return None
 
     def process_symbol(self, symbol: str, update_history: bool = False, force: bool = False, interval_value: Optional[int] = None, interval_unit: Optional[str] = None) -> None:
         """Process a single symbol, fetching and storing its data.
@@ -1288,79 +1313,79 @@ class MarketDataFetcher:
         """Get the configuration for a symbol.
 
         Handles base symbols (ES, NQ, SPY), indices ($VIX.X), specific
-        futures contracts (ESH25, NQM25, VXF24), and continuous contracts (@BASE=ID<Letter>Suf)
+        futures contracts (ESH25, NQM25, VXF24), and continuous contracts (@BASE=...)
         by looking up their base config.
         """
-        # --- ADDED DEBUGGING ---
-        self.logger.debug(f"_get_symbol_config called for: {symbol}")
-        self.logger.debug(f"Current self.config object: {self.config}")
-        # --- END ADDED DEBUGGING ---
+        self.logger.debug(f"_get_symbol_config checking for: {symbol}")
+        
+        # 0. Handle specific continuous contracts explicitly if needed (e.g. @VX=101XN)
+        # If these have their own top-level entries in the YAML
+        for future in self.config.get('futures', []):
+            if future.get('symbol') == symbol and future.get('asset_type') == 'continuous_future':
+                 self.logger.debug(f"Found explicit continuous config for {symbol}")
+                 return future
+        # Add checks for indices/equities if they can be continuous
 
-        # Check indices first
+        # 1. Check for continuous contract pattern (@BASE=...)
+        # Example: @ES=102XC, @VX=101XN
+        continuous_pattern = re.compile(r"^(@[A-Z]{1,3})(?:=.*)?$") # Match @BASE or @BASE=...
+        cont_match = continuous_pattern.match(symbol)
+        base_symbol_from_cont = None
+        if cont_match:
+            base_symbol_from_cont = cont_match.group(1).lstrip('@') # Extract BASE (e.g., ES, VX)
+            self.logger.debug(f"Detected continuous pattern: {symbol}, Extracted Base: {base_symbol_from_cont}")
+            # Find config for the extracted base symbol (ES, NQ, VX...)
+            for future in self.config.get('futures', []):
+                if future.get('base_symbol') == base_symbol_from_cont:
+                    config = future.copy()
+                    config['_derived_from_continuous'] = True # Mark that this config was found via a continuous pattern
+                    config['_original_symbol'] = symbol # Store original full symbol for reference
+                    self.logger.debug(f"Found base config for continuous symbol '{symbol}' using base '{base_symbol_from_cont}'")
+                    return config
+            # If base config not found, log warning but continue to check other types
+            self.logger.warning(f"Found continuous pattern {symbol} but no base config found for '{base_symbol_from_cont}'")
+
+        # 2. Check indices directly
         for index in self.config.get('indices', []):
             if index.get('symbol') == symbol:
+                self.logger.debug(f"Found index config for {symbol}")
                 return index
 
-        # Check equities
+        # 3. Check equities directly
         for equity in self.config.get('equities', []):
             if equity.get('symbol') == symbol:
+                self.logger.debug(f"Found equity config for {symbol}")
                 return equity
 
-        # Check for continuous contract pattern (@BASE=ID<Letter>Suf)
-        # Example: @ES=101XN, @VX=101IN
-        continuous_pattern = re.compile(r"^(@[A-Z]{1,3})=[0-9]+[A-Z][A-Z]+$")
-        cont_match = continuous_pattern.match(symbol)
-        if cont_match:
-            base_symbol = cont_match.group(1) # Extract @BASE (e.g., @VX)
-            logger.debug(f"Detected continuous contract pattern: {symbol}, Base: {base_symbol}")
-            # Find config for the base symbol (e.g., find config for @VX)
-            for future in self.config.get('futures', []):
-                if future.get('base_symbol') == base_symbol:
-                    config = future.copy()
-                    config['specific_contract'] = symbol # Store original full symbol
-                    logger.debug(f"Found config for continuous base {base_symbol}")
-                    return config
-            logger.warning(f"Found continuous pattern {symbol} but no config for base {base_symbol}")
-
-        # Check if it looks like a standard futures contract (e.g., ESH25, NQM25)
-        futures_pattern = re.compile(r"^[A-Z]{1,2}[FGHJKMNQUVXZ][0-9]{1,2}$")
+        # 4. Check if it looks like a standard futures contract (e.g., ESH25, NQM25)
+        # This pattern might need adjustment depending on exact symbol formats used
+        futures_pattern = re.compile(r"^([A-Z]{1,3})([FGHJKMNQUVXZ])([0-9]{1,2})$")
         fut_match = futures_pattern.match(symbol)
+        base_symbol_from_fut = None
         if fut_match:
-            # Extract base symbol more carefully
-            if len(symbol) >= 4 and symbol[-2:].isdigit() and symbol[-3].isalpha(): # Common case like ESH24
-                base_symbol = symbol[:-3]
-            elif len(symbol) >= 3 and symbol[-1:].isdigit() and symbol[-2].isalpha(): # Case like ESH4
-                 base_symbol = symbol[:-2]
-            else:
-                 base_symbol = None # Couldn't reliably extract base
-            
-            if base_symbol:
-                logger.debug(f"Detected standard futures pattern: {symbol}, Base: {base_symbol}")
-                # Find the config for the base symbol
-                futures_configs = self.config.get('futures', [])
-                logger.debug(f"Available future base symbols in config: {[fc.get('base_symbol') for fc in futures_configs]}") # DEBUG LOG
-                for future in futures_configs:
-                    future_base = future.get('base_symbol') # Get the base from config
-                    logger.debug(f"Checking config base: '{future_base}' against extracted base: '{base_symbol}'") # DEBUG LOG
-                    if future_base == base_symbol: 
-                        config = future.copy()
-                        config['specific_contract'] = symbol # Store the specific contract
-                        logger.debug(f"Found config for standard futures base {base_symbol}")
-                        return config
-                logger.warning(f"Found standard future {symbol} but no config for base {base_symbol}")
+            base_symbol_from_fut = fut_match.group(1) # Extract Base (e.g., ES, VX)
+            self.logger.debug(f"Detected standard futures pattern: {symbol}, Extracted Base: {base_symbol_from_fut}")
+            # Find the config for the base symbol
+            for future in self.config.get('futures', []):
+                if future.get('base_symbol') == base_symbol_from_fut:
+                    config = future.copy()
+                    config['_derived_from_standard_future'] = True # Mark how config was found
+                    config['_original_symbol'] = symbol
+                    self.logger.debug(f"Found base config for standard future '{symbol}' using base '{base_symbol_from_fut}'")
+                    return config
+            # If base config not found, log warning but continue
+            self.logger.warning(f"Found standard future {symbol} but no base config found for '{base_symbol_from_fut}'")
 
-        # Fallback: Check if the provided symbol itself is a base future symbol
+        # 5. Fallback: Check if the provided symbol itself is a base future symbol in the config
         for future in self.config.get('futures', []):
              if future.get('base_symbol') == symbol:
+                 self.logger.debug(f"Found base future config matching symbol directly: {symbol}")
                  return future # Return the base config directly
 
-        # If no match found
-        logger.warning(f"No configuration match found for symbol: {symbol}")
-        # --- ADDED DEBUGGING ---
-        self.logger.debug(f"Config object when '{symbol}' not found: {self.config}")
-        # --- END ADDED DEBUGGING ---
+        # If no match found after all checks
+        self.logger.error(f"No configuration match found for symbol: {symbol}")
         return None
-    
+
     def generate_futures_contracts(self, root_symbol, start_date, end_date=None):
         """
         Generate futures contract symbols for a given root symbol based on YAML configuration.
@@ -1548,6 +1573,82 @@ class MarketDataFetcher:
                      logger.info("Database connection closed.")
                  except Exception as e:
                      logger.error(f"Error closing database connection in main: {e}")
+
+    def get_active_futures_symbols(self, base_symbol: str, item_config: Dict[str, Any]) -> List[str]:
+        """Determine the currently active futures contract symbols based on config.
+
+        Args:
+            base_symbol: The base symbol (e.g., "ES", "NQ").
+            item_config: The configuration dictionary for this base symbol from market_symbols.yaml.
+
+        Returns:
+            A list of the N active contract symbols (e.g., ['ESH24', 'ESM24']),
+            ordered by proximity of expiry date (nearest first).
+            Returns an empty list if configuration is missing or invalid.
+        """
+        if not item_config:
+            logger.error(f"Missing item_config for {base_symbol} in get_active_futures_symbols.")
+            return []
+            
+        num_active = item_config.get('num_active_contracts', 1)
+        if num_active <= 0:
+            logger.warning(f"num_active_contracts is {num_active} for {base_symbol}. Returning empty list.")
+            return []
+
+        # Generate potential contracts for the current and next year
+        today = pd.Timestamp.now().normalize()
+        start_gen_date = today - pd.Timedelta(days=90) # Look back slightly to catch recent contracts
+        end_gen_date = today + pd.Timedelta(days=540) # Look ahead ~1.5 years
+        
+        try:
+            # Ensure generate_futures_contracts exists and works
+            potential_symbols = self.generate_futures_contracts(
+                base_symbol, 
+                start_date=start_gen_date, 
+                end_date=end_gen_date
+            )
+        except AttributeError:
+             logger.error(f"MarketDataFetcher does not have 'generate_futures_contracts' method.")
+             return []
+        except Exception as e:
+             logger.error(f"Error generating potential contracts for {base_symbol}: {e}", exc_info=True)
+             return []
+
+        if not potential_symbols:
+            logger.warning(f"No potential symbols generated for {base_symbol} around {today.date()}")
+            return []
+
+        # Calculate expiry dates for potential contracts
+        contracts_with_expiry = []
+        for symbol in potential_symbols:
+            try:
+                # Ensure calculate_expiration_date exists and works
+                expiry_date = self.calculate_expiration_date(symbol)
+                if expiry_date and expiry_date >= today:
+                    # Ensure expiry_date is a Timestamp for comparison/sorting
+                    if isinstance(expiry_date, (datetime, date)):
+                         expiry_date = pd.Timestamp(expiry_date)
+                    else: # Skip if conversion fails or type is wrong
+                         logger.warning(f"Expiry date for {symbol} is not a valid date type: {type(expiry_date)}. Skipping.")
+                         continue 
+                    contracts_with_expiry.append((symbol, expiry_date))
+            except AttributeError:
+                 logger.error(f"MarketDataFetcher does not have 'calculate_expiration_date' method.")
+                 # Cannot proceed without this method, return empty or raise?
+                 return []
+            except Exception as e:
+                 logger.warning(f"Could not calculate expiry for potential symbol {symbol}: {e}")
+        
+        # Sort contracts by expiry date (nearest first)
+        contracts_with_expiry.sort(key=lambda x: x[1])
+
+        # Select the top N active contracts
+        active_symbols = [symbol for symbol, expiry in contracts_with_expiry[:num_active]]
+        
+        if len(active_symbols) < num_active:
+            logger.warning(f"Found only {len(active_symbols)} active contracts for {base_symbol}, expected {num_active}. Check generation range or config.")
+            
+        return active_symbols
 
 def main():
     parser = argparse.ArgumentParser(description='Fetch market data from TradeStation')

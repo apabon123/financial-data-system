@@ -26,6 +26,7 @@ echo    C1. View Continuous Contract Inventory Summary
 echo    C2. View Continuous Contract Intervals by Base (e.g., @ES)
 echo    C3. Fetch NEW data for Specific Continuous Symbol (@ES=...)
 echo    C4. FORCE Fetch for Specific Continuous Symbol (@ES=...)
+echo    C5. Build specific VX Continuous Contract (@VX=101XN)
 echo.
 echo  --- Overall Inventory ---
 echo    O1. View Market Data Inventory Summary (Base Symbols)
@@ -66,6 +67,7 @@ if /i "%choice%"=="C1" goto continuous_summary
 if /i "%choice%"=="C2" goto view_continuous_details
 if /i "%choice%"=="C3" goto fetch_continuous
 if /i "%choice%"=="C4" goto force_fetch_continuous
+if /i "%choice%"=="C5" goto build_vx_101xn
 
 if /i "%choice%"=="O1" goto symbol_summary_py
 if /i "%choice%"=="O2" goto sql_data_quality
@@ -306,25 +308,82 @@ python src/scripts/market_data/dispatch_fetcher.py --symbol "%symbol_to_fetch%" 
 goto pause_menu
 
 :fetch_continuous
-set cont_symbol_to_fetch=
-set /p cont_symbol_to_fetch="Enter the specific continuous symbol to fetch (e.g., @ES=102XC, @NQ=102XN): "
-if not defined cont_symbol_to_fetch (
+set cont_symbol_fetch=
+set interval_str=
+set interval_unit=daily
+set interval_value=1
+
+set /p cont_symbol_fetch="Enter the specific continuous symbol to fetch (e.g., @ES=102XC, @NQ=102XN): "
+if not defined cont_symbol_fetch (
     echo No symbol entered. Aborting.
     goto pause_menu
 )
-echo Fetching NEW data for %cont_symbol_to_fetch%...
-python -m src.scripts.market_data.continuous_contract_loader --symbol %cont_symbol_to_fetch%
+
+set /p interval_str="Enter Interval [1min, 15min, daily] (leave blank for daily): "
+
+if /i "%interval_str%"=="1min" ( 
+    set interval_unit=minute
+    set interval_value=1
+) else if /i "%interval_str%"=="15min" ( 
+    set interval_unit=minute
+    set interval_value=15
+) else if /i "%interval_str%"=="daily" ( 
+    set interval_unit=daily
+    set interval_value=1
+) else if not defined interval_str ( 
+    echo Using default interval: 1 daily
+    set interval_unit=daily
+    set interval_value=1
+) else ( 
+    echo Invalid interval entered. Using default: 1 daily
+    set interval_unit=daily
+    set interval_value=1
+)
+
+echo Fetching NEW data for %cont_symbol_fetch% (%interval_value% %interval_unit%)...
+python -m src.scripts.market_data.continuous_contract_loader "%cont_symbol_fetch%" --interval-unit "%interval_unit%" --interval-value "%interval_value%"
 goto pause_menu
 
 :force_fetch_continuous
-set cont_symbol_to_fetch=
-set /p cont_symbol_to_fetch="Enter the specific continuous symbol to FORCE fetch (e.g., @ES=102XC): "
-if not defined cont_symbol_to_fetch (
+set cont_symbol_force_fetch=
+set interval_str=
+set interval_unit=daily
+set interval_value=1
+
+set /p cont_symbol_force_fetch="Enter the specific continuous symbol to FORCE fetch (e.g., @ES=102XC): "
+if not defined cont_symbol_force_fetch (
     echo No symbol entered. Aborting.
     goto pause_menu
 )
-echo FORCE Fetching data for %cont_symbol_to_fetch% (OVERWRITING HISTORY)...
-python -m src.scripts.market_data.continuous_contract_loader --symbol %cont_symbol_to_fetch% --force
+
+set /p interval_str="Enter Interval [1min, 15min, daily] (leave blank for daily): "
+
+if /i "%interval_str%"=="1min" ( 
+    set interval_unit=minute
+    set interval_value=1
+) else if /i "%interval_str%"=="15min" ( 
+    set interval_unit=minute
+    set interval_value=15
+) else if /i "%interval_str%"=="daily" ( 
+    set interval_unit=daily
+    set interval_value=1
+) else if not defined interval_str ( 
+    echo Using default interval: 1 daily
+    set interval_unit=daily
+    set interval_value=1
+) else ( 
+    echo Invalid interval entered. Using default: 1 daily
+    set interval_unit=daily
+    set interval_value=1
+)
+
+echo FORCE Fetching data for %cont_symbol_force_fetch% (%interval_value% %interval_unit%) (OVERWRITING HISTORY)...
+python -m src.scripts.market_data.continuous_contract_loader "%cont_symbol_force_fetch%" --interval-unit "%interval_unit%" --interval-value "%interval_value%" --force
+goto pause_menu
+
+:build_vx_101xn
+echo Building specific VX continuous contract: @VX=101XN (and other VX continuous if configured)...
+python -m src.scripts.market_data.generate_continuous_futures --root-symbol VX
 goto pause_menu
 
 :update_active

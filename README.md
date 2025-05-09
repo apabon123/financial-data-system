@@ -31,15 +31,24 @@ Run the batch script. This is typically done via a scheduled task.
 update_market_data.bat
 ```
 
-This script executes `src/scripts/market_data/update_all_market_data.py`, which performs the following steps:
-*   Updates VIX Index ($VIX.X) from CBOE into the `market_data_cboe` table.
-*   Updates individual active VIX futures (e.g., VXK25, VXM25) from CBOE into the `market_data_cboe` table.
-*   Updates continuous contract mapping table for VX.
-*   Generates/updates daily continuous VX contracts (@VX=...) based on the mapping.
-*   Updates individual active ES and NQ futures via TradeStation into the `market_data` table.
-*   Updates daily continuous ES and NQ contracts (@ES=..., @NQ=...) via TradeStation.
-*   Updates intraday (1min, 15min) data for active ES and NQ contracts via TradeStation.
-*   (Optional) Runs data verification checks.
+This script executes `src/scripts/market_data/update_all_market_data.py`, which orchestrates the following major steps:
+
+*   **Symbol Metadata Update:** Populates/updates the `symbol_metadata` table from `config/market_symbols.yaml`. This table guides the subsequent update processes.
+*   **Individual Instruments Update (TradeStation):**
+    *   Fetches/updates data for active individual futures (e.g., ESM25, NQM25), indices (e.g., SPX), and equities (e.g., SPY) as defined in `symbol_metadata` to be sourced from TradeStation.
+    *   Data is retrieved using `MarketDataFetcher` and stored in the `market_data` table.
+*   **Raw VIX Futures Update (CBOE):**
+    *   Fetches/updates daily data for active individual VIX futures contracts (e.g., VXK25, VXM25) directly from the CBOE website.
+    *   This data is stored in the `market_data_cboe` table.
+*   **Continuous Contracts Update (TradeStation Sourced):**
+    *   Identifies continuous contract symbols (e.g., `@ES=102XC`, `@NQ=102XN`, `@VX=101XN`) from `symbol_metadata` that are designated with `data_source = 'tradestation'`.
+    *   For each, `continuous_contract_loader.py` is called. This script:
+        *   Uses `MarketDataFetcher` to retrieve data for the underlying individual contracts from TradeStation.
+        *   Builds the continuous contract series.
+        *   Stores the resulting data in the `continuous_contracts` table.
+    *   This now includes VIX continuous contracts, which are built from TradeStation underlying VIX futures data.
+*   **Intraday Data:** The process also updates intraday (e.g., 1-minute, 15-minute) data for individual contracts from TradeStation as configured in `symbol_metadata`.
+*   **(Optional) Verification:** The `--verify` flag can be passed, though its primary handling within `update_all_market_data.py` is to log its presence. The batch script might separately call other verification scripts.
 
 Logs for the update process are stored in the `logs/` directory.
 
