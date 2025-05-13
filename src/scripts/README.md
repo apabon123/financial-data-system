@@ -1,6 +1,14 @@
-# Scripts Directory Structure
+# scripts/
 
-This directory contains Python scripts for various functions of the financial data system. The scripts are organized by function and by symbol to maintain a clean and scalable codebase.
+This directory contains automation and utility scripts for database management, data updates, analysis, and other operational tasks.
+
+## Subdirectories
+- `analysis/`: Scripts for data analysis and reporting.
+- `database/`: Scripts for database setup, migration, and maintenance.
+- `market_data/`: Scripts for updating and managing market data.
+- `utilities/`: Miscellaneous utility scripts.
+
+Scripts are organized by their primary function to facilitate maintenance and discovery.
 
 ## Directory Organization
 

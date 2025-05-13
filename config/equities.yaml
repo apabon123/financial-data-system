@@ -1,0 +1,167 @@
+# equities.yaml
+# Configuration for individual equities with their corporate action handling
+
+version: "1.0"
+
+# Common templates for equities
+templates:
+  common_stock:
+    type: "Stock"
+    asset_class: "equity"
+    default_source: "tradestation"
+    default_raw_table: "market_data"
+    frequencies: ["daily"]
+    adjustment_method: "price_adjustment"
+    price_decimal_places: 2
+
+# Equity definitions
+equities:
+  AAPL:
+    inherit: "common_stock"
+    symbol: "AAPL"
+    name: "Apple Inc."
+    description: "Apple Inc."
+    exchange: "NASDAQ"
+    exchange_ref: "${exchanges.NASDAQ}"
+    calendar: "NASDAQ"
+    calendar_ref: "${exchanges.NASDAQ.calendars.NASDAQ}"
+    start_date: "2001-01-01"
+    currency: "USD"
+    sector: "Technology"
+    industry: "Consumer Electronics"
+    corporate_actions:
+      splits:
+        - date: "2020-08-31"
+          ratio: "4:1"
+        - date: "2014-06-09"
+          ratio: "7:1"
+        - date: "2005-02-28"
+          ratio: "2:1"
+        - date: "2000-06-21"
+          ratio: "2:1"
+      dividends:
+        frequency: "quarterly"
+        history_url: "https://investor.apple.com/dividend-history/default.aspx"
+    market_cap_category: "large"
+    index_memberships: ["SPX", "NDX"]
+    data_sources:
+      - source: "tradestation"
+        symbol: "AAPL"
+        primary: true
+        frequencies: ["daily"]
+    
+  GS:
+    inherit: "common_stock"
+    symbol: "GS"
+    name: "Goldman Sachs Group Inc."
+    description: "Goldman Sachs Group Inc."
+    exchange: "NYSE"
+    exchange_ref: "${exchanges.NYSE}"
+    calendar: "NYSE"
+    calendar_ref: "${exchanges.NYSE.calendars.NYSE}"
+    start_date: "2001-01-01"
+    currency: "USD"
+    sector: "Financial Services"
+    industry: "Capital Markets"
+    corporate_actions:
+      splits:
+        - date: "2000-05-01"
+          ratio: "3:1"
+      dividends:
+        frequency: "quarterly"
+        history_url: "https://www.goldmansachs.com/investor-relations/dividends-and-stock-split/"
+    market_cap_category: "large"
+    index_memberships: ["SPX"]
+    data_sources:
+      - source: "tradestation"
+        symbol: "GS"
+        primary: true
+        frequencies: ["daily"]
+    
+  MSFT:
+    inherit: "common_stock"
+    symbol: "MSFT"
+    name: "Microsoft Corporation"
+    description: "Microsoft Corporation"
+    exchange: "NASDAQ"
+    exchange_ref: "${exchanges.NASDAQ}"
+    calendar: "NASDAQ"
+    calendar_ref: "${exchanges.NASDAQ.calendars.NASDAQ}"
+    start_date: "2001-01-01"
+    currency: "USD"
+    sector: "Technology"
+    industry: "Software—Infrastructure"
+    corporate_actions:
+      splits:
+        - date: "2003-02-18"
+          ratio: "2:1"
+        - date: "1999-03-29"
+          ratio: "2:1"
+        - date: "1998-02-23"
+          ratio: "2:1"
+      dividends:
+        frequency: "quarterly"
+        history_url: "https://www.microsoft.com/en-us/Investor/dividends-and-stock-history.aspx"
+    market_cap_category: "large"
+    index_memberships: ["SPX", "NDX"]
+    data_sources:
+      - source: "tradestation"
+        symbol: "MSFT"
+        primary: true
+        frequencies: ["daily"]
+    
+  AMZN:
+    inherit: "common_stock"
+    symbol: "AMZN"
+    name: "Amazon.com, Inc."
+    description: "Amazon.com, Inc."
+    exchange: "NASDAQ"
+    exchange_ref: "${exchanges.NASDAQ}"
+    calendar: "NASDAQ"
+    calendar_ref: "${exchanges.NASDAQ.calendars.NASDAQ}"
+    start_date: "2001-01-01"
+    currency: "USD"
+    sector: "Consumer Cyclical"
+    industry: "Internet Retail"
+    corporate_actions:
+      splits:
+        - date: "2022-06-06"
+          ratio: "20:1"
+        - date: "1999-09-02"
+          ratio: "2:1"
+        - date: "1999-01-05"
+          ratio: "3:1"
+        - date: "1998-01-02"
+          ratio: "2:1"
+      dividends:
+        frequency: "none"
+    market_cap_category: "large"
+    index_memberships: ["SPX", "NDX"]
+    data_sources:
+      - source: "tradestation"
+        symbol: "AMZN"
+        primary: true
+        frequencies: ["daily"]
+
+# Corporate action handling methods
+corporate_action_methods:
+  price_adjustment:
+    description: "Adjusts historical prices for splits and dividends"
+    options:
+      split_adjustment: true
+      dividend_adjustment: true
+      rights_offering_adjustment: true
+      
+  split_only_adjustment:
+    description: "Adjusts historical prices for splits only"
+    options:
+      split_adjustment: true
+      dividend_adjustment: false
+      rights_offering_adjustment: false
+      
+  unadjusted:
+    description: "No adjustment to historical prices"
+    options:
+      split_adjustment: false
+      dividend_adjustment: false
+      rights_offering_adjustment: false

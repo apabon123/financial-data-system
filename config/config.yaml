@@ -1,0 +1,57 @@
+# Financial Data System Configuration
+
+# Database settings
+database:
+  path: "./data/financial_data.duckdb"
+  backup_dir: "./backups"
+  backup_retention_days: 30
+
+# Logging settings
+logging:
+  level: "INFO"
+  file: "./logs/financial_data_system.log"
+  console: true
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+  module_levels:
+    src.data_sources: "INFO"
+    src.processors.continuous: "INFO"
+    src.processors.cleaners: "INFO"
+
+# Data sources configuration
+data_sources:
+  tradestation:
+    type: "tradestation"
+    api_key_env: "TRADESTATION_API_KEY"
+    api_secret_env: "TRADESTATION_API_SECRET"
+    rate_limit: 60
+  
+  cboe:
+    type: "cboe"
+    vix_url_template: "https://cdn.cboe.com/api/global/delayed_quotes/charts/historical/{symbol}.json"
+    vx_futures_url_template: "https://www.cboe.com/us/futures/market_statistics/historical_data/products/csv/{symbol}/"
+    rate_limit: 30
+
+# Data cleaners configuration
+cleaners:
+  vx:
+    name: "VX Futures Cleaner"
+    vx_division_factor_threshold: 1.0
+    vx_max_reasonable_price: 200.0
+    vx_min_reasonable_price: 5.0
+
+# Continuous contract settings
+continuous_contracts:
+  panama:
+    adjustment_method: "ratio"
+  
+  unadjusted:
+    # No specific settings needed
+
+# General settings
+settings:
+  default_start_date: "2004-03-26"
+  default_lookback_days: 90
+  roll_proximity_days: 7
+
+# Import market symbols configuration
+# (This will be imported separately from market_symbols.yaml)

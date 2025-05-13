@@ -65,3 +65,4 @@ tasks/
 
 # Wrapper scripts
 wrappers/
+**/.claude/settings.local.json

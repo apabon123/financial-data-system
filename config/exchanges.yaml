@@ -1,0 +1,278 @@
+# exchanges.yaml
+# Configuration for exchanges with trading calendars, timezones, and session info
+
+version: "1.0"
+
+exchanges:
+  CME:
+    name: "Chicago Mercantile Exchange"
+    timezone: "America/Chicago"
+    country: "US"
+    holidays:
+      - name: "New Year's Day"
+        rule: "USNewYearsDay"
+      - name: "Martin Luther King Jr. Day"
+        rule: "USMartinLutherKingJrDay"
+      - name: "Presidents' Day"
+        rule: "USPresidentsDay"
+      - name: "Good Friday"
+        rule: "USGoodFriday"
+      - name: "Memorial Day"
+        rule: "USMemorialDay"
+      - name: "Independence Day"
+        rule: "USIndependenceDay"
+      - name: "Labor Day"
+        rule: "USLaborDay"
+      - name: "Thanksgiving Day"
+        rule: "USThanksgivingDay"
+      - name: "Christmas Day"
+        rule: "USChristmasDay"
+    trading_sessions:
+      regular:
+        start: "08:30"
+        end: "15:15"
+      overnight:
+        start: "17:00"
+        end: "16:00"  # Next day
+        days: ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday"]
+    calendars:
+      CME_Equity:
+        description: "CME Equity Index Futures Trading Calendar"
+        holidays: "inherit"  # Inherit from parent exchange
+        early_closes:
+          - name: "Day after Thanksgiving"
+            rule: "USDayAfterThanksgiving"
+            time: "12:15"
+          - name: "Christmas Eve"
+            rule: "USChristmasEve"
+            time: "12:15"
+
+  NYMEX:
+    name: "New York Mercantile Exchange"
+    timezone: "America/New_York"
+    country: "US"
+    holidays:
+      - name: "New Year's Day"
+        rule: "USNewYearsDay"
+      - name: "Martin Luther King Jr. Day"
+        rule: "USMartinLutherKingJrDay"
+      - name: "Presidents' Day"
+        rule: "USPresidentsDay"
+      - name: "Good Friday"
+        rule: "USGoodFriday"
+      - name: "Memorial Day"
+        rule: "USMemorialDay"
+      - name: "Independence Day"
+        rule: "USIndependenceDay"
+      - name: "Labor Day"
+        rule: "USLaborDay"
+      - name: "Thanksgiving Day"
+        rule: "USThanksgivingDay"
+      - name: "Christmas Day"
+        rule: "USChristmasDay"
+    trading_sessions:
+      regular:
+        start: "09:00"
+        end: "14:30"
+      overnight:
+        start: "18:00"
+        end: "17:00"  # Next day
+        days: ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday"]
+    calendars:
+      CMEGlobex_CL:
+        description: "CME Globex Crude Oil Futures Trading Calendar"
+        holidays: "inherit"  # Inherit from parent exchange
+
+  COMEX:
+    name: "Commodity Exchange, Inc."
+    timezone: "America/New_York"
+    country: "US"
+    holidays:
+      - name: "New Year's Day"
+        rule: "USNewYearsDay"
+      - name: "Martin Luther King Jr. Day"
+        rule: "USMartinLutherKingJrDay"
+      - name: "Presidents' Day"
+        rule: "USPresidentsDay"
+      - name: "Good Friday"
+        rule: "USGoodFriday"
+      - name: "Memorial Day"
+        rule: "USMemorialDay"
+      - name: "Independence Day"
+        rule: "USIndependenceDay"
+      - name: "Labor Day"
+        rule: "USLaborDay"
+      - name: "Thanksgiving Day"
+        rule: "USThanksgivingDay"
+      - name: "Christmas Day"
+        rule: "USChristmasDay"
+    trading_sessions:
+      regular:
+        start: "08:20"
+        end: "13:30"
+      overnight:
+        start: "18:00"
+        end: "17:15"  # Next day
+        days: ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday"]
+    calendars:
+      CMEGlobex_GC:
+        description: "CME Globex Gold Futures Trading Calendar"
+        holidays: "inherit"  # Inherit from parent exchange
+
+  CBOE:
+    name: "Chicago Board Options Exchange"
+    timezone: "America/Chicago"
+    country: "US"
+    holidays:
+      - name: "New Year's Day"
+        rule: "USNewYearsDay"
+      - name: "Martin Luther King Jr. Day"
+        rule: "USMartinLutherKingJrDay"
+      - name: "Presidents' Day"
+        rule: "USPresidentsDay"
+      - name: "Good Friday"
+        rule: "USGoodFriday"
+      - name: "Memorial Day"
+        rule: "USMemorialDay"
+      - name: "Independence Day"
+        rule: "USIndependenceDay"
+      - name: "Labor Day"
+        rule: "USLaborDay"
+      - name: "Thanksgiving Day"
+        rule: "USThanksgivingDay"
+      - name: "Christmas Day"
+        rule: "USChristmasDay"
+    trading_sessions:
+      regular:
+        start: "08:30"
+        end: "15:15"
+    calendars:
+      CFE:
+        description: "CBOE Futures Exchange Trading Calendar"
+        holidays: "inherit"  # Inherit from parent exchange
+        early_closes:
+          - name: "Day after Thanksgiving"
+            rule: "USDayAfterThanksgiving"
+            time: "12:15"
+          - name: "Christmas Eve"
+            rule: "USChristmasEve"
+            time: "12:15"
+
+  NYSE:
+    name: "New York Stock Exchange"
+    timezone: "America/New_York"
+    country: "US"
+    holidays:
+      - name: "New Year's Day"
+        rule: "USNewYearsDay"
+      - name: "Martin Luther King Jr. Day"
+        rule: "USMartinLutherKingJrDay"
+      - name: "Presidents' Day"
+        rule: "USPresidentsDay"
+      - name: "Good Friday"
+        rule: "USGoodFriday"
+      - name: "Memorial Day"
+        rule: "USMemorialDay"
+      - name: "Independence Day"
+        rule: "USIndependenceDay"
+      - name: "Labor Day"
+        rule: "USLaborDay"
+      - name: "Thanksgiving Day"
+        rule: "USThanksgivingDay"
+      - name: "Christmas Day"
+        rule: "USChristmasDay"
+    trading_sessions:
+      regular:
+        start: "09:30"
+        end: "16:00"
+      pre_market:
+        start: "04:00"
+        end: "09:30"
+      after_hours:
+        start: "16:00"
+        end: "20:00"
+    calendars:
+      NYSE:
+        description: "NYSE Trading Calendar"
+        holidays: "inherit"  # Inherit from parent exchange
+        early_closes:
+          - name: "Day after Thanksgiving"
+            rule: "USDayAfterThanksgiving"
+            time: "13:00"
+          - name: "Christmas Eve"
+            rule: "USChristmasEve"
+            time: "13:00"
+
+  NASDAQ:
+    name: "NASDAQ Stock Market"
+    timezone: "America/New_York"
+    country: "US"
+    holidays:
+      - name: "New Year's Day"
+        rule: "USNewYearsDay"
+      - name: "Martin Luther King Jr. Day"
+        rule: "USMartinLutherKingJrDay"
+      - name: "Presidents' Day"
+        rule: "USPresidentsDay"
+      - name: "Good Friday"
+        rule: "USGoodFriday"
+      - name: "Memorial Day"
+        rule: "USMemorialDay"
+      - name: "Independence Day"
+        rule: "USIndependenceDay"
+      - name: "Labor Day"
+        rule: "USLaborDay"
+      - name: "Thanksgiving Day"
+        rule: "USThanksgivingDay"
+      - name: "Christmas Day"
+        rule: "USChristmasDay"
+    trading_sessions:
+      regular:
+        start: "09:30"
+        end: "16:00"
+      pre_market:
+        start: "04:00"
+        end: "09:30"
+      after_hours:
+        start: "16:00"
+        end: "20:00"
+    calendars:
+      NASDAQ:
+        description: "NASDAQ Trading Calendar"
+        holidays: "inherit"  # Inherit from parent exchange
+        early_closes:
+          - name: "Day after Thanksgiving"
+            rule: "USDayAfterThanksgiving"
+            time: "13:00"
+          - name: "Christmas Eve"
+            rule: "USChristmasEve"
+            time: "13:00"
+
+# Calendar rules
+calendar_rules:
+  USNewYearsDay:
+    date: "January 1"
+    observed_if_weekend: true
+  USMartinLutherKingJrDay:
+    nth_weekday: "3rd Monday in January"
+  USPresidentsDay:
+    nth_weekday: "3rd Monday in February"
+  USGoodFriday:
+    calculation: "Easter - 2 days"
+  USMemorialDay:
+    nth_weekday: "last Monday in May"
+  USIndependenceDay:
+    date: "July 4"
+    observed_if_weekend: true
+  USLaborDay:
+    nth_weekday: "1st Monday in September"
+  USThanksgivingDay:
+    nth_weekday: "4th Thursday in November"
+  USDayAfterThanksgiving:
+    calculation: "USThanksgivingDay + 1 day"
+  USChristmasEve:
+    date: "December 24"
+    observed_if_weekend: false
+  USChristmasDay:
+    date: "December 25"
+    observed_if_weekend: true

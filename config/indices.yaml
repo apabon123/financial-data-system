@@ -1,0 +1,130 @@
+# indices.yaml
+# Configuration for market indices with their calculation methodologies and constituent mappings
+
+version: "1.0"
+
+# Common templates for indices
+templates:
+  equity_index:
+    type: "index"
+    default_source: "tradestation"
+    default_raw_table: "market_data"
+    frequencies: ["daily"]
+    asset_class: "equity_index"
+    currency: "USD"
+    
+  volatility_index:
+    type: "index"
+    default_source: "cboe"
+    default_raw_table: "market_data_cboe"
+    frequencies: ["daily"]
+    asset_class: "volatility"
+    currency: "USD"
+
+# Index definitions
+indices:
+  VIX:
+    inherit: "volatility_index"
+    symbol: "$VIX.X"
+    name: "CBOE Volatility Index"
+    description: "CBOE Volatility Index"
+    exchange: "CBOE"
+    exchange_ref: "${exchanges.CBOE}"
+    calendar: "CFE"
+    calendar_ref: "${exchanges.CBOE.calendars.CFE}"
+    start_date: "2005-01-01"
+    calculation_methodology:
+      type: "implied_volatility"
+      source_options: "SPX"
+      term: "30 days"
+      description: "Measures market expectations of 30-day volatility implied by S&P 500 index options"
+    related_futures: "VX"
+    related_etfs: ["VXX", "UVXY"]
+    data_sources:
+      - source: "tradestation"
+        symbol: "$VIX.X"
+        primary: true
+        frequencies: ["daily"]
+      - source: "cboe"
+        symbol: "VIX"
+        primary: false
+        frequencies: ["daily"]
+        url_pattern: "https://cdn.cboe.com/api/global/delayed_quotes/vix_historical_data.csv"
+        
+  SPX:
+    inherit: "equity_index"
+    symbol: "$SPX.X"
+    name: "S&P 500 Index"
+    description: "Standard & Poor's 500 Index"
+    exchange: "NYSE"
+    exchange_ref: "${exchanges.NYSE}"
+    calendar: "NYSE"
+    calendar_ref: "${exchanges.NYSE.calendars.NYSE}"
+    start_date: "1990-01-01"
+    calculation_methodology:
+      type: "market_cap_weighted"
+      divisor_adjusted: true
+      float_adjusted: true
+      rebalancing: "quarterly"
+      description: "Market-capitalization-weighted index of 500 leading U.S. publicly traded companies"
+    related_futures: "ES"
+    related_etfs: ["SPY", "IVV", "VOO"]
+    constituents:
+      count: 500
+      selection_criteria: "Leading U.S. companies selected by committee"
+      url: "https://www.spglobal.com/spdji/en/indices/equity/sp-500/#data"
+    data_sources:
+      - source: "tradestation"
+        symbol: "$SPX.X"
+        primary: true
+        frequencies: ["daily"]
+        
+  NDX:
+    inherit: "equity_index"
+    symbol: "$NDX.X"
+    name: "NASDAQ-100 Index"
+    description: "NASDAQ-100 Index"
+    exchange: "NASDAQ"
+    exchange_ref: "${exchanges.NASDAQ}"
+    calendar: "NASDAQ"
+    calendar_ref: "${exchanges.NASDAQ.calendars.NASDAQ}"
+    start_date: "1990-01-01"
+    calculation_methodology:
+      type: "modified_market_cap_weighted"
+      divisor_adjusted: true
+      float_adjusted: true
+      rebalancing: "quarterly"
+      description: "Modified market-capitalization-weighted index of 100 largest non-financial companies listed on NASDAQ"
+    related_futures: "NQ"
+    related_etfs: ["QQQ"]
+    constituents:
+      count: 100
+      selection_criteria: "Largest non-financial companies listed on NASDAQ"
+      url: "https://www.nasdaq.com/market-activity/quotes/nasdaq-ndx-index"
+    data_sources:
+      - source: "tradestation"
+        symbol: "$NDX.X"
+        primary: true
+        frequencies: ["daily"]
+
+# Index calculation methodologies
+calculation_methodologies:
+  market_cap_weighted:
+    description: "Sum of all constituent market capitalizations divided by a divisor"
+    formula: "Index = (Sum(Price_i * Shares_Outstanding_i * Float_Factor_i)) / Divisor"
+    
+  modified_market_cap_weighted:
+    description: "Market cap weighted with concentration limits applied"
+    formula: "Index = (Sum(Price_i * Shares_Outstanding_i * Float_Factor_i * Capping_Factor_i)) / Divisor"
+    
+  price_weighted:
+    description: "Sum of constituent prices divided by a divisor"
+    formula: "Index = Sum(Price_i) / Divisor"
+    
+  equal_weighted:
+    description: "Equal weight given to all constituents"
+    formula: "Index = Sum(Price_i * Equal_Weight_Factor_i) / Divisor"
+    
+  implied_volatility:
+    description: "Measures expected volatility using option prices"
+    formula: "Complex calculation based on SPX option prices across different strikes and expirations"

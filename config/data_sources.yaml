@@ -1,0 +1,303 @@
+# data_sources.yaml
+# Configuration for data sources with connection details and specifications
+
+version: "1.0"
+
+# Data source templates
+templates:
+  rest_api_source:
+    protocol: "https"
+    auth_method: "oauth2"
+    rate_limit:
+      max_requests_per_min: 60
+      max_requests_per_day: 5000
+    retry_policy:
+      max_retries: 3
+      retry_delay_seconds: 2
+      backoff_factor: 2
+    timeout_seconds: 30
+    
+  file_download_source:
+    protocol: "https"
+    auth_method: "none"
+    download_method: "direct"
+    file_processing:
+      extract_method: "auto"
+      parsing_engine: "pandas"
+    retry_policy:
+      max_retries: 3
+      retry_delay_seconds: 5
+      backoff_factor: 2
+    timeout_seconds: 60
+
+# Data source configurations
+data_sources:
+  tradestation:
+    inherit: "rest_api_source"
+    name: "TradeStation"
+    type: "broker_api"
+    description: "TradeStation market data API"
+    base_url: "https://api.tradestation.com/v3"
+    auth:
+      auth_url: "https://signin.tradestation.com/oauth/token"
+      client_id: "${env:TRADESTATION_CLIENT_ID}"
+      client_secret: "${env:TRADESTATION_CLIENT_SECRET}"
+      redirect_uri: "http://localhost:5000/callback"
+      grant_type: "authorization_code"
+      scope: "MarketData ReadAccount"
+    endpoints:
+      quotes: "/marketdata/quotes"
+      bars: "/marketdata/barcharts/{symbol}"
+      options_chains: "/marketdata/options/chains/{root_symbol}"
+      timesales: "/marketdata/timesales/{symbol}"
+    supported_intervals:
+      - name: "1min"
+        interval: 1
+        unit: "minute"
+        max_bars_per_request: 1000
+        max_history_days: 30
+      - name: "15min"
+        interval: 15
+        unit: "minute"
+        max_bars_per_request: 1000
+        max_history_days: 90
+      - name: "daily"
+        interval: 1
+        unit: "day"
+        max_bars_per_request: 1000
+        max_history_days: 3650
+    rate_limit:
+      max_requests_per_min: 120
+      max_requests_per_day: 10000
+    data_validation:
+      validate_timestamps: true
+      handle_missing_data: "warn"
+      handle_duplicate_data: "last"
+    database:
+      raw_table: "market_data_raw"
+      clean_table: "market_data"
+      
+  cboe:
+    inherit: "file_download_source"
+    name: "CBOE"
+    type: "exchange_data"
+    description: "CBOE market data files"
+    base_url: "https://cdn.cboe.com/api/global/delayed_quotes"
+    auth:
+      auth_method: "none"
+    endpoints:
+      vix_index: "/vix_historical_data.csv"
+      vix_futures: "/futures/vx/history/"
+    file_patterns:
+      vx_futures_daily: "CFE_{symbol}_{year}{month}.csv"
+      vix_index_daily: "vix_historical_data.csv"
+    data_formats:
+      vx_futures_daily:
+        format: "csv"
+        header_rows: 1
+        date_column: "Trade Date"
+        date_format: "%m/%d/%Y"
+        columns:
+          - name: "Trade Date"
+            mapped_name: "timestamp"
+            type: "date"
+          - name: "Futures"
+            mapped_name: "symbol"
+            type: "string"
+          - name: "Open"
+            mapped_name: "open"
+            type: "float"
+          - name: "High"
+            mapped_name: "high"
+            type: "float"
+          - name: "Low"
+            mapped_name: "low"
+            type: "float"
+          - name: "Close"
+            mapped_name: "close"
+            type: "float"
+          - name: "Settle"
+            mapped_name: "settle"
+            type: "float"
+          - name: "Change"
+            mapped_name: "change"
+            type: "float"
+          - name: "Total Volume"
+            mapped_name: "volume"
+            type: "int"
+          - name: "EFP"
+            mapped_name: "efp"
+            type: "int"
+          - name: "Open Interest"
+            mapped_name: "open_interest"
+            type: "int"
+      vix_index_daily:
+        format: "csv"
+        header_rows: 1
+        date_column: "DATE"
+        date_format: "%m/%d/%Y"
+        columns:
+          - name: "DATE"
+            mapped_name: "timestamp"
+            type: "date"
+          - name: "OPEN"
+            mapped_name: "open"
+            type: "float"
+          - name: "HIGH"
+            mapped_name: "high"
+            type: "float"
+          - name: "LOW"
+            mapped_name: "low"
+            type: "float"
+          - name: "CLOSE"
+            mapped_name: "close"
+            type: "float"
+    data_validation:
+      validate_timestamps: true
+      handle_missing_data: "warn"
+      handle_duplicate_data: "last"
+    database:
+      raw_table: "market_data_cboe_raw"
+      clean_table: "market_data_cboe"
+      
+  fred:
+    inherit: "rest_api_source"
+    name: "FRED"
+    type: "economic_data"
+    description: "Federal Reserve Economic Data API"
+    base_url: "https://api.stlouisfed.org/fred"
+    auth:
+      auth_method: "api_key"
+      api_key_param: "api_key"
+      api_key: "${env:FRED_API_KEY}"
+    endpoints:
+      series: "/series"
+      observations: "/series/observations"
+      releases: "/releases"
+    supported_intervals:
+      - name: "daily"
+        interval: 1
+        unit: "day"
+      - name: "weekly"
+        interval: 1
+        unit: "week"
+      - name: "monthly"
+        interval: 1
+        unit: "month"
+      - name: "quarterly"
+        interval: 1
+        unit: "quarter"
+      - name: "annual"
+        interval: 1
+        unit: "year"
+    rate_limit:
+      max_requests_per_sec: 20
+      max_requests_per_day: 1000
+    data_validation:
+      validate_timestamps: true
+      handle_missing_data: "null"
+      handle_duplicate_data: "last"
+    database:
+      raw_table: "economic_data_raw"
+      clean_table: "economic_data"
+      
+# Database table definitions
+tables:
+  market_data_raw:
+    description: "Raw market data from various sources"
+    primary_key: ["timestamp", "symbol", "interval_value", "interval_unit"]
+    columns:
+      - name: "timestamp"
+        type: "TIMESTAMP"
+        description: "Bar timestamp"
+      - name: "symbol"
+        type: "VARCHAR"
+        description: "Instrument symbol"
+      - name: "open"
+        type: "DOUBLE"
+        description: "Opening price"
+      - name: "high"
+        type: "DOUBLE"
+        description: "Highest price"
+      - name: "low"
+        type: "DOUBLE"
+        description: "Lowest price"
+      - name: "close"
+        type: "DOUBLE"
+        description: "Closing price"
+      - name: "volume"
+        type: "BIGINT"
+        description: "Trading volume"
+      - name: "open_interest"
+        type: "BIGINT"
+        description: "Open interest for futures/options"
+      - name: "source"
+        type: "VARCHAR"
+        description: "Data source identifier"
+      - name: "interval_value"
+        type: "INTEGER"
+        description: "Interval value (e.g., 1, 5, 15)"
+      - name: "interval_unit"
+        type: "VARCHAR"
+        description: "Interval unit (e.g., minute, day)"
+    
+  market_data:
+    description: "Cleaned market data"
+    inherit: "market_data_raw"
+    additional_columns:
+      - name: "quality"
+        type: "INTEGER"
+        description: "Data quality score (0-100)"
+      - name: "adjusted"
+        type: "BOOLEAN"
+        description: "Whether prices are adjusted for corporate actions"
+      - name: "cleaning_history"
+        type: "VARCHAR"
+        description: "Reference to cleaning history entries"
+    
+  market_data_cboe_raw:
+    description: "Raw CBOE data"
+    primary_key: ["timestamp", "symbol", "interval_value", "interval_unit"]
+    columns:
+      - name: "timestamp"
+        type: "TIMESTAMP"
+        description: "Bar timestamp"
+      - name: "symbol"
+        type: "VARCHAR"
+        description: "Instrument symbol"
+      - name: "open"
+        type: "DOUBLE"
+        description: "Opening price"
+      - name: "high"
+        type: "DOUBLE"
+        description: "Highest price"
+      - name: "low"
+        type: "DOUBLE"
+        description: "Lowest price"
+      - name: "close"
+        type: "DOUBLE"
+        description: "Closing price"
+      - name: "settle"
+        type: "DOUBLE"
+        description: "Settlement price"
+      - name: "change"
+        type: "DOUBLE"
+        description: "Price change"
+      - name: "volume"
+        type: "BIGINT"
+        description: "Trading volume"
+      - name: "efp"
+        type: "BIGINT"
+        description: "Exchange for physical"
+      - name: "open_interest"
+        type: "BIGINT"
+        description: "Open interest"
+      - name: "source"
+        type: "VARCHAR"
+        description: "Data source identifier"
+      - name: "interval_value"
+        type: "INTEGER"
+        description: "Interval value (e.g., 1, 5, 15)"
+      - name: "interval_unit"
+        type: "VARCHAR"
+        description: "Interval unit (e.g., minute, day)"

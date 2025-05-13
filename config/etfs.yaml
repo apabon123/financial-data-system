@@ -1,0 +1,162 @@
+# etfs.yaml
+# Configuration for ETFs with their NAV calculation details and underlying index references
+
+version: "1.0"
+
+# Common templates for ETFs
+templates:
+  equity_index_etf:
+    type: "ETF"
+    asset_class: "equity"
+    default_source: "tradestation"
+    default_raw_table: "market_data"
+    frequencies: ["1min", "15min", "daily"]
+    dividend_reinvestment: true
+    expense_ratio_handling: "daily_accrual"
+    
+  volatility_etf:
+    type: "ETF"
+    asset_class: "volatility"
+    default_source: "tradestation"
+    default_raw_table: "market_data"
+    frequencies: ["1min", "15min", "daily"]
+    dividend_reinvestment: false
+    rebalance_frequency: "daily"
+    expense_ratio_handling: "daily_accrual"
+
+# ETF definitions
+etfs:
+  SPY:
+    inherit: "equity_index_etf"
+    symbol: "SPY"
+    name: "SPDR S&P 500 ETF Trust"
+    description: "SPDR S&P 500 ETF"
+    exchange: "NYSE"
+    exchange_ref: "${exchanges.NYSE}"
+    calendar: "NYSE"
+    calendar_ref: "${exchanges.NYSE.calendars.NYSE}"
+    start_date: "2001-01-01"
+    currency: "USD"
+    expense_ratio: 0.0945
+    tracking_index: "SPX"
+    tracking_index_ref: "${indices.SPX}"
+    creation_unit_size: 50000
+    nav_calculation:
+      method: "full_replication"
+      description: "Holds all constituent stocks of the S&P 500 index in the same weights"
+    corporate_actions:
+      dividend_treatment: "distributed"
+      tax_characteristics: "qualified_dividend"
+    official_website: "https://www.ssga.com/us/en/individual/etfs/funds/spdr-sp-500-etf-trust-spy"
+    related_futures: "ES"
+    data_sources:
+      - source: "tradestation"
+        symbol: "SPY"
+        primary: true
+        frequencies: ["1min", "15min", "daily"]
+    
+  QQQ:
+    inherit: "equity_index_etf"
+    symbol: "QQQ"
+    name: "Invesco QQQ Trust"
+    description: "Invesco QQQ Trust"
+    exchange: "NASDAQ"
+    exchange_ref: "${exchanges.NASDAQ}"
+    calendar: "NASDAQ"
+    calendar_ref: "${exchanges.NASDAQ.calendars.NASDAQ}"
+    start_date: "2001-01-01"
+    currency: "USD"
+    expense_ratio: 0.20
+    tracking_index: "NDX"
+    tracking_index_ref: "${indices.NDX}"
+    creation_unit_size: 50000
+    nav_calculation:
+      method: "full_replication"
+      description: "Holds all constituent stocks of the NASDAQ-100 index in the same weights"
+    corporate_actions:
+      dividend_treatment: "distributed"
+      tax_characteristics: "qualified_dividend"
+    official_website: "https://www.invesco.com/us/financial-products/etfs/product-detail?audienceType=Investor&ticker=QQQ"
+    related_futures: "NQ"
+    data_sources:
+      - source: "tradestation"
+        symbol: "QQQ"
+        primary: true
+        frequencies: ["1min", "15min", "daily"]
+    
+  VXX:
+    inherit: "volatility_etf"
+    symbol: "VXX"
+    name: "iPath Series B S&P 500 VIX Short-Term Futures ETN"
+    description: "iPath Series B S&P 500 VIX Short-Term Futures ETN"
+    exchange: "CBOE"
+    exchange_ref: "${exchanges.CBOE}"
+    calendar: "NYSE"
+    calendar_ref: "${exchanges.NYSE.calendars.NYSE}"
+    start_date: "2018-01-01"  # Replaced older VXX
+    currency: "USD"
+    expense_ratio: 0.89
+    etn_issuer: "Barclays Bank PLC"
+    tracking_index: "S&P 500 VIX Short-Term Futures Index"
+    related_index: "VIX"
+    related_index_ref: "${indices.VIX}"
+    maturity_date: "2028-01-23"
+    index_calculation:
+      method: "futures_roll"
+      description: "Maintains a constant-maturity 30-day exposure to VIX futures by daily rolling partial positions in first and second month contracts"
+      roll_schedule: "daily"
+      contracts_used: [1, 2]
+    official_website: "https://www.ipathetn.com/US/16/en/details.app?instrumentId=341408"
+    related_futures: "VX"
+    data_sources:
+      - source: "tradestation"
+        symbol: "VXX"
+        primary: true
+        frequencies: ["daily"]
+
+  UVXY:
+    inherit: "volatility_etf"
+    symbol: "UVXY"
+    name: "ProShares Ultra VIX Short-Term Futures ETF"
+    description: "ProShares Ultra VIX Short-Term Futures ETF"
+    exchange: "CBOE"
+    exchange_ref: "${exchanges.CBOE}"
+    calendar: "NYSE"
+    calendar_ref: "${exchanges.NYSE.calendars.NYSE}"
+    start_date: "2011-10-04"
+    currency: "USD"
+    expense_ratio: 0.95
+    leverage_factor: 1.5  # Was 2x, changed to 1.5x in 2018
+    tracking_index: "S&P 500 VIX Short-Term Futures Index"
+    related_index: "VIX"
+    related_index_ref: "${indices.VIX}"
+    index_calculation:
+      method: "futures_roll_leveraged"
+      description: "Seeks daily investment results that correspond to 1.5x the daily performance of the S&P 500 VIX Short-Term Futures Index"
+      roll_schedule: "daily"
+      contracts_used: [1, 2]
+      rebalance_frequency: "daily"
+    official_website: "https://www.proshares.com/our-etfs/leveraged-and-inverse/uvxy"
+    related_futures: "VX"
+    data_sources:
+      - source: "tradestation"
+        symbol: "UVXY"
+        primary: true
+        frequencies: ["daily"]
+
+# NAV calculation methodologies
+nav_calculation_methods:
+  full_replication:
+    description: "ETF holds all constituent securities of the underlying index in the same weights"
+    
+  sampling:
+    description: "ETF holds a representative sample of constituent securities to track the index"
+    
+  synthetic:
+    description: "ETF uses derivatives like swaps to track the index without holding the underlying securities"
+    
+  futures_roll:
+    description: "ETF holds futures contracts and rolls them according to a specified schedule"
+    
+  futures_roll_leveraged:
+    description: "ETF uses leverage to provide multiple exposure to an index of futures contracts"

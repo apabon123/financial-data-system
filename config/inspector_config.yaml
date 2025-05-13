@@ -1,0 +1,44 @@
+paths:
+  db: C:/Users/alexp/OneDrive/Gdrive/Trading/GitHub Projects/data-management/financial-data-system/data/financial_data.duckdb
+  sql: C:/Users/alexp/OneDrive/Gdrive/Trading/GitHub Projects/data-management/financial-data-system/src/sql/sql
+  history: C:/Users/alexp/OneDrive/Gdrive/Trading/GitHub Projects/data-management/financial-data-system/data/inspector_history.json
+  export: C:/Users/alexp/OneDrive/Gdrive/Trading/GitHub Projects/data-management/financial-data-system/output/exports
+  reports: C:/Users/alexp/OneDrive/Gdrive/Trading/GitHub Projects/data-management/financial-data-system/output/reports
+  backup: C:/Users/alexp/OneDrive/Gdrive/Trading/GitHub Projects/data-management/financial-data-system/backups
+  log: C:/Users/alexp/OneDrive/Gdrive/Trading/GitHub Projects/data-management/financial-data-system/logs/inspector.log
+
+ui:
+  theme: dark
+  max_rows_display: 1000
+  syntax_highlighting: true
+  show_query_time: true
+
+data_quality:
+  outlier_threshold: 3.0
+  missing_data_threshold: 0.1
+  price_spike_threshold: 10.0
+  volume_spike_threshold: 5.0
+
+performance:
+  cache_schema: true
+  cache_results: true
+  max_cache_size: 50
+  max_query_time: 300
+  max_query_history: 100
+
+visualization:
+  default_chart_type: line
+  default_color_scheme: viridis
+  interactive: true
+  max_points: 10000
+
+backups:
+  auto_backup_enabled: true
+  backup_before_changes: true
+  max_backups: 10
+  compression: true
+
+market_structure:
+  default_roll_method: volume
+  panama_ratio: 0.75
+  correlation_period: 60

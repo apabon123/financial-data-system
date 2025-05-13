@@ -1,0 +1,282 @@
+#!/bin/bash
+# Enhanced DB Inspector for Financial Data System
+# This script launches the new DB Inspector with improved functionality
+
+# Determine Python executable to use (python3 preferred)
+if command -v python3 &>/dev/null; then
+    PYTHON="python3"
+elif command -v python &>/dev/null; then
+    PYTHON="python"
+else
+    echo "Error: Python not found. Please install Python 3.8 or higher."
+    echo "Visit https://www.python.org/downloads/"
+    exit 1
+fi
+
+# Check Python version
+PY_VERSION=$($PYTHON -c "import sys; print('{}.{}'.format(sys.version_info.major, sys.version_info.minor))")
+if [[ "$(echo "$PY_VERSION < 3.8" | bc)" -eq 1 ]]; then
+    echo "Error: Python 3.8+ is required. Found Python $PY_VERSION"
+    echo "Please upgrade your Python installation."
+    exit 1
+fi
+
+echo "======================================================"
+echo "DB Inspector - Financial Market Data Inspection Tool"
+echo "======================================================"
+echo 
+echo "Using Python $PY_VERSION"
+
+# Check for verbose mode
+VERBOSE=0
+for arg in "$@"; do
+    if [ "$arg" == "--verbose" ]; then
+        VERBOSE=1
+    fi
+done
+
+# Check for requirements.txt
+if [ ! -f "requirements.txt" ]; then
+    echo "[WARNING] requirements.txt not found. Will use hardcoded dependency list."
+fi
+
+# Check for required dependencies
+echo "[1/4] Checking required dependencies..."
+echo
+
+# Capture missing dependencies
+MISSING_DEPS=$($PYTHON -c "
+missing = []
+try: import pandas
+except ImportError: missing.append('pandas')
+try: import duckdb
+except ImportError: missing.append('duckdb')
+try: import numpy
+except ImportError: missing.append('numpy')
+try: import yaml
+except ImportError: missing.append('pyyaml')
+try: import rich
+except ImportError: missing.append('rich')
+if missing:
+    print(' '.join(missing))
+else:
+    print('')
+")
+
+# Build installation command and dependencies list
+INSTALL_CMD=""
+INSTALL_DEPS=""
+
+if [ ! -z "$MISSING_DEPS" ]; then
+    for dep in $MISSING_DEPS; do
+        case $dep in
+            pandas) INSTALL_DEPS="$INSTALL_DEPS pandas>=2.0.0" ;;
+            duckdb) INSTALL_DEPS="$INSTALL_DEPS duckdb>=1.2.1" ;;
+            numpy) INSTALL_DEPS="$INSTALL_DEPS numpy>=1.24.0" ;;
+            pyyaml) INSTALL_DEPS="$INSTALL_DEPS pyyaml>=6.0.1" ;;
+            rich) INSTALL_DEPS="$INSTALL_DEPS rich>=13.7.0" ;;
+        esac
+    done
+    
+    if [ -f "requirements.txt" ]; then
+        INSTALL_CMD="$PYTHON -m pip install -r requirements.txt"
+    else
+        INSTALL_CMD="$PYTHON -m pip install $INSTALL_DEPS"
+    fi
+    
+    echo "[MISSING] Required dependencies: $MISSING_DEPS"
+    echo
+    echo "These core dependencies are required for DB Inspector to function."
+    echo
+    echo "Would you like to install the missing dependencies now? (y/n)"
+    read INSTALL
+    
+    if [[ "$INSTALL" == "y" || "$INSTALL" == "Y" ]]; then
+        echo
+        echo "Installing required dependencies..."
+        echo "Running: $INSTALL_CMD"
+        echo
+        
+        # Ensure logs directory exists
+        mkdir -p logs
+        
+        # Redirect output to a log file
+        $INSTALL_CMD > logs/pip_install.log 2>&1
+        
+        if [ $? -ne 0 ]; then
+            echo
+            echo "[ERROR] Failed to install dependencies."
+            echo
+            echo "Please try manually with:"
+            echo "pip install $INSTALL_DEPS"
+            echo
+            echo "Or install all dependencies with:"
+            echo "pip install -r requirements.txt"
+            echo
+            echo "Check logs/pip_install.log for details."
+            if [ $VERBOSE -eq 1 ]; then
+                echo
+                echo "Installation log:"
+                cat logs/pip_install.log
+            fi
+            exit 1
+        else
+            echo "[SUCCESS] Required dependencies installed successfully."
+        fi
+    else
+        echo
+        echo "Installation aborted. DB Inspector requires these dependencies to function."
+        echo
+        echo "You can install them manually with:"
+        echo "pip install $INSTALL_DEPS"
+        echo
+        echo "Or install all dependencies with:"
+        echo "pip install -r requirements.txt"
+        exit 1
+    fi
+else
+    echo "[OK] All required dependencies are installed."
+fi
+
+# Check for optional dependencies
+echo
+echo "[2/4] Checking optional dependencies..."
+echo
+
+# Capture missing optional dependencies
+MISSING_OPT=$($PYTHON -c "
+missing = []
+try: import networkx
+except ImportError: missing.append('networkx')
+try: import prompt_toolkit
+except ImportError: missing.append('prompt_toolkit')
+try: import pygments
+except ImportError: missing.append('pygments')
+try: import matplotlib
+except ImportError: missing.append('matplotlib')
+try: import seaborn
+except ImportError: missing.append('seaborn')
+try: import tabulate
+except ImportError: missing.append('tabulate')
+if missing:
+    print(' '.join(missing))
+else:
+    print('')
+")
+
+# Set installation strings for optional deps
+INSTALL_OPT_CMD=""
+INSTALL_OPT_DEPS=""
+
+if [ ! -z "$MISSING_OPT" ]; then
+    for dep in $MISSING_OPT; do
+        case $dep in
+            networkx) INSTALL_OPT_DEPS="$INSTALL_OPT_DEPS networkx>=3.0" ;;
+            prompt_toolkit) INSTALL_OPT_DEPS="$INSTALL_OPT_DEPS prompt_toolkit>=3.0.33" ;;
+            pygments) INSTALL_OPT_DEPS="$INSTALL_OPT_DEPS pygments>=2.15.0" ;;
+            matplotlib) INSTALL_OPT_DEPS="$INSTALL_OPT_DEPS matplotlib>=3.7.0" ;;
+            seaborn) INSTALL_OPT_DEPS="$INSTALL_OPT_DEPS seaborn>=0.12.0" ;;
+            tabulate) INSTALL_OPT_DEPS="$INSTALL_OPT_DEPS tabulate>=0.9.0" ;;
+        esac
+    done
+    
+    INSTALL_OPT_CMD="$PYTHON -m pip install $INSTALL_OPT_DEPS"
+    
+    echo "[LIMITED] Missing optional dependencies: $MISSING_OPT"
+    echo
+    echo "These dependencies enable enhanced features but are not required:"
+    echo "- networkx: Schema visualization"
+    echo "- prompt_toolkit, pygments: Interactive SQL"
+    echo "- matplotlib, seaborn: Data visualization"
+    echo "- tabulate: Table formatting"
+    echo
+    echo "Would you like to install these optional dependencies for enhanced functionality? (y/n)"
+    read INSTALL_OPT
+    
+    if [[ "$INSTALL_OPT" == "y" || "$INSTALL_OPT" == "Y" ]]; then
+        echo
+        echo "Installing optional dependencies..."
+        echo "Running: $INSTALL_OPT_CMD"
+        echo
+        
+        # Ensure logs directory exists
+        mkdir -p logs
+        
+        # Redirect output to a log file
+        $INSTALL_OPT_CMD > logs/pip_install_opt.log 2>&1
+        
+        if [ $? -ne 0 ]; then
+            echo "[WARNING] Some optional dependencies could not be installed."
+            echo
+            echo "You can try manually with:"
+            echo "pip install $INSTALL_OPT_DEPS"
+            echo
+            echo "Check logs/pip_install_opt.log for details."
+            echo
+            echo "Continuing with limited functionality..."
+            if [ $VERBOSE -eq 1 ]; then
+                echo
+                echo "Installation log:"
+                cat logs/pip_install_opt.log
+            fi
+        else
+            echo "[SUCCESS] Optional dependencies installed successfully."
+        fi
+    else
+        echo "Continuing with limited functionality..."
+    fi
+else
+    echo "[OK] All optional dependencies are installed."
+fi
+
+# Check for fallback mode
+FALLBACK_MODE=0
+for arg in "$@"; do
+    if [ "$arg" == "--fallback" ]; then
+        FALLBACK_MODE=1
+    fi
+done
+
+# Set special flags for running
+RUN_ARGS=("$@")
+if [ $FALLBACK_MODE -eq 1 ]; then
+    echo
+    echo "[3/4] Running in FALLBACK MODE with basic functionality..."
+    RUN_ARGS=("--fallback")
+    if [ $VERBOSE -eq 1 ]; then
+        RUN_ARGS=("--fallback" "--debug")
+    fi
+else
+    echo
+    echo "[3/4] Launching DB Inspector..."
+fi
+
+echo
+
+# Create logs directory if it doesn't exist
+mkdir -p logs
+
+# Run with error handling - capturing stderr to a log file
+echo "Command: $PYTHON -m src.inspector ${RUN_ARGS[@]}"
+$PYTHON -m src.inspector "${RUN_ARGS[@]}" 2> logs/inspector_error.log
+
+if [ $? -ne 0 ]; then
+    echo
+    echo "[ERROR] DB Inspector encountered an error."
+    echo
+    echo "Please check the logs for more information:"
+    echo "- logs/inspector.log (Application log)"
+    echo "- logs/inspector_error.log (Error output)"
+    echo
+    echo "To run in debug mode, use:"
+    echo "  ./db_inspect_enhanced --debug"
+    echo
+    echo "If you're experiencing dependency issues, try:"
+    echo "  ./db_inspect_enhanced --fallback"
+    echo
+    echo "For more detailed installation help, create a check_dependencies.sh script"
+    read -p "Press Enter to continue..."
+else
+    echo
+    echo "[SUCCESS] DB Inspector completed successfully."
+fi

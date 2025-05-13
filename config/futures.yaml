@@ -1,0 +1,261 @@
+# futures.yaml
+# Configuration for futures contracts with their specifications, roll rules, and exchange mappings
+
+version: "1.0"
+
+# Common templates for futures to reduce repetition
+templates:
+  equity_index_futures:
+    default_source: "tradestation"
+    default_raw_table: "market_data"
+    frequencies: ["1min", "15min", "daily"]
+    roll_method: "volume"
+    expiry_rule:
+      day_type: "friday"
+      day_number: 3
+      adjust_for_holiday: true
+    tick_size: 0.25
+    tick_value: 12.50
+    
+  vix_futures:
+    default_source: "tradestation"
+    default_raw_table: "market_data"
+    frequencies: ["1min", "15min", "daily"]
+    roll_method: "volume"
+    expiry_rule:
+      day_type: "wednesday"
+      special_rule: "VX_expiry"
+    tick_size: 0.05
+    tick_value: 50.00
+  
+  energy_futures:
+    default_source: "tradestation"
+    default_raw_table: "market_data"
+    frequencies: ["1min", "15min", "daily"]
+    roll_method: "volume"
+    expiry_rule:
+      day_type: "business_day"
+      days_before: 3
+      reference_day: 25
+      adjust_for_holiday: true
+      
+  metal_futures:
+    default_source: "tradestation"
+    default_raw_table: "market_data"
+    frequencies: ["daily"]
+    roll_method: "volume"
+    expiry_rule:
+      day_type: "business_day"
+      days_before: 3
+      reference_point: "last_business_day"
+      adjust_for_holiday: true
+
+# Futures contract specifications
+futures:
+  ES:
+    inherit: "equity_index_futures"
+    name: "E-mini S&P 500 Futures"
+    description: "E-mini S&P 500 Futures"
+    asset_class: "equity_index"
+    exchange: "CME"
+    exchange_ref: "${exchanges.CME}"
+    currency: "USD"
+    calendar: "CME_Equity"
+    calendar_ref: "${exchanges.CME.calendars.CME_Equity}"
+    multiplier: 50
+    point_value: 50.00
+    tick_size: 0.25
+    tick_value: 12.50
+    settlement_type: "cash"
+    contract_info:
+      patterns: ["H", "M", "U", "Z"]
+      start_year: 2003
+      num_active_contracts: 2
+    continuous_contracts:
+      - identifier: "@ES=101XN"
+        description: "ES Continuous Contract (Unadjusted, TradeStation)"
+        type: "continuous_future"
+        method: "none"
+        position: 1
+        frequencies: ["1min", "15min", "daily"]
+        start_date: "2003-01-01"
+      - identifier: "@ES=102XC"
+        description: "ES Continuous Contract (Adjusted, Backwards Ratio, TradeStation)"
+        type: "continuous_future"
+        method: "backwards_ratio"
+        position: 1
+        frequencies: ["1min", "15min", "daily"]
+        start_date: "2003-01-01"
+      - identifier: "@ES=1P75V"
+        description: "ES Continuous Contract (Panama Method, Volume-Based Rolls)"
+        type: "continuous_future"
+        method: "panama"
+        position: 1
+        ratio_limit: 0.75
+        roll_method: "volume"
+        frequencies: ["daily"]
+        start_date: "2003-01-01"
+
+  NQ:
+    inherit: "equity_index_futures"
+    name: "E-mini NASDAQ-100 Futures"
+    description: "E-mini NASDAQ-100 Futures"
+    asset_class: "equity_index"
+    exchange: "CME"
+    exchange_ref: "${exchanges.CME}"
+    currency: "USD"
+    calendar: "CME_Equity"
+    calendar_ref: "${exchanges.CME.calendars.CME_Equity}"
+    multiplier: 20
+    point_value: 20.00
+    settlement_type: "cash"
+    contract_info:
+      patterns: ["H", "M", "U", "Z"]
+      start_year: 2003
+      num_active_contracts: 2
+    continuous_contracts:
+      - identifier: "@NQ=101XN"
+        description: "NQ Continuous Contract (Unadjusted, TradeStation)"
+        type: "continuous_future"
+        method: "none"
+        position: 1
+        frequencies: ["1min", "15min", "daily"]
+        start_date: "2003-01-01"
+      - identifier: "@NQ=102XC"
+        description: "NQ Continuous Contract (Adjusted, Backwards Ratio, TradeStation)"
+        type: "continuous_future"
+        method: "backwards_ratio"
+        position: 1
+        frequencies: ["1min", "15min", "daily"]
+        start_date: "2003-01-01"
+      - identifier: "@NQ=1P75V"
+        description: "NQ Continuous Contract (Panama Method, Volume-Based Rolls)"
+        type: "continuous_future"
+        method: "panama"
+        position: 1
+        ratio_limit: 0.75
+        roll_method: "volume"
+        frequencies: ["daily"]
+        start_date: "2003-01-01"
+
+  CL:
+    inherit: "energy_futures"
+    name: "Crude Oil Futures"
+    description: "Crude Oil Futures"
+    asset_class: "energy"
+    exchange: "NYMEX"
+    exchange_ref: "${exchanges.NYMEX}"
+    currency: "USD"
+    calendar: "CMEGlobex_CL"
+    calendar_ref: "${exchanges.NYMEX.calendars.CMEGlobex_CL}"
+    multiplier: 1000
+    point_value: 1000.00
+    tick_size: 0.01
+    tick_value: 10.00
+    settlement_type: "physical"
+    contract_info:
+      patterns: ["F", "G", "H", "J", "K", "M", "N", "Q", "U", "V", "X", "Z"]
+      start_year: 2005
+      start_month: 6
+      num_active_contracts: 12
+    continuous_contracts:
+      - identifier: "@CL=1P75V"
+        description: "CL Continuous Contract (Panama Method, Volume-Based Rolls)"
+        type: "continuous_future"
+        method: "panama"
+        position: 1
+        ratio_limit: 0.75
+        roll_method: "volume"
+        frequencies: ["daily"]
+        start_date: "2005-01-01"
+
+  GC:
+    inherit: "metal_futures"
+    name: "Gold Futures"
+    description: "Gold Futures"
+    asset_class: "metals"
+    exchange: "COMEX"
+    exchange_ref: "${exchanges.COMEX}"
+    currency: "USD"
+    calendar: "CMEGlobex_GC"
+    calendar_ref: "${exchanges.COMEX.calendars.CMEGlobex_GC}"
+    multiplier: 100
+    point_value: 100.00
+    tick_size: 0.10
+    tick_value: 10.00
+    settlement_type: "physical"
+    contract_info:
+      patterns: ["G", "J", "M", "Q", "V", "Z"]
+      start_year: 2004
+      num_active_contracts: 6
+    continuous_contracts:
+      - identifier: "@GC=1P75V"
+        description: "GC Continuous Contract (Panama Method, Volume-Based Rolls)"
+        type: "continuous_future"
+        method: "panama"
+        position: 1
+        ratio_limit: 0.75
+        roll_method: "volume"
+        frequencies: ["daily"]
+        start_date: "2004-01-01"
+
+  VX:
+    inherit: "vix_futures"
+    name: "CBOE Volatility Index Futures"
+    description: "CBOE Volatility Index Futures"
+    asset_class: "volatility"
+    exchange: "CBOE"
+    exchange_ref: "${exchanges.CBOE}"
+    currency: "USD"
+    calendar: "CFE"
+    calendar_ref: "${exchanges.CBOE.calendars.CFE}"
+    multiplier: 1000
+    point_value: 1000.00
+    settlement_type: "cash"
+    contract_info:
+      patterns: ["F", "G", "H", "J", "K", "M", "N", "Q", "U", "V", "X", "Z"]
+      start_year: 2004
+      num_active_contracts: 9
+      exclude_contracts:
+        - "VXF04"
+        - "VXG04"
+        - "VXH04"
+        - "VXJ04"
+        - "VXZ04"
+        - "VXJ05"
+        - "VXN05"
+        - "VXU05"
+    continuous_contracts:
+      # Group definition for VX continuous contracts
+      group:
+        identifier_base: "@VX"
+        month_codes: ["1", "2", "3", "4", "5", "6", "7", "8", "9"]
+        settings_code: "01XN"
+        description_template: "TradeStation Continuous VIX Future ({nth_month} month)"
+        type: "continuous_future"
+        frequencies: ["daily"]
+        start_date: "2005-01-01"
+      # Panama method continuous for VX
+      - identifier: "@VX=1P75V"
+        description: "VX Continuous Contract (Panama Method, Volume-Based Rolls)"
+        type: "continuous_future"
+        method: "panama"
+        position: 1
+        ratio_limit: 0.75
+        roll_method: "volume"
+        frequencies: ["daily"]
+        start_date: "2005-01-01"
+
+# Expiry calculation rules
+expiry_rules:
+  VX_expiry:
+    description: "VIX futures expire 30 days before the 3rd Friday of the following month"
+    calculation:
+      base: "nth_weekday"
+      parameters:
+        nth: 3
+        weekday: "Friday"
+        month: "following"
+      offset: -30
+      offset_units: "days"
+      adjust_for_holiday: true

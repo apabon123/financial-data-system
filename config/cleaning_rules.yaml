@@ -1,0 +1,396 @@
+# cleaning_rules.yaml
+# Configuration for data quality rules and cleaning procedures
+
+version: "1.0"
+
+# Templates for common cleaning rule sets
+templates:
+  common_price_data_rules:
+    priority: 100
+    enabled: true
+    fields: ["open", "high", "low", "close"]
+    rules:
+      - rule: "zero_values"
+        enabled: true
+        priority: 10
+        parameters:
+          threshold: 0.0001
+          fields: ["open", "high", "low", "close"]
+          action: "interpolate"
+      - rule: "high_low_inversion"
+        enabled: true
+        priority: 20
+        parameters:
+          fields: ["high", "low"]
+          action: "swap"
+      - rule: "open_outside_range"
+        enabled: true
+        priority: 30
+        parameters:
+          fields: ["open", "high", "low"]
+          action: "clamp"
+      - rule: "close_outside_range"
+        enabled: true
+        priority: 40
+        parameters:
+          fields: ["close", "high", "low"]
+          action: "clamp"
+      - rule: "price_spike"
+        enabled: true
+        priority: 50
+        parameters:
+          fields: ["open", "high", "low", "close"]
+          max_deviation: 20.0
+          window_size: 5
+          action: "interpolate"
+          
+  futures_data_rules:
+    inherit: "common_price_data_rules"
+    priority: 90
+    enabled: true
+    rules:
+      - rule: "settlement_outside_range"
+        enabled: true
+        priority: 45
+        parameters:
+          fields: ["settle", "high", "low"]
+          action: "clamp"
+      - rule: "negative_open_interest"
+        enabled: true
+        priority: 60
+        parameters:
+          fields: ["open_interest"]
+          action: "zero"
+
+# Cleaning rules by asset class and specific instruments
+cleaning_rules:
+  # Equities cleaning rules
+  equity:
+    inherit: "common_price_data_rules"
+    description: "Cleaning rules for equity data"
+    enabled: true
+    target:
+      asset_class: "equity"
+    rules:
+      - rule: "negative_volume"
+        enabled: true
+        priority: 60
+        parameters:
+          fields: ["volume"]
+          action: "zero"
+      - rule: "missing_after_hours"
+        enabled: true
+        priority: 70
+        parameters:
+          fields: ["open", "high", "low", "close"]
+          action: "copy_previous"
+          conditions:
+            is_market_hours: false
+  
+  # VIX Index specific rules
+  vix_index:
+    inherit: "common_price_data_rules"
+    description: "Cleaning rules for VIX index data"
+    enabled: true
+    target:
+      symbols: ["$VIX.X"]
+    rules:
+      - rule: "price_spike"
+        enabled: true
+        priority: 50
+        parameters:
+          fields: ["open", "high", "low", "close"]
+          max_deviation: 40.0  # VIX can be more volatile
+          window_size: 3
+          action: "interpolate"
+      - rule: "minimum_value"
+        enabled: true
+        priority: 55
+        parameters:
+          fields: ["open", "high", "low", "close"]
+          min_value: 9.0
+          action: "replace_with_min"
+  
+  # VX Futures specific rules
+  vx_futures:
+    inherit: "futures_data_rules"
+    description: "Cleaning rules for VX futures data"
+    enabled: true
+    target:
+      symbols_pattern: "^VX[A-Z]\\d{2}$"
+    rules:
+      - rule: "zero_price"
+        enabled: true
+        priority: 10
+        parameters:
+          fields: ["open", "high", "low", "close", "settle"]
+          threshold: 0.05  # VX prices should never be near zero
+          action: "interpolate"
+          max_gap_days: 5
+      - rule: "minimum_value"
+        enabled: true
+        priority: 55
+        parameters:
+          fields: ["open", "high", "low", "close", "settle"]
+          min_value: 9.0
+          action: "replace_with_min"
+      - rule: "missing_volume"
+        enabled: true
+        priority: 65
+        parameters:
+          fields: ["volume"]
+          action: "rolling_average"
+          window_size: 5
+  
+  # ES Futures specific rules
+  es_futures:
+    inherit: "futures_data_rules"
+    description: "Cleaning rules for ES futures data"
+    enabled: true
+    target:
+      symbols_pattern: "^ES[A-Z]\\d{2}$"
+    rules:
+      - rule: "price_gap"
+        enabled: true
+        priority: 70
+        parameters:
+          fields: ["close"]
+          max_gap_percent: 5.0
+          action: "flag"
+          flag_only: true
+      - rule: "missing_volume"
+        enabled: true
+        priority: 65
+        parameters:
+          fields: ["volume"]
+          action: "rolling_average"
+          window_size: 5
+  
+  # NQ Futures specific rules
+  nq_futures:
+    inherit: "futures_data_rules"
+    description: "Cleaning rules for NQ futures data"
+    enabled: true
+    target:
+      symbols_pattern: "^NQ[A-Z]\\d{2}$"
+    rules:
+      - rule: "price_gap"
+        enabled: true
+        priority: 70
+        parameters:
+          fields: ["close"]
+          max_gap_percent: 6.0
+          action: "flag"
+          flag_only: true
+      - rule: "missing_volume"
+        enabled: true
+        priority: 65
+        parameters:
+          fields: ["volume"]
+          action: "rolling_average"
+          window_size: 5
+
+# Cleaning rule definitions
+rule_definitions:
+  zero_values:
+    description: "Detects and corrects zero or near-zero values that should be positive"
+    parameters:
+      threshold: 
+        type: "float"
+        description: "Values below this threshold are considered zeros"
+        default: 0.0001
+      fields: 
+        type: "list"
+        description: "Fields to check for zero values"
+        default: ["open", "high", "low", "close"]
+      action: 
+        type: "enum"
+        options: ["interpolate", "previous", "next", "rolling_average", "flag"]
+        description: "Action to take when zeros are found"
+        default: "interpolate"
+      max_gap_days:
+        type: "int"
+        description: "Maximum gap in days for interpolation"
+        default: 5
+    implementation: "src.processors.cleaners.rules.zero_values.ZeroValuesRule"
+    
+  high_low_inversion:
+    description: "Detects and corrects cases where low is greater than high"
+    parameters:
+      fields: 
+        type: "list"
+        description: "Fields representing high and low values"
+        default: ["high", "low"]
+      action: 
+        type: "enum"
+        options: ["swap", "average", "flag"]
+        description: "Action to take when inversion is found"
+        default: "swap"
+    implementation: "src.processors.cleaners.rules.high_low_inversion.HighLowInversionRule"
+    
+  open_outside_range:
+    description: "Detects and corrects cases where open is outside the high-low range"
+    parameters:
+      fields: 
+        type: "list"
+        description: "Fields representing open, high, and low values"
+        default: ["open", "high", "low"]
+      action: 
+        type: "enum"
+        options: ["clamp", "average", "flag"]
+        description: "Action to take when violation is found"
+        default: "clamp"
+    implementation: "src.processors.cleaners.rules.price_range.OpenOutsideRangeRule"
+    
+  close_outside_range:
+    description: "Detects and corrects cases where close is outside the high-low range"
+    parameters:
+      fields: 
+        type: "list"
+        description: "Fields representing close, high, and low values"
+        default: ["close", "high", "low"]
+      action: 
+        type: "enum"
+        options: ["clamp", "average", "flag"]
+        description: "Action to take when violation is found"
+        default: "clamp"
+    implementation: "src.processors.cleaners.rules.price_range.CloseOutsideRangeRule"
+    
+  price_spike:
+    description: "Detects and corrects abnormal price spikes"
+    parameters:
+      fields: 
+        type: "list"
+        description: "Fields to check for price spikes"
+        default: ["open", "high", "low", "close"]
+      max_deviation: 
+        type: "float"
+        description: "Maximum allowed deviation in percent"
+        default: 20.0
+      window_size: 
+        type: "int"
+        description: "Window size for moving average"
+        default: 5
+      action: 
+        type: "enum"
+        options: ["interpolate", "rolling_average", "previous", "flag"]
+        description: "Action to take when spike is found"
+        default: "interpolate"
+    implementation: "src.processors.cleaners.rules.price_spike.PriceSpikeRule"
+    
+  negative_volume:
+    description: "Detects and corrects negative volume values"
+    parameters:
+      fields: 
+        type: "list"
+        description: "Fields to check for negative values"
+        default: ["volume"]
+      action: 
+        type: "enum"
+        options: ["zero", "absolute", "flag"]
+        description: "Action to take when negative values are found"
+        default: "zero"
+    implementation: "src.processors.cleaners.rules.negative_values.NegativeVolumeRule"
+    
+  negative_open_interest:
+    description: "Detects and corrects negative open interest values"
+    parameters:
+      fields: 
+        type: "list"
+        description: "Fields to check for negative values"
+        default: ["open_interest"]
+      action: 
+        type: "enum"
+        options: ["zero", "absolute", "flag"]
+        description: "Action to take when negative values are found"
+        default: "zero"
+    implementation: "src.processors.cleaners.rules.negative_values.NegativeOpenInterestRule"
+    
+  missing_after_hours:
+    description: "Handles missing data in after-hours trading"
+    parameters:
+      fields: 
+        type: "list"
+        description: "Fields to check for missing data"
+        default: ["open", "high", "low", "close"]
+      action: 
+        type: "enum"
+        options: ["copy_previous", "interpolate", "flag"]
+        description: "Action to take when missing data is found"
+        default: "copy_previous"
+      conditions:
+        type: "dict"
+        description: "Conditions to check before applying rule"
+    implementation: "src.processors.cleaners.rules.missing_data.MissingAfterHoursRule"
+    
+  settlement_outside_range:
+    description: "Detects and corrects cases where settlement price is outside the high-low range"
+    parameters:
+      fields: 
+        type: "list"
+        description: "Fields representing settlement, high, and low values"
+        default: ["settle", "high", "low"]
+      action: 
+        type: "enum"
+        options: ["clamp", "average", "flag"]
+        description: "Action to take when violation is found"
+        default: "clamp"
+    implementation: "src.processors.cleaners.rules.price_range.SettlementOutsideRangeRule"
+    
+  missing_volume:
+    description: "Handles missing volume data"
+    parameters:
+      fields: 
+        type: "list"
+        description: "Fields to check for missing data"
+        default: ["volume"]
+      action: 
+        type: "enum"
+        options: ["rolling_average", "previous", "zero", "flag"]
+        description: "Action to take when missing data is found"
+        default: "rolling_average"
+      window_size: 
+        type: "int"
+        description: "Window size for rolling average"
+        default: 5
+    implementation: "src.processors.cleaners.rules.missing_data.MissingVolumeRule"
+    
+  minimum_value:
+    description: "Enforces a minimum value for specified fields"
+    parameters:
+      fields: 
+        type: "list"
+        description: "Fields to enforce minimum value"
+        default: ["open", "high", "low", "close"]
+      min_value: 
+        type: "float"
+        description: "Minimum allowed value"
+        default: 0.0
+      action: 
+        type: "enum"
+        options: ["replace_with_min", "flag"]
+        description: "Action to take when values below minimum are found"
+        default: "replace_with_min"
+    implementation: "src.processors.cleaners.rules.constraints.MinimumValueRule"
+    
+  price_gap:
+    description: "Detects and handles large price gaps between periods"
+    parameters:
+      fields: 
+        type: "list"
+        description: "Fields to check for price gaps"
+        default: ["close"]
+      max_gap_percent: 
+        type: "float"
+        description: "Maximum allowed gap in percent"
+        default: 5.0
+      action: 
+        type: "enum"
+        options: ["interpolate", "flag"]
+        description: "Action to take when gap is found"
+        default: "flag"
+      flag_only:
+        type: "bool"
+        description: "Whether to only flag without fixing"
+        default: false
+    implementation: "src.processors.cleaners.rules.price_gap.PriceGapRule"
