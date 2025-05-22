@@ -11,15 +11,13 @@ from dotenv import load_dotenv
 import pandas_market_calendars as mcal
 from src.scripts.market_data.fetch_market_data import MarketDataFetcher, get_trading_calendar
 import re
-from typing import Optional
+from typing import Optional, List
 
 # Load environment variables
 load_dotenv(os.path.join(os.path.dirname(__file__), 'config', '.env'))
 
 # Add the project root directory to the Python path
 project_root = str(Path(__file__).resolve().parent.parent.parent.parent)
-if project_root not in sys.path:
-    sys.path.insert(0, project_root)
 
 # Configure logging
 logging.basicConfig(
@@ -564,7 +562,7 @@ def load_continuous_data(fetcher: MarketDataFetcher, symbol_root: str, config: d
         logger.error(f"Error processing {specific_symbol}: {str(e)}", exc_info=True)
         return
 
-def main():
+def main(args_list: Optional[List[str]] = None):
     DEFAULT_DB_PATH = os.path.join(project_root, "data", "financial_data.duckdb")
     DEFAULT_CONFIG_PATH = os.path.join(project_root, "config", "market_symbols.yaml")
 
@@ -613,7 +611,10 @@ def main():
         help="Days before expiry to trigger full series rebuild for adjusted contracts in 'auto' mode (default: 7)"
     )
 
-    args = parser.parse_args()
+    if args_list is not None:
+        args = parser.parse_args(args_list)
+    else:
+        args = parser.parse_args()
 
     logger.info(f"Continuous Contract Loader started for: {args.symbol}")
     logger.info(f"Using DB Path: {args.db_path}, Config Path: {args.config_path}") # DEBUG DB PATH
@@ -669,46 +670,79 @@ def main():
 
     logger.info(f"Processing continuous contract: {actual_symbol_to_process} (config root: {root_symbol_for_config})")
 
-    # Metadata Check (using actual_symbol_to_process for query)
+    # Metadata Check to confirm data_source is 'tradestation'
     metadata_source = ''
     metadata_found = False
+    is_parameterized_symbol = '=' in actual_symbol_to_process # e.g., @ES=101XN
+
     try:
-        logger.info(f"Querying metadata for continuous contract group based on: '{actual_symbol_to_process}' (derived root: '{root_symbol_for_config}') using existing fetcher connection.")
-        
-        # Attempt to find a specific entry first (e.g. for @VX=101XN where base_symbol IS @VX=101XN)
-        query_specific = """ 
-            SELECT data_source, base_symbol, data_table, asset_type
-            FROM symbol_metadata 
-            WHERE base_symbol = ? AND asset_type = 'continuous_future' AND data_table = ?
-            LIMIT 1
-        """
-        params_specific = [actual_symbol_to_process, actual_symbol_to_process]
-        logger.info(f"DEBUG_LOADER: specific_symbol_arg for metadata query_specific: '{actual_symbol_to_process}'") # DEBUG LINE 1
-        metadata_rows = fetcher.conn.execute(query_specific, params_specific).fetchall()
-        logger.info(f"DEBUG_LOADER: query_specific returned {len(metadata_rows)} rows.") # DEBUG LINE 2
-        if metadata_rows:
-            logger.info(f"DEBUG_LOADER: metadata_rows[0] from query_specific: {metadata_rows[0]}") # DEBUG LINE 3
+        logger.info(f"Verifying data source for: '{actual_symbol_to_process}' (config root: '{root_symbol_for_config}', parameterized: {is_parameterized_symbol})")
 
-        if metadata_rows:
-            # We expect one row per interval. For now, just take the first to get common properties.
-            metadata_record = metadata_rows[0]
-            metadata_found = True # Set flag to True
-            metadata_source = metadata_record['data_source'] # Set variable
-            logger.info(f"Found base metadata for {actual_symbol_to_process} (Source: {metadata_source}): {metadata_record}")
-            logger.info(f"Will attempt to process for requested interval: {args.interval_unit}/{args.interval_value}.")
+        if is_parameterized_symbol:
+            # Specific parameterized symbol like @ES=101XN
+            # These MUST have a direct entry in symbol_metadata with asset_type 'continuous_future'
+            # and data_source 'tradestation' if this script is to handle them.
+            query_for_specific = '''
+                SELECT data_source FROM symbol_metadata
+                WHERE base_symbol = ? AND asset_type = 'continuous_future'
+                LIMIT 1
+            '''
+            params = [actual_symbol_to_process]
+            logger.debug(f"Querying specific metadata with params {params}")
+            result = fetcher.conn.execute(query_for_specific, params).fetchone()
+            if result:
+                metadata_source = result[0]
+                metadata_found = True
+                logger.info(f"Found direct metadata for specific symbol {actual_symbol_to_process}. Source: {metadata_source}")
+            else:
+                # For parameterized symbols, missing metadata is a critical issue for this loader's logic.
+                logger.error(f"No 'continuous_future' metadata entry found for specific parameterized symbol: {actual_symbol_to_process}. This symbol should be defined in symbol_metadata if it's to be loaded as a continuous contract by this script.")
+                # sys.exit(1) # Decided to let the final check handle exit
 
-            if metadata_source.lower() != 'tradestation':
-                logger.error(f"Symbol {actual_symbol_to_process} (or its group {metadata_record['base_symbol']}) is configured with data_source='{metadata_source}' in symbol_metadata, not 'tradestation'. Cannot proceed with this loader.")
-                sys.exit(1)
-            # No need to check base_symbol_from_meta vs root_symbol_for_config here as the query logic handles it.
         else:
-            # This 'else' means neither the specific nor the generic query yielded results
-            logger.error(f"No 'continuous_future' metadata record found for symbol '{actual_symbol_to_process}' or its generic group ('{f'@{root_symbol_for_config}'}') in symbol_metadata. Cannot determine data_source.")
-            sys.exit(1) 
-            
+            # Generic symbol like @ES or @NQ (default TradeStation continuous contract)
+            # We don't expect a direct 'continuous_future' metadata entry for '@ES' itself.
+            # We verify based on the root symbol's configuration in the YAML file.
+            logger.info(f"Generic symbol '{actual_symbol_to_process}'. Verifying via root symbol '{root_symbol_for_config}' YAML configuration.")
+            root_cfg = fetcher._get_symbol_config(root_symbol_for_config) # e.g., 'ES' or 'NQ'
+            if root_cfg:
+                configured_source = root_cfg.get('data_source', 'NOT_FOUND_IN_YAML').lower()
+                configured_asset_type = root_cfg.get('asset_type', 'NOT_FOUND_IN_YAML').lower()
+                # Check for explicit continuous settings or if it's a future_group meant for continuous
+                is_configurable_for_continuous = (
+                    'continuous_contracts' in root_cfg or
+                    'panama_settings' in root_cfg or # Panama implies custom continuous
+                    configured_asset_type == 'future_group' # Future groups often have continuous versions
+                )
+
+                logger.debug(f"Root YAML config for '{root_symbol_for_config}': source='{configured_source}', asset_type='{configured_asset_type}', is_configurable_for_continuous={is_configurable_for_continuous}")
+
+                if configured_source == 'tradestation' and (configured_asset_type in ['future', 'future_group'] or is_configurable_for_continuous) :
+                    metadata_source = 'tradestation' # Inferred from root config
+                    metadata_found = True # Considered "found" for logic flow
+                    logger.info(f"Root symbol '{root_symbol_for_config}' YAML config indicates TradeStation source for continuous futures for generic symbol '{actual_symbol_to_process}'.")
+                else:
+                    logger.warning(f"Root symbol '{root_symbol_for_config}' YAML configuration (found source: '{configured_source}', found asset_type: '{configured_asset_type}') does not definitively indicate it's a TradeStation-sourced future suitable for generic continuous contract generation by this loader.")
+            else:
+                 logger.warning(f"No YAML configuration found for root symbol '{root_symbol_for_config}'. Cannot verify source for generic symbol '{actual_symbol_to_process}'.")
+
+        # Final Decision Point
+        if metadata_found and metadata_source.lower() == 'tradestation':
+            logger.info(f"Data source for '{actual_symbol_to_process}' confirmed as 'tradestation'. Proceeding.")
+        else:
+            if not metadata_found and is_parameterized_symbol:
+                 # This case was logged as an error above, reinforcing exit.
+                 logger.error(f"Final check: Parameterized symbol '{actual_symbol_to_process}' must have a 'continuous_future' metadata entry with 'tradestation' source. Not found or not tradestation.")
+            elif not metadata_found and not is_parameterized_symbol:
+                 logger.error(f"Final check: Could not confirm generic symbol '{actual_symbol_to_process}' (root: '{root_symbol_for_config}') is TradeStation-sourced via YAML config.")
+            elif metadata_found and metadata_source.lower() != 'tradestation':
+                 logger.error(f"Final check: Source for '{actual_symbol_to_process}' found as '{metadata_source}', but this loader only handles 'tradestation'.")
+            else: # Catch-all for unhandled logic paths, though should be covered
+                 logger.error(f"Final check: Unable to confirm '{actual_symbol_to_process}' as a valid TradeStation continuous contract for this loader.")
+            sys.exit(1)
+
     except Exception as e:
-        logger.error(f"CRITICAL ERROR querying metadata for {actual_symbol_to_process}: {e}", exc_info=True)
-        sys.exit(1) # Exit if metadata query fails critically
+        logger.error(f"CRITICAL ERROR during metadata source verification for {actual_symbol_to_process}: {e}", exc_info=True)
 
     logger.info(f"Metadata source verified. Proceeding to load data for {actual_symbol_to_process}...")
 

@@ -18,7 +18,8 @@ from typing import Dict, List, Optional, Tuple, Union, Any, Type
 import time
 from datetime import datetime
 
-from .base import DataCleanerBase
+from ...core.database import Database
+from .base import DataCleaner
 
 # Logger for this module
 logger = logging.getLogger(__name__)
@@ -39,7 +40,7 @@ class DataCleaningPipeline:
         self,
         name: str,
         db_connector = None,
-        cleaners: List[DataCleanerBase] = None,
+        cleaners: List[DataCleaner] = None,
         config: Dict[str, Any] = None
     ):
         """
@@ -71,15 +72,16 @@ class DataCleaningPipeline:
         self._performance_history = []
         self._recent_run_summary = None
     
-    def add_cleaner(self, cleaner: DataCleanerBase) -> None:
+    def add_cleaner(self, cleaner: DataCleaner, config: Optional[Dict[str, Any]] = None) -> None:
         """
-        Add a cleaner to the pipeline.
+        Add a cleaner instance to the pipeline.
         
         Args:
             cleaner: Data cleaner instance to add
+            config: Configuration options for the cleaner
         """
-        if not isinstance(cleaner, DataCleanerBase):
-            logger.error(f"Cannot add cleaner: {cleaner} is not an instance of DataCleanerBase")
+        if not isinstance(cleaner, DataCleaner):
+            logger.error(f"Cannot add cleaner: {cleaner} is not an instance of DataCleaner")
             return
         
         self.cleaners.append(cleaner)
@@ -145,7 +147,8 @@ class DataCleaningPipeline:
             'total_modifications': 0,
             'elapsed_time': 0,
             'fields_modified': set(),
-            'status': 'success'
+            'status': 'success',
+            'error_message': None
         }
         
         try:
@@ -222,7 +225,7 @@ class DataCleaningPipeline:
             logger.error(f"Error in cleaning pipeline '{self.name}': {e}", exc_info=True)
             
             run_summary['status'] = 'error'
-            run_summary['error'] = str(e)
+            run_summary['error_message'] = str(e)
             run_summary['elapsed_time'] = time.time() - start_time
             run_summary['end_time'] = datetime.now()
             
@@ -260,10 +263,39 @@ class DataCleaningPipeline:
         
         try:
             # Determine raw and clean table names based on symbol
-            table_prefix = self._get_table_prefix_for_symbol(symbol)
-            raw_table = f"{table_prefix}_raw"
-            clean_table = table_prefix
-            
+            table_category = self._get_table_prefix_for_symbol(symbol) # E.g. 'continuous_contracts', 'cboe_data', 'market_data'
+
+            # Define source and target tables
+            source_table = f"{table_category}_raw" # Default assumption
+            target_table = table_category       # Default assumption
+
+            # Override for specific categories where data isn't in a separate '_raw' table,
+            # or where cleaning is effectively in-place.
+            if table_category == 'continuous_contracts':
+                # For continuous contracts (@ES, @NQ, @VX), data is processed and stored in 'continuous_contracts'.
+                # Cleaning is performed in-place on this table.
+                source_table = 'continuous_contracts'
+                target_table = 'continuous_contracts'
+                logger.debug(f"Adjusted for '{table_category}': source='{source_table}', target='{target_table}' for symbol '{symbol}'")
+            elif table_category == 'cboe_data':
+                # For $VIX.X (and potentially other direct CBOE symbols if rule expanded).
+                # Data is in 'market_data_cboe'. Cleaning is in-place.
+                source_table = 'market_data_cboe'
+                target_table = 'market_data_cboe'
+                logger.debug(f"Adjusted for '{table_category}': source='{source_table}', target='{target_table}' for symbol '{symbol}'")
+            elif table_category == 'market_data':
+                # For individual futures like VXK25, data is in 'market_data_cboe'.
+                if 'VX' in symbol and not symbol.startswith('@'): # Heuristic for individual VX contracts
+                    source_table = 'market_data_cboe'
+                    target_table = 'market_data_cboe'
+                    logger.debug(f"Adjusted for VX in '{table_category}': source='{source_table}', target='{target_table}' for symbol '{symbol}'")
+                else:
+                    # For other 'market_data' categories, retain default _raw behavior.
+                    # This path might need specific handling if other data types are cleaned here.
+                    logger.debug(f"Using default for '{table_category}': source='{source_table}', target='{target_table}' for symbol '{symbol}'")
+            else:
+                logger.debug(f"Using default for '{table_category}': source='{source_table}', target='{target_table}' for symbol '{symbol}'")
+
             # Build query parameters
             params = [symbol, interval_unit, interval_value]
             date_conditions = []
@@ -290,7 +322,7 @@ class DataCleaningPipeline:
             # Query to get raw data
             query = f"""
                 SELECT *
-                FROM {raw_table}
+                FROM {source_table}
                 WHERE symbol = ?
                   AND interval_unit = ?
                   AND interval_value = ?
@@ -299,10 +331,10 @@ class DataCleaningPipeline:
             """
             
             # Load raw data
-            raw_df = self.db_connector.query(query, params)
+            raw_df = self.db_connector.query_to_df(query, params)
             
             if raw_df.empty:
-                logger.warning(f"No data found for {symbol} in {raw_table}")
+                logger.warning(f"No data found for {symbol} in {source_table}")
                 return False, {'status': 'skipped', 'reason': 'no_data'}
             
             # Process the data through the pipeline
@@ -319,21 +351,20 @@ class DataCleaningPipeline:
             try:
                 # Delete existing clean data for this range
                 delete_query = f"""
-                    DELETE FROM {clean_table}
+                    DELETE FROM {target_table}
                     WHERE symbol = ?
                       AND interval_unit = ?
                       AND interval_value = ?
-                      {date_condition}
                 """
                 self.db_connector.execute(delete_query, params)
                 
                 # Insert cleaned data
-                self.db_connector.insert_dataframe(clean_table, cleaned_df)
+                self.db_connector.insert_dataframe(target_table, cleaned_df)
                 
                 # Commit the transaction
                 self.db_connector.commit_transaction()
                 
-                logger.info(f"Successfully saved cleaned data for {symbol} to {clean_table}")
+                logger.info(f"Successfully saved cleaned data for {symbol} to {target_table}")
                 return True, summary
                 
             except Exception as e:
@@ -342,7 +373,7 @@ class DataCleaningPipeline:
                 logger.error(f"Error saving cleaned data for {symbol}: {e}")
                 
                 summary['status'] = 'error'
-                summary['error'] = str(e)
+                summary['error_message'] = str(e)
                 
                 return False, summary
                 
@@ -445,7 +476,7 @@ class DataCleaningPipeline:
                         'status': summary.get('status', 'unknown'),
                         'modifications': summary.get('total_modifications', 0),
                         'elapsed_time': summary.get('elapsed_time', 0),
-                        'error': summary.get('error', None)
+                        'error': summary.get('error_message', None)
                     }
             
             # Finalize overall summary
@@ -528,10 +559,10 @@ class DataCleaningPipeline:
                 'modifications_count': summary['total_modifications'],
                 'elapsed_time': summary['elapsed_time'],
                 'status': summary['status'],
-                'error': summary.get('error', None),
+                'error_message': summary.get('error_message', None),
                 'cleaners_applied': ','.join([c['name'] for c in summary['cleaners_applied']]),
                 'fields_modified': ','.join(summary['fields_modified']),
-                'timestamp': datetime.now()
+                'log_timestamp': datetime.now()
             }
             
             # Insert into log table

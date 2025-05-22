@@ -69,7 +69,7 @@ class ContinuousContractBuilder(ABC):
         self.config = config
         
         # Default settings
-        self.roll_calendar_table = config.get('roll_calendar_table', 'futures_roll_calendar')
+        self.roll_calendar_table = config.get('roll_calendar_table', 'futures_roll_dates')
         self.market_data_table = config.get('market_data_table', 'market_data')
         self.continuous_data_table = config.get('continuous_data_table', 'continuous_contracts')
         
@@ -123,37 +123,46 @@ class ContinuousContractBuilder(ABC):
                 start_clause = ""
                 start_params = []
             else:
-                start_clause = "AND r.roll_date >= ?"
+                start_clause = "AND r.RollDate >= ?"
                 start_params = [start_date]
                 
             if end_date is None:
                 end_clause = ""
                 end_params = []
             else:
-                end_clause = "AND r.roll_date <= ?"
+                end_clause = "AND r.RollDate <= ?"
                 end_params = [end_date]
                 
             # Query roll dates from the database
             query = f"""
-            SELECT 
-                r.roll_date,
-                r.from_contract,
-                r.to_contract,
+            WITH OrderedRolls AS (
+                SELECT
+                    r.RollDate AS roll_date,
+                    r.Contract AS from_contract_symbol,
+                    LEAD(r.Contract, 1) OVER (PARTITION BY r.SymbolRoot ORDER BY r.RollDate) AS to_contract_symbol,
+                    r.SymbolRoot
+                FROM {self.roll_calendar_table} r
+                WHERE r.SymbolRoot = ?
+                  {start_clause}
+                  {end_clause}
+            )
+            SELECT
+                o.roll_date,
+                o.from_contract_symbol AS from_contract,
+                o.to_contract_symbol AS to_contract,
                 f_close.close AS from_price,
                 t_close.close AS to_price
-            FROM {self.roll_calendar_table} r
+            FROM OrderedRolls o
             LEFT JOIN {self.market_data_table} f_close
-                ON r.from_contract = f_close.symbol
-                AND r.roll_date = f_close.timestamp::DATE
+                ON o.from_contract_symbol = f_close.symbol
+                AND o.roll_date = f_close.timestamp::DATE
                 AND f_close.interval_unit = 'daily'
             LEFT JOIN {self.market_data_table} t_close
-                ON r.to_contract = t_close.symbol
-                AND r.roll_date = t_close.timestamp::DATE
+                ON o.to_contract_symbol = t_close.symbol
+                AND o.roll_date = t_close.timestamp::DATE 
                 AND t_close.interval_unit = 'daily'
-            WHERE r.root_symbol = ?
-            {start_clause}
-            {end_clause}
-            ORDER BY r.roll_date
+            WHERE o.to_contract_symbol IS NOT NULL -- Only include rolls where there is a next contract
+            ORDER BY o.roll_date
             """
             
             params = [root_symbol] + start_params + end_params

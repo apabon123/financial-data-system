@@ -10,8 +10,8 @@ import logging
 import importlib
 from typing import Dict, List, Optional, Type, Any, Set
 
-from .base import ContinuousContractBase
-from .panama import PanamaContractGenerator
+from .base import ContinuousContractBuilder
+from .panama import PanamaContractBuilder
 
 # Logger for this module
 logger = logging.getLogger(__name__)
@@ -21,14 +21,14 @@ class ContinuousContractRegistry:
     
     def __init__(self):
         """Initialize the registry."""
-        self._generators: Dict[str, Type[ContinuousContractBase]] = {}
+        self._generators: Dict[str, Type[ContinuousContractBuilder]] = {}
         self._register_defaults()
     
     def _register_defaults(self):
         """Register the default generators."""
         try:
             # Register the Panama method
-            self.register('panama', PanamaContractGenerator)
+            self.register('panama', PanamaContractBuilder)
             
             # Add more default generators here
             
@@ -36,7 +36,7 @@ class ContinuousContractRegistry:
         except Exception as e:
             logger.error(f"Error registering default generators: {e}")
     
-    def register(self, name: str, generator_class: Type[ContinuousContractBase]) -> bool:
+    def register(self, name: str, generator_class: Type[ContinuousContractBuilder]) -> bool:
         """
         Register a new generator.
         
@@ -49,9 +49,9 @@ class ContinuousContractRegistry:
         """
         try:
             # Validate the generator class
-            if not issubclass(generator_class, ContinuousContractBase):
+            if not issubclass(generator_class, ContinuousContractBuilder):
                 logger.error(f"Cannot register {name}: {generator_class.__name__} "
-                           f"is not a subclass of ContinuousContractBase")
+                           f"is not a subclass of ContinuousContractBuilder")
                 return False
             
             # Register the generator
@@ -85,7 +85,7 @@ class ContinuousContractRegistry:
             logger.error(f"Error unregistering generator {name}: {e}")
             return False
     
-    def get(self, name: str) -> Optional[Type[ContinuousContractBase]]:
+    def get(self, name: str) -> Optional[Type[ContinuousContractBuilder]]:
         """
         Get a generator by name.
         
@@ -97,7 +97,7 @@ class ContinuousContractRegistry:
         """
         return self._generators.get(name.lower())
     
-    def create(self, name: str, **kwargs) -> Optional[ContinuousContractBase]:
+    def create(self, name: str, **kwargs) -> Optional[ContinuousContractBuilder]:
         """
         Create a new instance of a generator.
         
@@ -145,14 +145,14 @@ class ContinuousContractRegistry:
             # Import the module
             module = importlib.import_module(module_path)
             
-            # Find all classes that inherit from ContinuousContractBase
+            # Find all classes that inherit from ContinuousContractBuilder
             for name in dir(module):
                 try:
                     obj = getattr(module, name)
                     
                     if (isinstance(obj, type) and 
-                        issubclass(obj, ContinuousContractBase) and 
-                        obj is not ContinuousContractBase):
+                        issubclass(obj, ContinuousContractBuilder) and 
+                        obj is not ContinuousContractBuilder):
                         
                         # Register the generator
                         # Use the snake_case version of the class name as the key
@@ -179,7 +179,7 @@ class ContinuousContractRegistry:
             logger.error(f"Error loading generators from {module_path}: {e}")
             return set()
     
-    def create_from_config(self, config: Dict[str, Any]) -> Optional[ContinuousContractBase]:
+    def create_from_config(self, config: Dict[str, Any]) -> Optional[ContinuousContractBuilder]:
         """
         Create a generator instance from a configuration dictionary.
         

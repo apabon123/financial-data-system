@@ -17,12 +17,14 @@ indices:
 
 futures:
   - base_symbol: ES
+    data_source: tradestation
+    asset_type: future_group
     default_source: tradestation
     default_raw_table: market_data
     calendar: CME_Equity
     description: E-mini S&P 500 Futures
     exchange: CME
-    frequencies: [1min, 15min, daily] # Reverted to simple list
+    frequencies: [1min, 15min, daily]
     historical_contracts:
       patterns: [H, M, U, Z]
       start_year: 2003
@@ -32,8 +34,16 @@ futures:
       day_number: 3
       adjust_for_holiday: true
     start_date: '2003-01-01'
+    contract_specs:
+      multiplier: 50
+      point_value: 50.00
+      tick_size: 0.25
+      tick_value: 12.50
+      settlement_type: cash
 
   - base_symbol: NQ
+    data_source: tradestation
+    asset_type: future_group
     default_source: tradestation
     default_raw_table: market_data
     calendar: CME_Equity
@@ -88,25 +98,24 @@ futures:
     start_date: '2004-01-01'
 
   - base_symbol: VX
+    data_source: tradestation
+    asset_type: future_group
     default_source: tradestation
     default_raw_table: market_data
     calendar: CFE
     description: CBOE Volatility Index Futures
     exchange: CBOE
-    frequencies: # MODIFIED - removed CBOE override for daily
+    frequencies:
       - name: daily
-        interval: 1 # Now uses default_source (tradestation) and default_raw_table (market_data)
-        unit: daily
-      - name: 1min               # Uses defaults
         interval: 1
-        unit: minute
-      - name: 15min              # Uses defaults
+        unit: daily
+      - name: 15min
         interval: 15
         unit: minute
     historical_contracts:
       patterns: [F, G, H, J, K, M, N, Q, U, V, X, Z]
-      start_year: 2004 # This will be overridden by the symbol-level start_date for fetching, but retain for reference
-      exclude_contracts: # Added list of known non-trading contracts
+      start_year: 2004
+      exclude_contracts:
         - VXF04
         - VXG04
         - VXH04
@@ -119,7 +128,16 @@ futures:
     expiry_rule:
       day_type: wednesday
       special_rule: VX_expiry
-    start_date: '2005-01-01' # MODIFIED
+    start_date: '2005-01-01'
+
+  - symbol: "@VX=101XN"
+    type: continuous_future
+    description: "VX Continuous Contract (Unadjusted, TradeStation)"
+    default_source: tradestation
+    exchange: CFE
+    calendar: CFE
+    frequencies: [daily, 15min]
+    start_date: '2005-01-01'
 
   # REPLACED: 9 individual @VX=...XN entries with a continuous_group
   - continuous_group:
@@ -220,5 +238,8 @@ settings:
       unit: minute
     - interval: 1
       name: daily
-      unit: day
+      unit: daily
+    - interval: 1
+      name: 1min
+      unit: minute
   default_start_date: '2004-03-26'

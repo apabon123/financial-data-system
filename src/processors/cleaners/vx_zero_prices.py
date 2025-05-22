@@ -12,12 +12,13 @@ import numpy as np
 from typing import Dict, List, Optional, Tuple, Union, Any
 from datetime import datetime, timedelta
 
-from .base import DataCleanerBase
+from .base import DataCleaner
+from ...core.database import Database
 
 # Logger for this module
 logger = logging.getLogger(__name__)
 
-class VXZeroPricesCleaner(DataCleanerBase):
+class VXZeroPricesCleaner(DataCleaner):
     """
     Cleaner for fixing zero prices in VX futures contracts.
     
@@ -54,17 +55,58 @@ class VXZeroPricesCleaner(DataCleanerBase):
         merged_config = default_config.copy()
         if config:
             merged_config.update(config)
+
+        # Ensure essential parameters for the base class and this class are in merged_config
+        merged_config.setdefault('name', "vx_zero_prices")
+        merged_config.setdefault('description', "Fixes zero or missing prices in VX futures contracts")
+        merged_config.setdefault('fields_to_clean', default_config['price_fields'] + default_config['volume_fields'])
+        merged_config.setdefault('enabled', enabled) # Pass through enabled state
+        merged_config.setdefault('priority', 50) # Default priority
         
-        # Initialize base class
+        # Initialize base class with db_connector as db and the comprehensive merged_config
         super().__init__(
-            name="vx_zero_prices",
-            description="Fixes zero or missing prices in VX futures contracts",
-            db_connector=db_connector,
-            fields_to_clean=merged_config['price_fields'] + merged_config['volume_fields'],
-            enabled=enabled,
-            priority=50,  # High priority - should run early in the pipeline
+            db=db_connector, # Pass db_connector as 'db' to the base class
             config=merged_config
         )
+        
+        # Set attributes specific to this cleaner or not handled by base, if necessary
+        # self.name, self.config are set by base class
+        # self.description = merged_config['description'] # If needed explicitly on self
+        self.fields_to_clean = merged_config['fields_to_clean']
+        self.enabled = merged_config['enabled']
+        self.priority = merged_config['priority']
+    
+    def can_clean(self, symbol: str, df_columns: List[str] = None) -> bool:
+        """
+        Check if this cleaner is applicable to the given symbol and data.
+        This cleaner specifically targets VX futures and related symbols
+        and requires price/volume fields to be present.
+        Args:
+            symbol: The symbol to check (e.g., 'VXN24', '@VX=101XN', '$VIX.X')
+            df_columns: Optional list of column names in the DataFrame to be cleaned.
+                        Used to ensure necessary fields are present.
+
+        Returns:
+            True if the cleaner can process this symbol, False otherwise.
+        """
+        if not symbol:
+            return False
+
+        # Check if the symbol is a VIX-related symbol
+        is_vx_symbol = symbol.startswith('VX') or symbol.startswith('@VX') or symbol == '$VIX.X'
+        if not is_vx_symbol:
+            logger.debug(f"VXZeroPricesCleaner cannot clean non-VX symbol: {symbol}")
+            return False
+
+        # Check if necessary fields are present if df_columns is provided
+        if df_columns:
+            required_fields = set(self.config.get('price_fields', [])) | set(self.config.get('volume_fields', []))
+            if not required_fields.intersection(set(df_columns)):
+                logger.debug(f"VXZeroPricesCleaner: Symbol {symbol} does not have required fields for cleaning.")
+                return False
+        
+        logger.debug(f"VXZeroPricesCleaner can clean symbol: {symbol}")
+        return True
     
     def clean(self, df: pd.DataFrame) -> pd.DataFrame:
         """

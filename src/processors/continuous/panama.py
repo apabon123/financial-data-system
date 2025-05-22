@@ -190,7 +190,9 @@ class PanamaContractBuilder(ContinuousContractBuilder):
                         )
                     else:
                         logger.warning(f"No contracts found for {root_symbol} in date range")
-                        return pd.DataFrame()
+                        # If no contracts found, _build_continuous_from_contracts will likely receive empty list
+                        # and continuous_data will be empty.
+                        continuous_data = pd.DataFrame() # Ensure continuous_data is defined
             else:
                 # Process each contract segment defined by the roll dates
                 contract_segments = []
@@ -250,32 +252,67 @@ class PanamaContractBuilder(ContinuousContractBuilder):
                                 logger.info(f"Loaded {len(final_data)} rows for final segment {final_contract}")
                 
                 # Generate the continuous series
-                continuous_data = self._build_continuous_from_contracts(
-                    contract_segments, rollovers, continuous_symbol, interval_unit, interval_value
-                )
-            
-            # If we have existing data, append the new data
-            if not existing_data.empty and not force:
-                # Filter out any overlap with existing data
-                new_data = continuous_data[
-                    continuous_data['timestamp'] > existing_data['timestamp'].max()
-                ]
-                
-                if not new_data.empty:
-                    logger.info(f"Appending {len(new_data)} new rows to existing {len(existing_data)} rows")
-                    continuous_data = pd.concat([existing_data, new_data], ignore_index=True)
+                if not contract_segments:
+                    logger.warning(f"No contract segments found for {root_symbol} after processing rollovers.")
+                    continuous_data = pd.DataFrame()
                 else:
-                    logger.info(f"No new data to append")
-                    continuous_data = existing_data
+                    continuous_data = self._build_continuous_from_contracts(
+                        contract_segments, rollovers, continuous_symbol, interval_unit, interval_value
+                    )
             
-            # Store the continuous data
-            if not continuous_data.empty:
-                self.store_continuous_data(continuous_symbol, continuous_data)
+            # At this point, continuous_data contains the newly built series (potentially empty)
+
+            final_data_to_store = pd.DataFrame()
+
+            if force:
+                logger.info(f"Force rebuild: using newly generated data for {continuous_symbol}")
+                final_data_to_store = continuous_data
+            else: # Not forcing, so consider existing_data
+                if existing_data.empty:
+                    logger.info(f"No existing data found for {continuous_symbol}. Using newly generated data.")
+                    final_data_to_store = continuous_data
+                else:
+                    # We have existing_data, try to append new portions of continuous_data
+                    new_data_to_append = pd.DataFrame()
+                    if not continuous_data.empty and 'timestamp' in continuous_data.columns and not continuous_data['timestamp'].empty:
+                        if not existing_data['timestamp'].empty:
+                            try:
+                                # Filter continuous_data for timestamps strictly greater than the max in existing_data
+                                new_data_to_append = continuous_data[continuous_data['timestamp'] > existing_data['timestamp'].max()].copy()
+                            except Exception as e: # Catch any error during filtering, though primarily expecting type issues if any
+                                logger.error(f"Error filtering new data against existing for {continuous_symbol}: {e}")
+                                new_data_to_append = pd.DataFrame() # Default to no new data on error
+                        else:
+                            # existing_data has no timestamps, so all of continuous_data is "new"
+                            new_data_to_append = continuous_data.copy()
+                    else:
+                        logger.info(f"Newly generated continuous_data is empty or lacks 'timestamp' column for {continuous_symbol}. No new data to filter.")
+                    
+                    if not new_data_to_append.empty:
+                        logger.info(f"Appending {len(new_data_to_append)} new rows to {len(existing_data)} existing rows for {continuous_symbol}.")
+                        final_data_to_store = pd.concat([existing_data, new_data_to_append], ignore_index=True)
+                        # Ensure unique timestamps, keeping the latest if any duplicates arose (should not happen with > filter)
+                        final_data_to_store = final_data_to_store.sort_values(by='timestamp').drop_duplicates(subset=['timestamp'], keep='last').reset_index(drop=True)
+                    else:
+                        logger.info(f"No new data to append to existing data for {continuous_symbol}.")
+                        final_data_to_store = existing_data
+            
+            # Store the final data
+            if not final_data_to_store.empty:
+                # Sort before storing, especially if concatenated
+                final_data_to_store = final_data_to_store.sort_values(by='timestamp').reset_index(drop=True)
                 
-            return continuous_data
-            
+                rows_stored = self.store_continuous_data(continuous_symbol, final_data_to_store)
+                logger.info(f"Successfully stored {rows_stored} rows for {continuous_symbol}.")
+                return final_data_to_store
+            else:
+                logger.warning(f"No data to store for {continuous_symbol} after processing.")
+                return pd.DataFrame() # Return empty if nothing was stored
+
+        except ContinuousContractError: # Re-raise specific errors
+            raise
         except Exception as e:
-            logger.error(f"Error building continuous series for {continuous_symbol}: {e}")
+            logger.error(f"Error building continuous series for {continuous_symbol}: {e}", exc_info=True)
             raise ContinuousContractError(f"Failed to build continuous series: {e}")
     
     def _build_continuous_from_contracts(self, contract_segments: List[pd.DataFrame],

@@ -29,11 +29,11 @@ load_dotenv(os.path.join(os.path.dirname(os.path.dirname(__file__)), 'config', '
 
 # Add the project root directory to the Python path
 project_root = str(Path(__file__).resolve().parent.parent.parent.parent)
-if project_root not in sys.path:
-    sys.path.insert(0, project_root)
+# if project_root not in sys.path: # Removed this block
+#     sys.path.insert(0, project_root)
 
 # Import from our project
-from src.agents.tradestation_market_data_agent import TradeStationMarketDataAgent
+from src.agents.market import TradeStationMarketDataAgent
 
 # Configure logging
 logging.basicConfig(

@@ -18,6 +18,7 @@ import shutil
 from pathlib import Path
 from datetime import datetime
 from typing import Optional, Union, Dict, List, Any, Tuple
+import time
 
 import duckdb
 import pandas as pd
@@ -84,7 +85,7 @@ class Database:
         """Context manager exit with automatic connection closing."""
         self.close()
     
-    def execute(self, query: str, params: List = None) -> duckdb.DuckDBPyResult:
+    def execute(self, query: str, params: List = None) -> duckdb.DuckDBPyConnection:
         """
         Execute a SQL query with optional parameters.
         
@@ -164,6 +165,64 @@ class Database:
         query = f"PRAGMA table_info('{table_name}')"
         result = self.execute(query).fetchdf()
         return result['name'].tolist()
+    
+    def insert_record(self, table_name: str, record: Dict[str, Any]) -> bool:
+        """
+        Insert a single record (dictionary) into the specified table.
+
+        Args:
+            table_name: Name of the table to insert into.
+            record: Dictionary representing the record to insert.
+                    Keys should match column names.
+
+        Returns:
+            True if insertion was successful, False otherwise.
+        
+        Raises:
+            DatabaseError: If the insertion fails due to DB issues.
+        """
+        if not self.conn:
+            self._connect()
+        
+        if not record or not isinstance(record, dict):
+            logger.error(f"Invalid record provided for insertion into {table_name}. Must be a non-empty dictionary.")
+            return False
+
+        try:
+            # Using register and insert a DataFrame of one row is a robust way with DuckDB
+            # Create a DataFrame from the single record
+            df = pd.DataFrame([record])
+            
+            # Register the DataFrame as a temporary view
+            temp_view_name = f"temp_insert_{table_name}_{int(time.time())}" # Unique temp view name
+            self.conn.register(temp_view_name, df)
+            
+            # Construct the INSERT INTO ... SELECT FROM ... query
+            columns = ", ".join(record.keys())
+            placeholders = ", ".join(["?" for _ in record.keys()]) # Not used directly with SELECT from view
+            
+            # Insert from the temporary view
+            # This handles data type conversions and is generally safer
+            insert_query = f"INSERT INTO {table_name} ({columns}) SELECT * FROM {temp_view_name}"
+            self.conn.execute(insert_query)
+            
+            # Unregister the temporary view
+            self.conn.unregister(temp_view_name)
+            
+            logger.debug(f"Successfully inserted 1 record into {table_name}")
+            return True
+            
+        except duckdb.Error as e:
+            logger.error(f"Error inserting record into {table_name}: {e}\nRecord: {record}")
+            # Check for common errors like table not existing or schema mismatch
+            if "Table with name" in str(e) and "does not exist" in str(e):
+                 logger.error(f"Table '{table_name}' might not exist or is misspelled.")
+            elif "binder error" in str(e).lower() or "conversion error" in str(e).lower():
+                 logger.error(f"Schema mismatch or data type conversion issue for table '{table_name}'. Check record keys and types.")
+            raise DatabaseError(f"Failed to insert record into {table_name}: {e}")
+        except Exception as ex: # Catch other potential errors, e.g., with DataFrame creation
+            logger.error(f"Unexpected error during single record insertion into {table_name}: {ex}\nRecord: {record}")
+            raise DatabaseError(f"Unexpected error inserting record into {table_name}: {ex}")
     
     def initialize_schema(self) -> None:
         """
@@ -261,7 +320,6 @@ class Database:
             backup_dir: Directory containing backups
             days: Number of days to keep backups
         """
-        import time
         from datetime import datetime, timedelta
         
         cutoff_time = (datetime.now() - timedelta(days=days)).timestamp()

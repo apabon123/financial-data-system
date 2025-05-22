@@ -92,8 +92,6 @@ def parse_arguments():
     # New architecture options (will be ignored in legacy mode)
     parser.add_argument("--panama-ratio", type=float, default=0.75,
                        help="Panama method ratio (0-1, 0=forward adjustment, 1=back adjustment)")
-    parser.add_argument("--update-active-es-15min", action="store_true", help="Update active ES 15min data")
-    parser.add_argument("--update-active-es-1min", action="store_true", help="Update active ES 1min data")
     
     # Force specific architecture (mainly for testing)
     parser.add_argument("--force-legacy", action="store_true", help="Force use of legacy architecture")

@@ -45,6 +45,7 @@ try:
     from rich.box import SIMPLE
     from rich.panel import Panel
     from rich.progress import Progress
+    from rich.prompt import Prompt
 except ImportError:
     logging.error("Rich is not installed. CLI interface will be degraded.")
     # Define minimal fallbacks
@@ -89,7 +90,7 @@ class DataQualityAnalyzer:
         # Check if required dependencies are available
         self._check_dependencies()
 
-        self.app = get_app()
+        self.app = get_app(db_path="data/financial_data.duckdb")
         self.config = get_config()
         self.schema_manager = get_schema_manager()
         self.console = Console()
@@ -105,6 +106,48 @@ class DataQualityAnalyzer:
 
         # Current configuration (can be overridden)
         self.config_values = self.default_config.copy()
+
+    def _parse_interval_string(self, interval_str: Optional[str]) -> Optional[Tuple[int, str]]:
+        """
+        Parse an interval string (e.g., "1D", "30Min", "H") into value and unit.
+
+        Args:
+            interval_str: The interval string.
+
+        Returns:
+            A tuple (value, unit_name) or None if parsing fails.
+            Units: 'minute', 'hourly', 'daily', 'weekly', 'monthly'.
+        """
+        if not interval_str:
+            return None
+
+        interval_str = interval_str.strip().lower()
+        if not interval_str:
+            return None
+
+        import re
+        match = re.match(r"(\d*)?\s*([a-z]+)", interval_str)
+        if not match:
+            return None
+
+        value_str, unit_abbr = match.groups()
+        value = int(value_str) if value_str else 1
+
+        if unit_abbr in ("m", "min", "minute", "minutes"):
+            unit = "minute"
+        elif unit_abbr in ("h", "hr", "hour", "hours"):
+            unit = "hourly"
+        elif unit_abbr in ("d", "day", "days", "daily"):
+            unit = "daily"
+        elif unit_abbr in ("w", "wk", "week", "weeks", "weekly"):
+            unit = "weekly"
+        elif unit_abbr in ("mon", "month", "months", "monthly"):
+            unit = "monthly"
+        else:
+            logger.warning(f"Could not parse interval unit: {unit_abbr} from string {interval_str}")
+            return None
+        
+        return value, unit
 
     def _check_dependencies(self) -> None:
         """Check if required dependencies are available."""
@@ -158,7 +201,8 @@ class DataQualityAnalyzer:
     def analyze_market_data_table(self, symbol: Optional[str] = None,
                                start_date: Optional[str] = None,
                                end_date: Optional[str] = None,
-                               interval: Optional[str] = None) -> Dict[str, Any]:
+                               interval: Optional[str] = None, # User input string e.g. "1D", "30Min"
+                               is_continuous: bool = False) -> Dict[str, Any]:
         """
         Perform comprehensive data quality analysis on market data.
 
@@ -166,12 +210,12 @@ class DataQualityAnalyzer:
             symbol: Symbol to analyze (optional)
             start_date: Start date (YYYY-MM-DD)
             end_date: End date (YYYY-MM-DD)
-            interval: Data interval
+            interval: Data interval string (e.g., "1D", "30Min")
+            is_continuous: Whether the data is for a continuous contract
 
         Returns:
             Dictionary with analysis results
         """
-        # Check if analysis is possible
         if not getattr(self, 'can_analyze', False):
             return {
                 'success': False,
@@ -179,114 +223,231 @@ class DataQualityAnalyzer:
                 'error': 'Install required dependencies with: pip install pandas numpy'
             }
 
-        try:
-            # Build query based on filters
-            query = "SELECT * FROM market_data WHERE 1=1"
+        params: List[Any] = []
+        
+        # Parse the user-provided interval string
+        parsed_interval: Optional[Tuple[int, str]] = self._parse_interval_string(interval)
+        query_symbol = symbol # Symbol to be used in the SQL query
 
-            if symbol:
-                query += f" AND symbol = '{symbol}'"
+        if is_continuous:
+            target_table = "continuous_contracts"
+            date_column = "timestamp"
+            source_name = "Continuous Contracts Data"
+            order_by_columns = ["symbol", date_column, "interval_value", "interval_unit"]
 
-            if start_date:
-                query += f" AND date >= '{start_date}'"
+            # Determine actual interval to query for continuous contracts
+            if parsed_interval:
+                query_interval_value = parsed_interval[0]
+                query_interval_unit = parsed_interval[1]
+                logger.info(f"User specified interval for continuous contract: {query_interval_value} {query_interval_unit}")
 
-            if end_date:
-                query += f" AND date <= '{end_date}'"
-
-            if interval:
-                query += f" AND interval = '{interval}'"
-
-            query += " ORDER BY symbol, date, interval"
-
-            # Execute query
-            try:
-                result = self.app.db_manager.execute_query(query)
-            except Exception as e:
-                logger.error(f"Database query error: {e}")
-                return {
-                    'success': False,
-                    'message': 'Error executing database query',
-                    'error': str(e)
-                }
-
-            if not result.is_success or result.is_empty:
-                return {
-                    'success': False,
-                    'message': 'No data found matching criteria',
-                    'error': result.error if not result.is_success else None
-                }
-
-            # Get data as DataFrame
-            df = result.dataframe
-
-            # Begin analysis
-            try:
-                with Progress() as progress:
-                    analysis_task = progress.add_task("Analyzing data quality...", total=5)
-
-                    # 1. Basic statistics
-                    progress.update(analysis_task, advance=1, description="Calculating basic statistics...")
-                    stats = self._calculate_statistics(df)
-
-                    # 2. Missing data analysis
-                    progress.update(analysis_task, advance=1, description="Analyzing missing data...")
-                    missing_data = self._analyze_missing_data(df)
-
-                    # 3. Outlier detection
-                    progress.update(analysis_task, advance=1, description="Detecting outliers...")
-                    outliers = self._detect_outliers(df)
-
-                    # 4. Time series consistency
-                    progress.update(analysis_task, advance=1, description="Checking time series consistency...")
-                    consistency = self._check_time_series_consistency(df)
-
-                    # 5. Generate visualizations (if possible)
-                    progress.update(analysis_task, advance=1, description="Generating visualizations...")
-                    visualizations = {}
-                    if getattr(self, 'can_visualize', False):
-                        visualizations = self._generate_visualizations(df)
+                # If a specific continuous contract (e.g., @ES=102XC) is given 
+                # AND a sub-daily interval is requested, switch to the root symbol (e.g., @ES)
+                if symbol and "=" in symbol and query_interval_unit != "daily":
+                    root_symbol_candidate = symbol.split("=")[0]
+                    # Basic validation: check if it looks like a root (e.g., starts with @, doesn't have too many chars after @)
+                    if root_symbol_candidate.startswith("@") and len(root_symbol_candidate) < 6: # Heuristic
+                        logger.info(f"Sub-daily interval ('{query_interval_unit}') requested for specific continuous symbol '{symbol}'. Switching to root symbol '{root_symbol_candidate}' for analysis.")
+                        query_symbol = root_symbol_candidate
                     else:
-                        logger.warning("Visualizations skipped due to missing dependencies")
-            except Exception as e:
-                # If analysis fails, return error with partial results if available
-                logger.error(f"Analysis error: {e}")
-                return {
-                    'success': False,
-                    'message': f'Error during analysis: {str(e)}',
-                    'error': str(e),
-                    'partial_results': {
-                        'symbol': symbol,
-                        'date_range': [df['date'].min(), df['date'].max()] if 'date' in df.columns else None,
-                        'row_count': len(df),
-                        'statistics': stats if 'stats' in locals() else {},
-                    }
-                }
+                        logger.warning(f"Could not reliably determine root symbol from '{symbol}' for sub-daily analysis. Proceeding with original symbol.")
+            else:
+                # Default to daily if no interval is specified by the user for continuous contracts
+                query_interval_value = 1
+                query_interval_unit = "daily"
+                logger.info(f"No interval specified for continuous contract. Defaulting to {query_interval_value} {query_interval_unit}.")
+        else:
+            target_table = "market_data"
+            date_column = "timestamp"
+            order_by_columns = ["symbol", date_column, "interval_value", "interval_unit"]
 
-            # Return comprehensive results
-            return {
-                'success': True,
-                'symbol': symbol,
-                'date_range': [df['date'].min(), df['date'].max()] if 'date' in df.columns else None,
-                'row_count': len(df),
-                'statistics': stats,
-                'missing_data': missing_data,
-                'outliers': outliers,
-                'consistency': consistency,
-                'visualizations': visualizations
-            }
+            query_interval_value = parsed_interval[0] if parsed_interval else None
+            query_interval_unit = parsed_interval[1] if parsed_interval else None
+
+        query = f"SELECT * FROM {target_table} WHERE 1=1"
+
+        if query_symbol: # Use query_symbol here
+            query += f" AND symbol = ?"
+            params.append(query_symbol)
+        if start_date:
+            # Use CAST(date_column AS DATE) for DuckDB compatibility to compare dates
+            query += f" AND CAST({date_column} AS DATE) >= ?"
+            params.append(start_date)
+        if end_date:
+            query += f" AND CAST({date_column} AS DATE) <= ?"
+            params.append(end_date)
+        
+        if query_interval_value is not None and query_interval_unit is not None:
+            query += f" AND interval_value = ? AND interval_unit = ?"
+            params.append(query_interval_value)
+            params.append(query_interval_unit)
+        
+        query += f" ORDER BY {', '.join(order_by_columns)}"
+
+        df: Optional[pd.DataFrame] = None
+        error_message: Optional[str] = None
+        actual_source_table = target_table # Keep track of where data actually came from
+        
+        logger.info(f"Executing query for {source_name}: {query} with params: {params}")
+        try:
+            result = self.app.db_manager.execute_query(query, params=params)
+            logger.info(f"Query result for {source_name} - success: {result.is_success}, empty: {result.is_empty}")
+            if result.is_success and not result.is_empty:
+                df = result.dataframe
+                logger.info(f"Found {len(df)} rows in {source_name}")
+            elif result.is_success and result.is_empty:
+                error_message = f"No data found matching criteria in {source_name}."
+            else: # Query failed
+                error_message = f"Error executing database query for {source_name}: {result.error}"
+                
         except Exception as e:
-            logger.error(f"Unexpected error in data analysis: {e}")
+            logger.error(f"Database query error for {source_name}: {e}", exc_info=True)
             return {
                 'success': False,
-                'message': f'Unexpected error in data analysis: {str(e)}',
+                'message': f'Error executing database query for {source_name}',
                 'error': str(e)
             }
+
+        # Fallback to market_data_cboe ONLY if not continuous and primary query failed or yielded no data
+        if not is_continuous and df is None:
+            logger.info(f"No data from {target_table} or query failed, trying market_data_cboe.")
+            cboe_table = "market_data_cboe"
+            # CBOE uses 'timestamp', 'interval_value', 'interval_unit' (always 1, 'daily' as per DATABASE.MD)
+            cboe_date_column = "timestamp"
+            cboe_order_by_columns = ["symbol", cboe_date_column] 
+            cboe_source_name = "Market Data CBOE"
+            
+            cboe_query = f"SELECT * FROM {cboe_table} WHERE 1=1"
+            cboe_params: List[Any] = []
+            actual_source_table = cboe_table # Update if we fetch from here
+
+            if query_symbol:
+                cboe_query += f" AND symbol = ?"
+                cboe_params.append(query_symbol)
+            if start_date:
+                # Use CAST(cboe_date_column AS DATE) for DuckDB compatibility
+                cboe_query += f" AND CAST({cboe_date_column} AS DATE) >= ?"
+                cboe_params.append(start_date)
+            if end_date:
+                # Use CAST(cboe_date_column AS DATE) for DuckDB compatibility
+                cboe_query += f" AND CAST({cboe_date_column} AS DATE) <= ?"
+                cboe_params.append(end_date)
+            
+            # CBOE data is daily, so filter for interval_value=1 and interval_unit='daily'
+            # This aligns with the DATABASE.MD note: "interval_unit: (text) - 'daily' (always for CBOE)"
+            cboe_query += f" AND interval_value = ? AND interval_unit = ?"
+            cboe_params.append(1)
+            cboe_params.append("daily")
+            
+            cboe_query += f" ORDER BY {', '.join(cboe_order_by_columns)}"
+            
+            logger.info(f"Executing query for {cboe_source_name}: {cboe_query} with params: {cboe_params}")
+            try:
+                result_cboe = self.app.db_manager.execute_query(cboe_query, params=cboe_params)
+                logger.info(f"Query result for {cboe_source_name} - success: {result_cboe.is_success}, empty: {result_cboe.is_empty}")
+                if result_cboe.is_success and not result_cboe.is_empty:
+                    df = result_cboe.dataframe
+                    # Overwrite date_column for downstream processing if it was different
+                    date_column = cboe_date_column 
+                    logger.info(f"Found {len(df)} rows in {cboe_source_name}")
+                    error_message = None # Clear previous error if CBOE data found
+                elif result_cboe.is_success and result_cboe.is_empty:
+                    if not error_message or "No data found" in error_message:
+                         error_message = f"No data found matching criteria in {source_name} or {cboe_source_name}."
+                else: # CBOE Query failed
+                    error_message = f"Error executing database query for {cboe_source_name}: {result_cboe.error}"
+
+            except Exception as e:
+                logger.error(f"Database query error for {cboe_source_name}: {e}", exc_info=True)
+                if error_message is None: 
+                    error_message = f"Error executing database query for {cboe_source_name}: {str(e)}"
+        
+        if df is None: 
+            return {
+                'success': False,
+                'message': error_message or "No data found or query failed for specified criteria.",
+                'error': error_message 
+            }
+
+        # Ensure the date column used for analysis exists and is consistently named 'date'.
+        final_date_col_for_analysis = 'date' 
+        if date_column == 'timestamp' and 'timestamp' in df.columns:
+            if 'date' in df.columns and not df['date'].equals(df['timestamp']):
+                logger.warning("DataFrame has both 'date' and 'timestamp' columns with different data. Using 'timestamp' and renaming to 'date'.")
+                df = df.drop(columns=['date']) # Drop the conflicting 'date' column
+            if 'date' not in df.columns: # Rename if 'date' doesn't exist or was just dropped
+                 logger.info(f"Renaming '{date_column}' to '{final_date_col_for_analysis}' for analysis consistency.")
+                 df = df.rename(columns={date_column: final_date_col_for_analysis})
+        elif final_date_col_for_analysis not in df.columns:
+            logger.error(f"Critical: DataFrame does not have the expected date column '{final_date_col_for_analysis}' (original: '{date_column}') for analysis.")
+            return {
+                'success': False,
+                'message': f"Data retrieved but essential date column '{final_date_col_for_analysis}' (from '{date_column}') is missing or could not be prepared.",
+                'error': "Missing/unprepared date column"
+            }
+        # Begin analysis
+        try:
+            with Progress(console=self.console, transient=True) as progress:
+                analysis_task = progress.add_task("[cyan]Analyzing data quality...", total=5)
+
+                progress.update(analysis_task, advance=1, description="Calculating basic statistics...")
+                stats = self._calculate_statistics(df, date_col_name=final_date_col_for_analysis)
+
+                progress.update(analysis_task, advance=1, description="Analyzing missing data...")
+                # Pass the determined query_interval_value and query_interval_unit as a tuple
+                current_query_interval_tuple = None
+                if 'query_interval_value' in locals() and 'query_interval_unit' in locals() and query_interval_value is not None and query_interval_unit is not None:
+                    current_query_interval_tuple = (query_interval_value, query_interval_unit)
+                
+                missing_data = self._analyze_missing_data(df, date_col_name=final_date_col_for_analysis, query_interval_tuple=current_query_interval_tuple)
+
+                progress.update(analysis_task, advance=1, description="Detecting outliers...")
+                outliers = self._detect_outliers(df, date_col_name=final_date_col_for_analysis)
+
+                progress.update(analysis_task, advance=1, description="Checking time series consistency...")
+                consistency = self._check_time_series_consistency(df, date_col_name=final_date_col_for_analysis)
+                
+                progress.update(analysis_task, advance=1, description="Generating visualizations...")
+                visualizations = {}
+                if getattr(self, 'can_visualize', False):
+                    visualizations = self._generate_visualizations(df, date_col_name=final_date_col_for_analysis)
+                else:
+                    logger.warning("Visualizations skipped due to missing dependencies")
+        except Exception as e:
+            logger.error(f"Analysis error: {e}", exc_info=True)
+            return {
+                'success': False,
+                'message': f'Error during analysis: {str(e)}',
+                'error': str(e),
+                'partial_results': {
+                    'symbol': query_symbol,
+                    'date_range': [df[final_date_col_for_analysis].min(), df[final_date_col_for_analysis].max()] if final_date_col_for_analysis in df.columns and not df.empty else None,
+                    'row_count': len(df),
+                    'statistics': stats if 'stats' in locals() else {},
+                }
+            }
+
+        # Return comprehensive results
+        return {
+            'success': True,
+            'symbol': query_symbol, # Return the symbol actually used for querying
+            'source_table': actual_source_table, 
+            'date_range': [df[final_date_col_for_analysis].min(), df[final_date_col_for_analysis].max()] if final_date_col_for_analysis in df.columns and not df.empty else None,
+            'row_count': len(df),
+            'statistics': stats,
+            'missing_data': missing_data,
+            'outliers': outliers,
+            'consistency': consistency,
+            'visualizations': visualizations
+        }
     
-    def _calculate_statistics(self, df: pd.DataFrame) -> Dict[str, Any]:
+    def _calculate_statistics(self, df: pd.DataFrame, date_col_name: str) -> Dict[str, Any]:
         """
         Calculate basic statistics for market data.
         
         Args:
             df: Market data DataFrame
+            date_col_name: Name of the date column
             
         Returns:
             Dictionary with statistics
@@ -302,7 +463,7 @@ class DataQualityAnalyzer:
             for symbol, group in df.groupby('symbol'):
                 symbol_stats[symbol] = {
                     'row_count': len(group),
-                    'date_range': [group['date'].min(), group['date'].max()] if 'date' in group.columns else None,
+                    'date_range': [group[date_col_name].min(), group[date_col_name].max()],
                     'intervals': group['interval'].unique().tolist() if 'interval' in group.columns else None
                 }
             stats['by_symbol'] = symbol_stats
@@ -322,8 +483,8 @@ class DataQualityAnalyzer:
         # Calculate returns if close exists
         if 'close' in df.columns and len(df) > 1:
             # Try to sort by date if available
-            if 'date' in df.columns:
-                df_sorted = df.sort_values(['symbol', 'date'])
+            if date_col_name in df.columns:
+                df_sorted = df.sort_values(['symbol', date_col_name])
             else:
                 df_sorted = df
                 
@@ -350,12 +511,14 @@ class DataQualityAnalyzer:
         
         return stats
     
-    def _analyze_missing_data(self, df: pd.DataFrame) -> Dict[str, Any]:
+    def _analyze_missing_data(self, df: pd.DataFrame, date_col_name: str, query_interval_tuple: Optional[Tuple[int, str]] = None) -> Dict[str, Any]:
         """
         Analyze missing data in market data.
         
         Args:
             df: Market data DataFrame
+            date_col_name: Name of the date column
+            query_interval_tuple: Optional tuple (value, unit) of the queried interval.
             
         Returns:
             Dictionary with missing data analysis
@@ -378,111 +541,162 @@ class DataQualityAnalyzer:
             }
         
         # Analyze time series gaps if date column exists
-        if 'date' in df.columns and 'symbol' in df.columns:
+        if date_col_name in df.columns and 'symbol' in df.columns:
             missing['time_series_gaps'] = {}
             
+            # Convert query_interval_tuple back to string for _find_date_gaps if needed, or modify _find_date_gaps to accept tuple
+            # For now, let's reconstruct a simple string if the tuple is provided.
+            interval_str_for_gaps = None
+            if query_interval_tuple:
+                value, unit = query_interval_tuple
+                if unit == "minute": unit_abbr = "Min"
+                elif unit == "hourly": unit_abbr = "H"
+                elif unit == "daily": unit_abbr = "D"
+                elif unit == "weekly": unit_abbr = "W"
+                elif unit == "monthly": unit_abbr = "M"
+                else: unit_abbr = unit
+                interval_str_for_gaps = f"{value}{unit_abbr}"
+
             for symbol, group in df.groupby('symbol'):
                 if len(group) <= 1:
                     continue
                 
-                # Try to analyze gaps by interval
-                if 'interval' in df.columns:
-                    interval_gaps = {}
-                    
-                    for interval, interval_group in group.groupby('interval'):
-                        gaps = self._find_date_gaps(interval_group, interval)
-                        if gaps:
-                            interval_gaps[interval] = gaps
-                    
-                    if interval_gaps:
-                        missing['time_series_gaps'][symbol] = interval_gaps
-                else:
-                    # Analyze without interval
-                    gaps = self._find_date_gaps(group)
+                # Log the actual date range of the group being processed for gaps
+                if not group.empty and date_col_name in group.columns:
+                    min_date_in_group = group[date_col_name].min()
+                    max_date_in_group = group[date_col_name].max()
+                    logger.info(f"_analyze_missing_data: Processing symbol '{symbol}'. Group date range: {min_date_in_group} to {max_date_in_group}. Points: {len(group)}.")
+
+                # If query_interval_tuple is provided, use it directly for gap analysis.
+                # This overrides trying to guess from a df['interval'] column which might be inconsistent.
+                if interval_str_for_gaps:
+                    gaps = self._find_date_gaps(group, interval=interval_str_for_gaps, date_col_name=date_col_name)
                     if gaps:
-                        missing['time_series_gaps'][symbol] = gaps
+                        # Store gaps directly under symbol, not nested by DataFrame's interval column values
+                        missing['time_series_gaps'][symbol] = gaps 
+                else: # Fallback to old behavior if no specific query interval was given (should be rare for main analysis)
+                    logger.warning(f"No specific query interval provided to _analyze_missing_data for symbol {symbol}. Analyzing gaps by df['interval'] column if present.")
+                    if 'interval' in df.columns:
+                        interval_gaps_dict = {}
+                        for interval_val_from_df, interval_group in group.groupby('interval'):
+                            gaps = self._find_date_gaps(interval_group, interval=str(interval_val_from_df), date_col_name=date_col_name)
+                            if gaps:
+                                interval_gaps_dict[str(interval_val_from_df)] = gaps
+                        if interval_gaps_dict:
+                            missing['time_series_gaps'][symbol] = interval_gaps_dict
+                    else:
+                        # Analyze without interval if column not present
+                        gaps = self._find_date_gaps(group, date_col_name=date_col_name) # Interval will be None, _find_date_gaps defaults
+                        if gaps:
+                            missing['time_series_gaps'][symbol] = gaps
         
         return missing
     
-    def _find_date_gaps(self, df: pd.DataFrame, interval: Optional[str] = None) -> List[Dict[str, Any]]:
+    def _find_date_gaps(self, df: pd.DataFrame, interval: Optional[str] = None, date_col_name: str = 'date') -> List[Dict[str, Any]]:
         """
-        Find gaps in date sequence.
+        Find gaps in date sequence. More performant for high-frequency data.
         
         Args:
-            df: DataFrame for a single symbol
-            interval: Data interval
+            df: DataFrame for a single symbol and a single interval.
+            interval: Data interval string (e.g., "1min", "1D").
+            date_col_name: Name of the date column.
             
         Returns:
-            List of gap dictionaries
+            List of gap dictionaries.
         """
-        # Sort by date
-        df_sorted = df.sort_values('date')
-        dates = pd.to_datetime(df_sorted['date'])
-        
+        if df.empty or len(df) < 2:
+            return []
+
+        df_sorted = df.sort_values(date_col_name).copy() # Ensure it's sorted and a copy
+        dates = pd.to_datetime(df_sorted[date_col_name])
         gaps = []
-        
-        # Determine expected frequency based on interval
-        if interval and 'day' in interval.lower():
-            freq = 'B'  # Business days
-        elif interval and 'hour' in interval.lower():
-            freq = 'H'  # Hourly
-        elif interval and 'minute' in interval.lower() or interval and 'min' in interval.lower():
-            # Try to extract number of minutes
-            try:
-                minutes = int(''.join(filter(str.isdigit, interval)))
-                freq = f'{minutes}min'
-            except:
-                freq = 'min'
+
+        # Determine expected frequency based on interval string
+        parsed_interval_tuple = self._parse_interval_string(interval)
+        if not parsed_interval_tuple:
+            logger.warning(f"Could not parse interval '{interval}' in _find_date_gaps. Defaulting to business day frequency for gap detection.")
+            expected_delta = pd.tseries.offsets.BDay()
         else:
-            # Default to daily
-            freq = 'B'
+            val, unit = parsed_interval_tuple
+            if unit == "minute":
+                expected_delta = pd.Timedelta(minutes=val)
+            elif unit == "hourly":
+                expected_delta = pd.Timedelta(hours=val)
+            elif unit == "daily":
+                expected_delta = pd.Timedelta(days=val) # or BDay() if only business days expected
+                 # For daily, consider if it should be calendar days or business days.
+                 # If strictly business days, pd.tseries.offsets.BDay() is better.
+                 # For now, using Timedelta for simplicity, adjust if stricter business day logic needed.
+            elif unit == "weekly":
+                expected_delta = pd.Timedelta(weeks=val)
+            elif unit == "monthly": # This is trickier due to varying month lengths
+                # For monthly, a simple timedelta is often not accurate.
+                # This part might need a more sophisticated approach if precise monthly gaps are critical.
+                logger.warning("Monthly gap detection with simple timedelta may be imprecise.")
+                expected_delta = pd.Timedelta(days=val * 30) # Approximation
+            else:
+                logger.warning(f"Unknown interval unit '{unit}' in _find_date_gaps. Defaulting to business day frequency.")
+                expected_delta = pd.tseries.offsets.BDay()
         
-        # Generate expected date range
-        if len(dates) >= 2:
-            expected_dates = pd.date_range(start=dates.min(), end=dates.max(), freq=freq)
+        # Iterate through sorted dates to find gaps
+        current_gap_start = None
+        max_deltas_logged = 0 # Helper to limit logging
+
+        for i in range(len(dates) - 1):
+            # Calculate the difference between consecutive timestamps
+            actual_delta = dates.iloc[i+1] - dates.iloc[i]
             
-            # Find missing dates
-            missing_dates = set(expected_dates) - set(dates)
+            # Log large deltas for diagnosis, especially for the full run
+            if actual_delta > pd.Timedelta(days=1) and max_deltas_logged < 20: # Log up to 20 large deltas
+                logger.info(f"_find_date_gaps: Large actual_delta at index {i}: {actual_delta}. Date[i]: {dates.iloc[i]}, Date[i+1]: {dates.iloc[i+1]}")
+                max_deltas_logged +=1
+
+            # A gap exists if actual_delta is significantly larger than expected_delta.
+            # Using 1.5 times expected_delta as a threshold to allow for minor timing variations.
+            is_gap = False
+            if isinstance(expected_delta, pd.Timedelta):
+                if actual_delta > expected_delta * 1.5: # If actual is > 1.5x expected, it's a gap
+                    is_gap = True
+            elif isinstance(expected_delta, pd.tseries.offsets.DateOffset):
+                 # For offsets like BDay, check if next expected date is missing
+                 next_expected_date = dates.iloc[i] + expected_delta
+                 if dates.iloc[i+1] > next_expected_date: # if next actual date is after next expected date
+                     is_gap = True
             
-            if missing_dates:
-                # Group consecutive missing dates
-                missing_dates_sorted = sorted(missing_dates)
-                gap_start = missing_dates_sorted[0]
-                current_gap = [gap_start]
+            if is_gap:
+                gap_start_time = dates.iloc[i] + expected_delta
+                gap_end_time = dates.iloc[i+1] - expected_delta 
                 
-                for i in range(1, len(missing_dates_sorted)):
-                    if missing_dates_sorted[i] - missing_dates_sorted[i-1] <= pd.Timedelta(days=1):
-                        current_gap.append(missing_dates_sorted[i])
-                    else:
-                        # End of gap, record it
-                        gaps.append({
-                            'start_date': current_gap[0],
-                            'end_date': current_gap[-1],
-                            'gap_days': (current_gap[-1] - current_gap[0]).days + 1,
-                            'missing_points': len(current_gap)
-                        })
-                        
-                        # Start new gap
-                        gap_start = missing_dates_sorted[i]
-                        current_gap = [gap_start]
-                
-                # Don't forget the last gap
-                if current_gap:
-                    gaps.append({
-                        'start_date': current_gap[0],
-                        'end_date': current_gap[-1],
-                        'gap_days': (current_gap[-1] - current_gap[0]).days + 1,
-                        'missing_points': len(current_gap)
-                    })
+                # Ensure gap_end_time is not before gap_start_time for tiny intervals
+                if gap_end_time < gap_start_time:
+                    gap_end_time = gap_start_time
+
+                if isinstance(expected_delta, pd.Timedelta) and expected_delta.total_seconds() > 0:
+                    # Ensure we are calculating points *within* the gap, so actual_delta / expected_delta, then subtract 1 for the known point after gap.
+                    # If actual_delta is 2*expected_delta, there's 1 missing point.
+                    num_missing_points = int(round( (actual_delta.total_seconds() / expected_delta.total_seconds()) ) -1 )
+                    if num_missing_points < 0: num_missing_points = 0 # Should not be negative
+                else: # Fallback for offsets or zero delta
+                    # For BDay or other offsets, direct point counting is harder without generating range.
+                    # Let's keep it 0 if not a simple Timedelta, or consider a more complex estimation if needed.
+                    num_missing_points = 0 # Default to 0 if cannot estimate reliably from simple timedelta arithmetic
+
+                gaps.append({
+                    'start_date': gap_start_time,
+                    'end_date': gap_end_time, # This is the timestamp before the next actual data point
+                    'gap_duration_seconds': (gap_end_time - gap_start_time).total_seconds(),
+                    'missing_points_estimated': num_missing_points
+                })
         
         return gaps
     
-    def _detect_outliers(self, df: pd.DataFrame) -> Dict[str, Any]:
+    def _detect_outliers(self, df: pd.DataFrame, date_col_name: str) -> Dict[str, Any]:
         """
         Detect outliers in market data.
         
         Args:
             df: Market data DataFrame
+            date_col_name: Name of the date column
             
         Returns:
             Dictionary with outlier analysis
@@ -558,7 +772,7 @@ class DataQualityAnalyzer:
                     continue
                 
                 # Calculate returns
-                sorted_group = group.sort_values('date')
+                sorted_group = group.sort_values(date_col_name)
                 returns = sorted_group['close'].pct_change().dropna()
                 
                 if len(returns) == 0:
@@ -594,12 +808,13 @@ class DataQualityAnalyzer:
         
         return outliers
     
-    def _check_time_series_consistency(self, df: pd.DataFrame) -> Dict[str, Any]:
+    def _check_time_series_consistency(self, df: pd.DataFrame, date_col_name: str) -> Dict[str, Any]:
         """
         Check time series consistency in market data.
         
         Args:
             df: Market data DataFrame
+            date_col_name: Name of the date column
             
         Returns:
             Dictionary with consistency analysis
@@ -676,12 +891,13 @@ class DataQualityAnalyzer:
         
         return consistency
     
-    def _generate_visualizations(self, df: pd.DataFrame) -> Dict[str, str]:
+    def _generate_visualizations(self, df: pd.DataFrame, date_col_name: str) -> Dict[str, str]:
         """
         Generate visualizations for data quality analysis.
 
         Args:
             df: Market data DataFrame
+            date_col_name: Name of the date column
 
         Returns:
             Dictionary mapping visualization names to file paths
@@ -692,6 +908,57 @@ class DataQualityAnalyzer:
         if plt is None:
             logger.warning("Matplotlib is not installed. Visualizations will be skipped.")
             return visualizations
+        
+        try:
+            import matplotlib
+            matplotlib.use('Agg') 
+            logger.info("Matplotlib backend set to Agg for visualization.")
+        except ImportError:
+            logger.warning("Could not import matplotlib to set backend. Visualizations might still cause issues.")
+        except Exception as e:
+            logger.warning(f"Error setting matplotlib backend: {e}. Visualizations might still cause issues.")
+
+        # Determine output directory for visualizations
+        # Assuming this script is in src/inspector/modules/data_quality.py
+        # Project root would be Path(__file__).parent.parent.parent.parent
+        project_root = Path(__file__).resolve().parent.parent.parent.parent
+        output_dir = project_root / "output" / "data_quality"
+        try:
+            output_dir.mkdir(parents=True, exist_ok=True)
+            logger.info(f"Ensured visualization output directory exists: {output_dir}")
+        except Exception as e:
+            logger.error(f"Could not create visualization output directory {output_dir}: {e}. Saving to temp.")
+            # Fallback to tempfile if directory creation fails
+            output_dir = Path(tempfile.gettempdir())
+
+        # Extract symbol and interval from DataFrame or analysis context if possible
+        # This relies on the structure of 'df' or having access to the original query parameters
+        # For simplicity, we'll try to get it from df if a single symbol/interval is present
+        # If multiple symbols, chart names will be more generic or symbol-specific in loops.
+        
+        # Generate a base filename prefix from symbol and interval
+        # df might contain data for multiple symbols if no specific symbol was requested for analysis
+        # The `symbol` argument to this function is not directly available here. 
+        # We'd need to pass it or derive it. Let's assume `df['symbol']` can be used if unique.
+        # Similarly for interval.
+        
+        # For now, let's try a generic approach. If specific symbol/interval is available in df:
+        base_filename_parts = []
+        try:
+            if 'symbol' in df.columns and df['symbol'].nunique() == 1:
+                current_symbol = df['symbol'].iloc[0]
+                base_filename_parts.append(str(current_symbol).replace("=", "_").replace("@","S_")) # Sanitize symbol
+            
+            #Interval info is not directly in df.columns as 'interval_value'/'interval_unit' generally
+            # We need to reconstruct it or have it passed. For now, we will omit it from base filename if not easily derived.
+            # Or, if it was part of the query that produced df, it might be available from analysis_results if passed.
+
+        except Exception as e:
+            logger.warning(f"Could not determine unique symbol/interval for filename: {e}")
+
+        base_file_prefix = "_".join(filter(None, base_filename_parts))
+        if not base_file_prefix: # Default if no parts were added
+            base_file_prefix = "analysis_plot"
 
         # Check if we have price data
         price_columns = ['open', 'high', 'low', 'close']
@@ -720,10 +987,15 @@ class DataQualityAnalyzer:
                 plt.title('Missing Data Heatmap')
                 plt.tight_layout()
 
-                with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as tmp:
-                    plt.savefig(tmp.name)
+                # Construct filename: <output_dir>/<base_file_prefix>_missing_heatmap.png
+                filename = output_dir / f"{base_file_prefix}_missing_heatmap.png"
+                try:
+                    plt.savefig(filename)
                     plt.close()
-                    visualizations['missing_data_heatmap'] = tmp.name
+                    visualizations['missing_data_heatmap'] = str(filename)
+                    logger.info(f"Saved missing data heatmap to {filename}")
+                except Exception as e:
+                    logger.error(f"Failed to save missing_data_heatmap: {e}")
             except Exception as e:
                 logger.error(f"Error generating missing data heatmap: {e}")
                 logger.error(f"Error details: {str(e)}")
@@ -737,17 +1009,33 @@ class DataQualityAnalyzer:
 
                     for symbol in symbols:
                         try:
-                            symbol_df = df[df['symbol'] == symbol].sort_values('date')
+                            symbol_df = df[df['symbol'] == symbol].sort_values(date_col_name)
 
                             if len(symbol_df) <= 1:
                                 continue
 
+                            # Downsample for plotting if too many points (e.g., > 50,000)
+                            plot_df = symbol_df
+                            if len(symbol_df) > 50000: # Arbitrary threshold for downsampling
+                                logger.info(f"Downsampling data for symbol {symbol} for price plot ({len(symbol_df)} points to daily).")
+                                try:
+                                    # Ensure date_col_name is DatetimeIndex for resampling
+                                    temp_plot_df = symbol_df.set_index(pd.to_datetime(symbol_df[date_col_name]))
+                                    # Resample to daily, taking an aggregate (e.g., last close, or ohlc if we want to plot candles)
+                                    # For a simple line plot of close, taking the last known close of the day is fine.
+                                    resampled_close = temp_plot_df['close'].resample('D').last()
+                                    # We need a dataframe with the date_col_name for plotting
+                                    plot_df = pd.DataFrame({date_col_name: resampled_close.index, 'close': resampled_close.values}).dropna()
+                                except Exception as resample_e:
+                                    logger.warning(f"Could not downsample data for {symbol} due to: {resample_e}. Plotting raw data.")
+                                    plot_df = symbol_df # Fallback to original if resampling fails
+
                             plt.figure(figsize=(12, 6))
 
                             # Plot close price
-                            plt.plot(symbol_df['date'], symbol_df['close'], label='Close Price')
+                            plt.plot(plot_df[date_col_name], plot_df['close'], label='Close Price')
 
-                            # Highlight outliers
+                            # Highlight outliers (use original symbol_df for outlier calculation and coordinates)
                             mean = symbol_df['close'].mean()
                             std = symbol_df['close'].std()
 
@@ -760,33 +1048,50 @@ class DataQualityAnalyzer:
                                 lower_outliers = symbol_df[symbol_df['close'] < lower_limit]
 
                                 if len(upper_outliers) > 0:
-                                    plt.scatter(upper_outliers['date'], upper_outliers['close'],
+                                    plt.scatter(upper_outliers[date_col_name], upper_outliers['close'],
                                             color='red', label='Upper Outliers')
 
                                 if len(lower_outliers) > 0:
-                                    plt.scatter(lower_outliers['date'], lower_outliers['close'],
+                                    plt.scatter(lower_outliers[date_col_name], lower_outliers['close'],
                                             color='green', label='Lower Outliers')
 
                             plt.title(f'Close Price with Outliers - {symbol}')
                             plt.xlabel('Date')
                             plt.ylabel('Price')
-                            plt.legend()
+                            plt.legend(loc='upper left')
                             plt.tight_layout()
 
-                            with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as tmp:
-                                plt.savefig(tmp.name)
+                            # Construct filename: <output_dir>/<symbol>_price_outliers.png
+                            symbol_filename_part = str(symbol).replace("=","_").replace("@","S_")
+                            filename = output_dir / f"{symbol_filename_part}_price_outliers.png"
+                            try:
+                                plt.savefig(filename)
                                 plt.close()
-                                visualizations[f'price_outliers_{symbol}'] = tmp.name
+                                visualizations[f'price_outliers_{symbol}'] = str(filename)
+                                logger.info(f"Saved price outliers for {symbol} to {filename}")
+                            except Exception as e:
+                                logger.error(f"Failed to save price_outliers_{symbol}: {e}")
                         except Exception as symbol_e:
                             logger.error(f"Error processing symbol {symbol}: {symbol_e}")
                 else:
-                    # Single chart for all data
+                    # Single chart for all data (if no symbols column or only one symbol originally)
+                    plot_df = df # Start with the original df
+                    if len(df) > 50000: # Arbitrary threshold
+                        logger.info(f"Downsampling data for general price plot ({len(df)} points to daily).")
+                        try:
+                            temp_plot_df = df.set_index(pd.to_datetime(df[date_col_name]))
+                            resampled_close = temp_plot_df['close'].resample('D').last()
+                            plot_df = pd.DataFrame({date_col_name: resampled_close.index, 'close': resampled_close.values}).dropna()
+                        except Exception as resample_e:
+                            logger.warning(f"Could not downsample general data due to: {resample_e}. Plotting raw data.")
+                            plot_df = df # Fallback
+                    
                     plt.figure(figsize=(12, 6))
 
                     # Plot close price
-                    plt.plot(df['date'], df['close'], label='Close Price')
+                    plt.plot(plot_df[date_col_name], plot_df['close'], label='Close Price')
 
-                    # Highlight outliers
+                    # Highlight outliers (use original df for outlier calculation and coordinates)
                     mean = df['close'].mean()
                     std = df['close'].std()
 
@@ -799,23 +1104,28 @@ class DataQualityAnalyzer:
                         lower_outliers = df[df['close'] < lower_limit]
 
                         if len(upper_outliers) > 0:
-                            plt.scatter(upper_outliers['date'], upper_outliers['close'],
+                            plt.scatter(upper_outliers[date_col_name], upper_outliers['close'],
                                       color='red', label='Upper Outliers')
 
                         if len(lower_outliers) > 0:
-                            plt.scatter(lower_outliers['date'], lower_outliers['close'],
+                            plt.scatter(lower_outliers[date_col_name], lower_outliers['close'],
                                       color='green', label='Lower Outliers')
 
                     plt.title('Close Price with Outliers')
                     plt.xlabel('Date')
                     plt.ylabel('Price')
-                    plt.legend()
+                    plt.legend(loc='upper left')
                     plt.tight_layout()
 
-                    with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as tmp:
-                        plt.savefig(tmp.name)
+                    # Construct filename: <output_dir>/<base_file_prefix>_price_outliers.png
+                    filename = output_dir / f"{base_file_prefix}_price_outliers.png"
+                    try:
+                        plt.savefig(filename)
                         plt.close()
-                        visualizations['price_outliers'] = tmp.name
+                        visualizations['price_outliers'] = str(filename)
+                        logger.info(f"Saved general price outliers to {filename}")
+                    except Exception as e:
+                        logger.error(f"Failed to save general price_outliers: {e}")
             except Exception as e:
                 logger.error(f"Error generating price series visualization: {e}")
 
@@ -833,12 +1143,30 @@ class DataQualityAnalyzer:
                 plt.title('Volume Distribution')
                 plt.xlabel('Volume')
                 plt.ylabel('Frequency')
+                plt.yscale('log')
+                
+                # Set x-axis limits to 99.5th percentile for better visibility of main distribution
+                if 'volume' in df.columns and not df['volume'].empty:
+                    max_vol_display = df['volume'].quantile(0.995) 
+                    if pd.notna(max_vol_display) and max_vol_display > 0:
+                        plt.xlim(-0.01 * max_vol_display, max_vol_display) # Start slightly before 0 for visual
+                        plt.title('Volume Distribution (up to 99.5th percentile)') # Update title
+                    else:
+                        plt.title('Volume Distribution') # Default title if percentile is problematic
+                else:
+                    plt.title('Volume Distribution')
+
                 plt.tight_layout()
 
-                with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as tmp:
-                    plt.savefig(tmp.name)
+                # Construct filename: <output_dir>/<base_file_prefix>_volume_histogram.png
+                filename = output_dir / f"{base_file_prefix}_volume_histogram.png"
+                try:
+                    plt.savefig(filename)
                     plt.close()
-                    visualizations['volume_histogram'] = tmp.name
+                    visualizations['volume_histogram'] = str(filename)
+                    logger.info(f"Saved volume histogram to {filename}")
+                except Exception as e:
+                    logger.error(f"Failed to save volume_histogram: {e}")
             except Exception as e:
                 logger.error(f"Error generating volume histogram: {e}")
 
@@ -856,7 +1184,7 @@ class DataQualityAnalyzer:
                         continue
 
                     # Sort and calculate returns
-                    sorted_group = group.sort_values('date')
+                    sorted_group = group.sort_values(date_col_name)
                     returns = sorted_group['close'].pct_change().dropna()
 
                     if len(returns) > 0:
@@ -870,16 +1198,39 @@ class DataQualityAnalyzer:
                     returns_df = pd.concat(all_returns)
 
                     # Plot returns distribution
-                    sns.histplot(data=returns_df, x='returns', hue='symbol', kde=True, common_norm=False)
-                    plt.title('Returns Distribution by Symbol')
+                    if returns_df['symbol'].nunique() > 1:
+                        sns.histplot(data=returns_df, x='returns', hue='symbol', kde=True, common_norm=False)
+                    else:
+                        sns.histplot(data=returns_df, x='returns', kde=True)
+                        
+                    plt.title('Returns Distribution by Symbol' if returns_df['symbol'].nunique() > 1 else 'Returns Distribution')
                     plt.xlabel('Returns')
                     plt.ylabel('Frequency')
+                    plt.yscale('log') # Add log scale to Y-axis for returns
+
+                    # Set x-axis limits based on percentiles to see tails better
+                    if not returns_df['returns'].empty:
+                        lower_percentile = returns_df['returns'].quantile(0.001) # 0.1th percentile
+                        upper_percentile = returns_df['returns'].quantile(0.999) # 99.9th percentile
+                        # Add a small buffer or ensure range is not zero
+                        if lower_percentile == upper_percentile:
+                            padding = 0.01 * abs(lower_percentile) if lower_percentile != 0 else 0.01
+                            lower_percentile -= padding
+                            upper_percentile += padding
+                        plt.xlim(lower_percentile, upper_percentile)
+
+                    plt.legend(loc='upper right')
                     plt.tight_layout()
 
-                    with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as tmp:
-                        plt.savefig(tmp.name)
+                    # Construct filename: <output_dir>/<base_file_prefix>_returns_dist.png
+                    filename = output_dir / f"{base_file_prefix}_returns_dist.png"
+                    try:
+                        plt.savefig(filename)
                         plt.close()
-                        visualizations['returns_distribution'] = tmp.name
+                        visualizations['returns_distribution'] = str(filename)
+                        logger.info(f"Saved returns distribution to {filename}")
+                    except Exception as e:
+                        logger.error(f"Failed to save returns_distribution: {e}")
             except Exception as e:
                 logger.error(f"Error generating returns distribution: {e}")
 
@@ -979,44 +1330,44 @@ class DataQualityAnalyzer:
             if gaps:
                 self.console.print(f"\n[bold cyan]Time Series Gaps:[/bold cyan] Found in {len(gaps)} symbols")
                 
-                for symbol, symbol_gaps in list(gaps.items())[:3]:  # Limit to 3 symbols for readability
-                    if isinstance(symbol_gaps, dict):
-                        # Gaps by interval
-                        for interval, interval_gaps in symbol_gaps.items():
-                            if interval_gaps:
-                                gap_table = Table(title=f"Gaps for {symbol} ({interval})", box=SIMPLE)
-                                gap_table.add_column("Start Date")
-                                gap_table.add_column("End Date")
-                                gap_table.add_column("Gap Days")
-                                gap_table.add_column("Missing Points")
-                                
-                                for gap in interval_gaps[:5]:  # Limit to 5 gaps
-                                    gap_table.add_row(
-                                        str(gap.get('start_date', '')),
-                                        str(gap.get('end_date', '')),
-                                        str(gap.get('gap_days', '')),
-                                        str(gap.get('missing_points', ''))
-                                    )
-                                
-                                self.console.print(gap_table)
+                for symbol, symbol_gaps_data in list(gaps.items())[:3]:  # Limit to 3 symbols for readability
+                    actual_gaps_list = []
+                    if isinstance(symbol_gaps_data, dict): # Old: Gaps by interval from DataFrame column
+                        for interval_key, interval_specific_gaps in symbol_gaps_data.items():
+                            if interval_specific_gaps:
+                                actual_gaps_list.extend(interval_specific_gaps)
+                    elif isinstance(symbol_gaps_data, list): # New: Direct list of gaps for the query interval
+                        actual_gaps_list = symbol_gaps_data
+                    
+                    if actual_gaps_list:
+                        # Sort gaps by duration (descending) to show largest first
+                        # Ensure 'gap_duration_seconds' exists and is numeric for sorting
+                        actual_gaps_list.sort(key=lambda x: x.get('gap_duration_seconds', 0) if isinstance(x.get('gap_duration_seconds'), (int, float)) else 0, reverse=True)
+                        
+                        gap_table_title = f"Largest Gaps for {symbol}"
+                        if isinstance(symbol_gaps_data, dict) and len(symbol_gaps_data) == 1:
+                             # If it was from old structure with one interval key
+                            interval_key = list(symbol_gaps_data.keys())[0]
+                            gap_table_title = f"Largest Gaps for {symbol} (Interval: {interval_key})"
+                        
+                        gap_table = Table(title=gap_table_title, box=SIMPLE)
+                        gap_table.add_column("Start Date")
+                        gap_table.add_column("End Date")
+                        gap_table.add_column("Duration")
+                        gap_table.add_column("Missing Pts (est)")
+                        
+                        for gap in actual_gaps_list[:10]:  # Show top 10 largest gaps
+                            duration_val = gap.get('gap_duration_seconds', 'N/A')
+                            formatted_duration = _format_duration(duration_val) if duration_val != 'N/A' else 'N/A'
+                            gap_table.add_row(
+                                str(gap.get('start_date', '')),
+                                str(gap.get('end_date', '')),
+                                formatted_duration,
+                                str(gap.get('missing_points_estimated', ''))
+                            )
+                        self.console.print(gap_table)
                     else:
-                        # Direct list of gaps
-                        if symbol_gaps:
-                            gap_table = Table(title=f"Gaps for {symbol}", box=SIMPLE)
-                            gap_table.add_column("Start Date")
-                            gap_table.add_column("End Date")
-                            gap_table.add_column("Gap Days")
-                            gap_table.add_column("Missing Points")
-                            
-                            for gap in symbol_gaps[:5]:  # Limit to 5 gaps
-                                gap_table.add_row(
-                                    str(gap.get('start_date', '')),
-                                    str(gap.get('end_date', '')),
-                                    str(gap.get('gap_days', '')),
-                                    str(gap.get('missing_points', ''))
-                                )
-                            
-                            self.console.print(gap_table)
+                        self.console.print(f"No gaps found or reported for {symbol} after processing.")
         
         # Print outliers
         outliers = results.get('outliers', {})
@@ -1105,111 +1456,139 @@ class DataQualityAnalyzer:
     
     def interactive_analyzer(self) -> None:
         """Run interactive data quality analyzer."""
-        print("\nEntering interactive data quality analyzer. Type 'help' for commands, 'exit' to quit.")
+        self.console.print("\nEntering interactive data quality analyzer. Type 'help' for commands, 'exit' to quit.")
         
         while True:
             try:
                 # Get command from user
-                command = input("\nquality> ").strip()
-                
-                if command.lower() in ('exit', 'quit'):
+                command_str = self.console.input("\n[bold]quality>[/bold] ").strip()
+                command_parts = command_str.split()
+                command = command_parts[0].lower() if command_parts else ""
+
+                if command in ('exit', 'quit'):
                     break
-                elif command.lower() == 'help':
+                elif command == 'help':
                     self._show_help()
-                elif command.lower().startswith('analyze'):
-                    # Parse parameters
-                    parts = command.split()
-                    symbol = None
-                    start_date = None
-                    end_date = None
-                    interval = None
+                elif command == 'analyze':
+                    # --- Contract Type Selection ---
+                    contract_type_prompt = "Analyze [1] Individual Contract or [2] Continuous Contract?"
+                    contract_choice = Prompt.ask(contract_type_prompt, choices=["1", "2"], default="1").strip()
+                    is_continuous = contract_choice == "2"
                     
-                    # Look for parameters
-                    for i, part in enumerate(parts):
-                        if part == '-s' and i + 1 < len(parts):
-                            symbol = parts[i + 1]
-                        elif part == '-d' and i + 2 < len(parts):
-                            start_date = parts[i + 1]
-                            end_date = parts[i + 2]
-                        elif part == '-i' and i + 1 < len(parts):
-                            interval = parts[i + 1]
+                    if is_continuous:
+                        symbol_prompt = "Enter continuous contract symbol (e.g., @ES=102XC, @VX=101XN):"
+                    else:
+                        symbol_prompt = "Enter individual contract symbol (e.g., ESU23, NQZ23):"
+                    symbol = Prompt.ask(symbol_prompt, default=None)
                     
-                    # Run analysis
-                    results = self.analyze_market_data_table(symbol, start_date, end_date, interval)
+                    # --- Date Range Selection ---
+                    start_date_str = Prompt.ask("Enter start date (YYYY-MM-DD, optional)", default=None)
+                    end_date_str = Prompt.ask("Enter end date (YYYY-MM-DD, optional)", default=None)
+                    
+                    # --- Interval Selection ---
+                    interval_prompt = "Enter data interval (e.g., 1D, 1H, 30Min, optional, default: 1D for individual, best available for continuous)"
+                    default_interval = None if is_continuous else "1D" # Continuous might infer best, individual defaults to Daily
+                    interval = Prompt.ask(interval_prompt, default=default_interval)
+
+                    # Validate and parse dates
+                    start_date, end_date = None, None
+                    if start_date_str:
+                        try:
+                            datetime.strptime(start_date_str, "%Y-%m-%d")
+                            start_date = start_date_str
+                        except ValueError:
+                            self.console.print(f"[bold red]Invalid start date format: {start_date_str}. Please use YYYY-MM-DD.[/bold red]")
+                            continue
+                    if end_date_str:
+                        try:
+                            datetime.strptime(end_date_str, "%Y-%m-%d")
+                            end_date = end_date_str
+                        except ValueError:
+                            self.console.print(f"[bold red]Invalid end date format: {end_date_str}. Please use YYYY-MM-DD.[/bold red]")
+                            continue
+                    
+                    if start_date and end_date and start_date > end_date:
+                        self.console.print("[bold red]Start date cannot be after end date.[/bold red]")
+                        continue
+
+                    # Run analysis (Pass is_continuous to the analysis function)
+                    # self.console.print(f"Analyzing: Symbol={symbol}, Start={start_date}, End={end_date}, Interval={interval}, Continuous={is_continuous}")
+                    results = self.analyze_market_data_table(
+                        symbol=symbol, 
+                        start_date=start_date, 
+                        end_date=end_date, 
+                        interval=interval,
+                        is_continuous=is_continuous # Pass the new flag
+                    )
                     self.display_analysis_results(results)
-                elif command.lower().startswith('config'):
-                    # Parse config settings
-                    parts = command.split()
-                    
-                    if len(parts) == 1:
-                        # Show current config
+
+                elif command == 'config':
+                    if len(command_parts) == 1:
                         self._show_config()
-                    elif len(parts) >= 3:
-                        # Update config
-                        key = parts[1]
-                        value = parts[2]
+                    elif len(command_parts) >= 3:
+                        key = command_parts[1]
+                        value = " ".join(command_parts[2:]) # Allow spaces in value
                         
                         if key in self.config_values:
-                            # Convert to appropriate type
                             try:
-                                if isinstance(self.config_values[key], bool):
-                                    self.config_values[key] = value.lower() in ('true', 'yes', '1')
-                                elif isinstance(self.config_values[key], int):
-                                    self.config_values[key] = int(value)
-                                elif isinstance(self.config_values[key], float):
-                                    self.config_values[key] = float(value)
-                                else:
-                                    self.config_values[key] = value
-                                
-                                print(f"Set {key} = {self.config_values[key]}")
+                                current_type = type(self.config_values[key])
+                                if current_type == bool:
+                                    new_value = value.lower() in ('true', 'yes', '1')
+                                elif current_type == int:
+                                    new_value = int(value)
+                                elif current_type == float:
+                                    new_value = float(value)
+                                else: # str or other
+                                    new_value = value
+                                self.config_values[key] = new_value
+                                self.console.print(f"[green]Set {key} = {self.config_values[key]}[/green]")
                             except ValueError:
-                                print(f"Invalid value for {key}: {value}")
+                                self.console.print(f"[bold red]Invalid value '{value}' for {key} (expected {current_type.__name__}).[/bold red]")
                         else:
-                            print(f"Unknown config key: {key}")
+                            self.console.print(f"[bold red]Unknown config key: {key}[/bold red]")
                     else:
-                        print("Usage: config <key> <value>")
-                elif command.lower() == 'reset':
-                    # Reset config to defaults
+                        self.console.print("Usage: config <key> <value> (or 'config' to show current)")
+                elif command == 'reset':
                     self.config_values = self.default_config.copy()
-                    print("Reset configuration to defaults")
+                    self.console.print("[green]Configuration reset to defaults.[/green]")
                 else:
-                    print(f"Unknown command: {command}")
+                    self.console.print(f"[bold red]Unknown command: {command_str}[/bold red]")
                     self._show_help()
             
             except KeyboardInterrupt:
+                self.console.print("\nOperation cancelled by user.")
                 break
-            except EOFError:
+            except EOFError: # Handle Ctrl+D
+                self.console.print("\nExiting data quality analyzer.")
                 break
             except Exception as e:
-                print(f"Error: {e}")
+                logger.error(f"Error in interactive analyzer: {e}", exc_info=True)
+                self.console.print(f"[bold red]An unexpected error occurred: {e}[/bold red]")
         
-        print("\nExiting data quality analyzer.")
+        self.console.print("\nExiting data quality analyzer.")
     
     def _show_help(self) -> None:
         """Show help information."""
         help_text = """
         Available commands:
         
-        analyze [-s SYMBOL] [-d START_DATE END_DATE] [-i INTERVAL]
-                               - Analyze market data quality
-        config <key> <value>   - Set configuration value
-        config                 - Show current configuration
-        reset                  - Reset configuration to defaults
-        help                   - Show this help
-        exit                   - Exit data quality analyzer
+        analyze                - Interactively analyze market data quality.
+                                 You will be prompted for contract type (individual/continuous),
+                                 symbol, date range, and interval.
+        config <key> <value>   - Set a specific configuration value.
+        config                 - Show the current data quality configuration.
+        reset                  - Reset all configuration values to their defaults.
+        help                   - Show this help message.
+        exit                   - Exit the data quality analyzer.
         
-        Examples:
-        
-        analyze                - Analyze all market data
-        analyze -s ES          - Analyze data for ES symbol
-        analyze -d 2023-01-01 2023-03-31
-                               - Analyze data within date range
-        analyze -s ES -i DAY   - Analyze daily data for ES
+        Examples for config:
         config outlier_threshold_std 4.0
-                               - Set outlier threshold to 4 standard deviations
+                               - Set outlier threshold to 4.0 standard deviations.
+        config zero_price_detection false
+                               - Disable zero price detection.
         """
         
-        print(help_text)
+        self.console.print(Panel(help_text, title="Data Quality Analyzer Help", expand=False))
     
     def _show_config(self) -> None:
         """Show current configuration."""
@@ -1234,6 +1613,28 @@ class DataQualityAnalyzer:
             )
         
         self.console.print(config_table)
+
+def _format_duration(seconds: Union[float, int]) -> str:
+    if not isinstance(seconds, (float, int)) or seconds < 0:
+        return "N/A"
+    if seconds == 0:
+        return "0s"
+
+    days, remainder = divmod(seconds, 86400)
+    hours, remainder = divmod(remainder, 3600)
+    minutes, sec = divmod(remainder, 60)
+
+    parts = []
+    if days > 0:
+        parts.append(f"{int(days)}d")
+    if hours > 0:
+        parts.append(f"{int(hours)}h")
+    if minutes > 0:
+        parts.append(f"{int(minutes)}m")
+    if sec > 0 or not parts: # show seconds if it's the only unit or if there's a remainder
+        parts.append(f"{int(sec)}s")
+    
+    return " ".join(parts)
 
 # Global instance
 quality_analyzer = None

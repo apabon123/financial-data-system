@@ -1,8 +1,8 @@
 #!/usr/bin/env python
 """
-Update Active ES and NQ Futures Contracts
+Update Active Futures Contracts
 
-This script identifies and updates only the active ES and NQ futures contracts.
+This script identifies and updates active futures contracts based on configuration.
 It determines which contracts are currently active based on trading calendar
 and fetches the latest data for those contracts only.
 """
@@ -15,6 +15,7 @@ import pandas as pd
 from datetime import datetime, date, timedelta
 import re
 import time
+import yaml
 
 # Add project root to Python path if needed
 project_root = os.path.abspath(os.path.dirname(__file__))
@@ -31,240 +32,159 @@ logging.basicConfig(
     datefmt='%Y-%m-%d %H:%M:%S',
     handlers=[
         logging.StreamHandler(),
-        logging.FileHandler('update_active_es_nq_futures.log')
+        logging.FileHandler('update_active_futures.log')
     ]
 )
-logger = logging.getLogger("update_active_es_nq_futures")
+logger = logging.getLogger("update_active_futures")
 
 # Database path
 DB_PATH = "./data/financial_data.duckdb"
 
-# Month code mapping
-MONTH_CODES = {
-    'F': 1,  # January
-    'G': 2,  # February
-    'H': 3,  # March
-    'J': 4,  # April
-    'K': 5,  # May
-    'M': 6,  # June
-    'N': 7,  # July
-    'Q': 8,  # August
-    'U': 9,  # September
-    'V': 10, # October
-    'X': 11, # November
-    'Z': 12  # December
-}
-
-# Reverse mapping for generating contract symbols
-MONTH_CODES_REVERSE = {v: k for k, v in MONTH_CODES.items()}
-
-def simple_save_market_data(self, df):
-    """
-    A simplified version of the save method that directly inserts data.
-    Avoids complex SQL updates and just inserts data.
-    """
-    if df is None or df.empty:
-        logger.warning("Empty dataframe, nothing to save")
-        return 0
-    
-    logger.info(f"Saving {len(df)} rows to database")
-    
-    # Ensure required columns exist
-    required_columns = [
-        'timestamp', 'symbol', 'open', 'high', 'low', 'close', 'settle',
-        'volume', 'interval_value', 'interval_unit', 'source'
-    ]
-    
-    # Add missing columns with default values
-    for col in required_columns:
-        if col not in df.columns:
-            logger.info(f"Adding missing column: {col}")
-            if col in ['open', 'high', 'low', 'close', 'settle', 'volume']:
-                df[col] = None
-            elif col == 'interval_value':
-                df[col] = 1
-            elif col == 'interval_unit':
-                df[col] = 'daily'
-            elif col == 'source':
-                df[col] = 'TradeStation'
-            else:
-                df[col] = None
-    
-    # Connect to the database
-    conn = duckdb.connect(DB_PATH, read_only=False)
-    
+def load_futures_config():
+    """Load futures configuration from YAML files."""
     try:
-        # Begin transaction
-        conn.begin()
-        rows_inserted = 0
+        with open('config/market_symbols.yaml', 'r') as f:
+            market_symbols = yaml.safe_load(f)
         
-        # Check if any of the rows already exist in the database
-        # We do this by checking primary key values (timestamp and symbol)
-        for idx, row in df.iterrows():
-            symbol = row['symbol']
-            timestamp = row['timestamp']
-            
-            # Check if this (timestamp, symbol) combination already exists
-            check_query = f"""
-                SELECT COUNT(*) FROM market_data 
-                WHERE timestamp = '{timestamp}' AND symbol = '{symbol}'
-            """
-            count = conn.execute(check_query).fetchone()[0]
-            
-            # Only insert if it doesn't exist
-            if count == 0:
-                # Create a list of column values for this row
-                columns = []
-                values = []
-                for col in df.columns:
-                    columns.append(col)
-                    values.append(row[col])
-                
-                # Build the INSERT query with ? placeholders
-                columns_str = ", ".join(columns)
-                placeholders = ", ".join(["?" for _ in columns])
-                
-                insert_query = f"""
-                    INSERT INTO market_data ({columns_str})
-                    VALUES ({placeholders})
-                """
-                
-                # Execute the INSERT query with values
-                conn.execute(insert_query, values)
-                rows_inserted += 1
-            else:
-                logger.debug(f"Skipping duplicate entry: {symbol} at {timestamp}")
+        with open('config/futures.yaml', 'r') as f:
+            futures_config = yaml.safe_load(f)
         
-        # Commit the transaction
-        conn.commit()
-        logger.info(f"Successfully saved {rows_inserted} rows to database")
-        return rows_inserted
-    
+        # Get futures from market_symbols.yaml
+        futures = [f for f in market_symbols.get('futures', []) if 'base_symbol' in f]
+        
+        # Enrich with contract specs from futures.yaml
+        for future in futures:
+            base_symbol = future['base_symbol']
+            if base_symbol in futures_config.get('futures', {}):
+                contract_specs = futures_config['futures'][base_symbol]
+                # Add contract specs if not already present
+                if 'contract_specs' not in future:
+                    future['contract_specs'] = {
+                        'multiplier': contract_specs.get('multiplier'),
+                        'point_value': contract_specs.get('point_value'),
+                        'tick_size': contract_specs.get('tick_size'),
+                        'tick_value': contract_specs.get('tick_value'),
+                        'settlement_type': contract_specs.get('settlement_type')
+                    }
+        
+        return futures
     except Exception as e:
-        conn.rollback()
-        logger.error(f"Error saving data to database: {e}")
-        return 0
-    finally:
-        conn.close()
+        logger.error(f"Error loading futures configuration: {e}")
+        return []
 
-def override_save_market_data():
-    """Override the default save method with our simplified version."""
-    TradeStationMarketDataAgent.save_market_data = simple_save_market_data
-    logger.info("Overrode TradeStationMarketDataAgent.save_market_data with simple version")
-
-def get_active_contracts(base_symbols=['ES', 'NQ'], num_active=2):
+def get_active_contracts(future_config):
     """
     Determine the active futures contracts based on the current date.
-    Only returns contracts in the quarterly cycle: H, M, U, Z (March, June, September, December)
     
     Args:
-        base_symbols: List of base symbols to get active contracts for
-        num_active: Number of active contracts to return per symbol
+        future_config: Dictionary containing future configuration
         
     Returns:
-        Dictionary mapping base symbols to lists of active contract symbols
+        List of active contract symbols
     """
+    base_symbol = future_config['base_symbol']
+    patterns = future_config['historical_contracts']['patterns']
+    num_active = future_config['num_active_contracts']
+    
     today = datetime.now().date()
     current_month = today.month
     current_year = today.year
     
-    # Define CME quarterly cycle months
-    quarterly_months = [3, 6, 9, 12]  # H, M, U, Z (March, June, September, December)
+    # Map month codes to numbers
     month_codes = {
-        3: 'H',  # March
-        6: 'M',  # June
-        9: 'U',  # September
-        12: 'Z'  # December
+        'F': 1, 'G': 2, 'H': 3, 'J': 4, 'K': 5, 'M': 6,
+        'N': 7, 'Q': 8, 'U': 9, 'V': 10, 'X': 11, 'Z': 12
     }
     
-    active_contracts = {}
+    # Get valid patterns for this future
+    valid_patterns = [p for p in patterns if p in month_codes]
     
-    for base_symbol in base_symbols:
-        contracts = []
-        
-        # Find the next active contract month in the quarterly cycle
-        # The active contracts are the next two quarterly contracts
-        # If we're past the 3rd Friday of the current quarterly month, move to the next one
-        
-        # First, find the nearest quarterly month
-        next_quarterly_idx = 0
-        for i, month in enumerate(quarterly_months):
-            if month > current_month:
-                next_quarterly_idx = i
-                break
-        
-        # Get the next num_active quarterly contracts
-        contract_count = 0
-        idx = next_quarterly_idx
-        year = current_year
-        
-        while contract_count < num_active:
-            if idx >= len(quarterly_months):
-                idx = 0
-                year += 1
-            
-            month = quarterly_months[idx]
-            month_code = month_codes[month]
-            year_str = str(year)[-2:]
-            
-            # Check if we're past the 3rd Friday of the current month
-            # If so and this is the first contract, we should skip to the next quarterly contract
-            if contract_count == 0 and month == quarterly_months[next_quarterly_idx] and year == current_year:
-                # Calculate the 3rd Friday of the month
-                first_day = date(year, month, 1)
-                # Find the first Friday
-                days_until_friday = (4 - first_day.weekday()) % 7
-                first_friday = first_day.replace(day=1 + days_until_friday)
-                # Find the third Friday
-                third_friday = first_friday.replace(day=first_friday.day + 14)
-                
-                # If today is past the 3rd Friday, move to the next quarterly contract
-                if today > third_friday:
-                    idx += 1
-                    if idx >= len(quarterly_months):
-                        idx = 0
-                        year += 1
-                    month = quarterly_months[idx]
-                    month_code = month_codes[month]
-                    year_str = str(year)[-2:]
-            
-            contract = f"{base_symbol}{month_code}{year_str}"
-            contracts.append(contract)
-            
-            contract_count += 1
-            idx += 1
-        
-        active_contracts[base_symbol] = contracts
+    # Find the next active contract month
+    next_contracts = []
+    year = current_year
+    month_idx = 0
     
-    return active_contracts
+    while len(next_contracts) < num_active:
+        if month_idx >= len(valid_patterns):
+            month_idx = 0
+            year += 1
+        
+        month_code = valid_patterns[month_idx]
+        month = month_codes[month_code]
+        
+        # Check if we're past the expiry for this month
+        if month == current_month and year == current_year:
+            # Calculate expiry date based on the future's expiry rule
+            expiry_date = calculate_expiry_date(month, year, future_config['expiry_rule'])
+            if today > expiry_date:
+                month_idx += 1
+                continue
+        
+        # Create contract symbol
+        year_str = str(year)[-2:]
+        contract = f"{base_symbol}{month_code}{year_str}"
+        next_contracts.append(contract)
+        
+        month_idx += 1
+    
+    return next_contracts
 
-def get_contract_dates(symbol):
-    """
-    Determine the start and end dates for a futures contract.
-    For an active contract, we look back 90 days to ensure we don't miss data
-    if the script hasn't been run in a while.
-    """
-    # Parse the symbol
-    match = re.match(r'^([A-Z]{2})([FGHJKMNQUVXZ])([0-9]{2})$', symbol)
-    if not match:
-        logger.error(f"Invalid symbol format: {symbol}")
-        return None, None
+def calculate_expiry_date(month, year, expiry_rule):
+    """Calculate the expiry date based on the expiry rule."""
+    if expiry_rule['day_type'] == 'friday':
+        # Find the nth Friday of the month
+        first_day = date(year, month, 1)
+        days_until_friday = (4 - first_day.weekday()) % 7
+        first_friday = first_day.replace(day=1 + days_until_friday)
+        nth_friday = first_friday.replace(day=first_friday.day + (expiry_rule['day_number'] - 1) * 7)
+        
+        if expiry_rule.get('adjust_for_holiday', False):
+            # Adjust for holidays (simplified - would need actual holiday calendar)
+            while nth_friday.weekday() > 4:  # If it's a weekend
+                nth_friday = nth_friday.replace(day=nth_friday.day - 1)
+        
+        return nth_friday
     
-    base, month_code, year_code = match.groups()
+    elif expiry_rule['day_type'] == 'business_day':
+        # For business day rules (like CL, GC)
+        reference_day = date(year, month, expiry_rule['reference_day'])
+        days_before = expiry_rule['days_before']
+        
+        # Move back the specified number of business days
+        current_date = reference_day
+        business_days = 0
+        while business_days < days_before:
+            current_date = current_date - timedelta(days=1)
+            if current_date.weekday() < 5:  # Monday to Friday
+                business_days += 1
+        
+        return current_date
     
-    month = MONTH_CODES[month_code]
-    year = 2000 + int(year_code) if int(year_code) < 50 else 1900 + int(year_code)
+    elif expiry_rule['day_type'] == 'wednesday' and expiry_rule.get('special_rule') == 'VX_expiry':
+        # Special rule for VX futures
+        # Expire 30 days before the 3rd Friday of the following month
+        next_month = month + 1 if month < 12 else 1
+        next_year = year if month < 12 else year + 1
+        
+        first_day = date(next_year, next_month, 1)
+        days_until_friday = (4 - first_day.weekday()) % 7
+        first_friday = first_day.replace(day=1 + days_until_friday)
+        third_friday = first_friday.replace(day=first_friday.day + 14)
+        
+        return third_friday - timedelta(days=30)
     
-    # For active contracts, we fetch data from 90 days ago to ensure we don't miss any
-    # if the script hasn't been run in a while
-    today = datetime.now().date()
-    start_date = today - timedelta(days=90)
-    
-    return start_date, today
+    return None
 
-def make_direct_api_request(symbol, start_date, end_date, agent):
+def make_direct_api_request(symbol, start_date, end_date, agent, frequency='daily'):
     """
     Make a direct API request to fetch market data.
+    
+    Args:
+        symbol: The contract symbol
+        start_date: Start date for data
+        end_date: End date for data
+        agent: TradeStationMarketDataAgent instance
+        frequency: Data frequency ('1min', '15min', or 'daily')
     """
     import requests
     
@@ -277,17 +197,36 @@ def make_direct_api_request(symbol, start_date, end_date, agent):
     today = datetime.now().date()
     if end_date > today:
         end_date = today
+
+    # Map frequency to API parameters
+    frequency_map = {
+        '1min': {'interval': 1, 'unit': 'Minute'},
+        '15min': {'interval': 15, 'unit': 'Minute'},
+        'daily': {'interval': 1, 'unit': 'Daily'}
+    }
     
-    # Calculate appropriate barsback parameter for historical data
-    # We'll use a fixed value for recent data
-    bars_back = 20  # This should be enough for recent data
-    
+    if frequency not in frequency_map:
+        logger.error(f"Unsupported frequency: {frequency}")
+        return None
+
+    # Calculate barsback based on frequency and date range
+    delta_days = (end_date - start_date).days + 1
+    if frequency == 'daily':
+        barsback = delta_days
+    elif frequency == '1min':
+        # Assume 6.5 trading hours per day = 390 minutes
+        barsback = delta_days * 390
+    elif frequency == '15min':
+        # 6.5 hours = 26 bars per day
+        barsback = delta_days * 26
+    else:
+        barsback = 2000  # fallback
+
     # Build the API request URL and parameters
     endpoint = f"{agent.base_url}/marketdata/barcharts/{symbol}"
     params = {
-        "interval": 1,
-        "unit": "Daily",
-        "barsback": bars_back,
+        **frequency_map[frequency],
+        "barsback": barsback,
     }
     
     headers = {
@@ -331,10 +270,10 @@ def make_direct_api_request(symbol, start_date, end_date, agent):
             
             # Add symbol and other metadata
             df['symbol'] = symbol
-            df['interval_value'] = 1
-            df['interval_unit'] = 'daily'
+            df['interval_value'] = frequency_map[frequency]['interval']
+            df['interval_unit'] = frequency_map[frequency]['unit'].lower()
             df['adjusted'] = True
-            df['source'] = 'TradeStation API'
+            df['source'] = 'tradestation'
             df['settle'] = df['close']  # Use close as settle value
             
             # Make sure timestamp is a datetime object and handle timezone
@@ -382,42 +321,50 @@ def make_direct_api_request(symbol, start_date, end_date, agent):
         logger.error(f"API error: {response.status_code} - {response.text}")
         return None
 
-def fetch_single_contract(symbol, start_date, end_date, db_path):
+def fetch_single_contract(symbol, start_date, end_date, db_path, frequencies=None):
     """Fetch data for a single futures contract."""
-    logger.info(f"Fetching {symbol} data from {start_date} to {end_date}")
+    if frequencies is None:
+        frequencies = ['daily']  # Default to daily if no frequencies specified
+        
+    logger.info(f"Fetching {symbol} data from {start_date} to {end_date} for frequencies: {frequencies}")
     
     # Create agent with the given database path
     agent = TradeStationMarketDataAgent(database_path=db_path, verbose=True)
     
-    # Attempt to fetch data with retries
-    max_retries = 3
-    retry_count = 0
-    success = False
+    # Track results for each frequency
+    results = []
     
-    while retry_count < max_retries and not success:
-        try:
-            # Directly call the API
-            df = make_direct_api_request(symbol, start_date, end_date, agent)
-            
-            if df is not None and not df.empty:
-                logger.info(f"Successfully fetched {len(df)} rows for {symbol}")
-                # Save the data to the database
-                rows_saved = agent.save_market_data(df)
-                logger.info(f"Saved {rows_saved} rows to database for {symbol}")
-                success = True
-            else:
-                logger.warning(f"No data returned for {symbol}")
+    for frequency in frequencies:
+        # Attempt to fetch data with retries
+        max_retries = 3
+        retry_count = 0
+        success = False
+        
+        while retry_count < max_retries and not success:
+            try:
+                # Directly call the API with the specified frequency
+                df = make_direct_api_request(symbol, start_date, end_date, agent, frequency)
+                
+                if df is not None and not df.empty:
+                    logger.info(f"Successfully fetched {len(df)} rows for {symbol} ({frequency})")
+                    # Save the data to the database
+                    rows_saved = agent.save_market_data(df)
+                    logger.info(f"Saved {rows_saved} rows to database for {symbol} ({frequency})")
+                    success = True
+                    results.append((frequency, True, f"Successfully fetched {len(df)} rows"))
+                else:
+                    logger.warning(f"No data returned for {symbol} ({frequency})")
+                    retry_count += 1
+                    time.sleep(2)  # Wait before retrying
+            except Exception as e:
+                logger.error(f"Error fetching {symbol} ({frequency}): {e}")
                 retry_count += 1
                 time.sleep(2)  # Wait before retrying
-        except Exception as e:
-            logger.error(f"Error fetching {symbol}: {e}")
-            retry_count += 1
-            time.sleep(2)  # Wait before retrying
+        
+        if not success:
+            results.append((frequency, False, f"Failed to fetch after {max_retries} retries"))
     
-    if success:
-        return True, f"Successfully fetched {symbol} ({len(df)} rows)"
-    else:
-        return False, f"Failed to fetch {symbol} after {max_retries} retries"
+    return results
 
 def check_if_contract_exists(symbol, db_path):
     """Check if a contract already exists in the database."""
@@ -438,53 +385,57 @@ def check_if_contract_exists(symbol, db_path):
         return False
 
 def main():
-    """Main function to update active ES and NQ futures contracts."""
-    logger.info("Starting update of active ES and NQ futures contracts")
+    """Main function to update active futures contracts."""
+    logger.info("Starting update of active futures contracts")
     
     # Override the save method
     override_save_market_data()
     
-    # Get active contracts
-    active_contracts = get_active_contracts(['ES', 'NQ'], num_active=2)
-    
-    # Flatten the contracts list
-    all_contracts = []
-    for base_symbol, contracts in active_contracts.items():
-        all_contracts.extend(contracts)
-    
-    # Log the contracts we'll be updating
-    logger.info(f"Updating the following contracts: {', '.join(all_contracts)}")
+    # Load futures configuration
+    futures_config = load_futures_config()
+    if not futures_config:
+        logger.error("Failed to load futures configuration")
+        return
     
     # Track results
     results = []
     
-    # Fetch data for each contract
-    for symbol in all_contracts:
-        # Get contract dates
-        start_date, end_date = get_contract_dates(symbol)
+    # Process each future
+    for future_config in futures_config:
+        base_symbol = future_config['base_symbol']
+        logger.info(f"Processing {base_symbol} futures")
         
-        if start_date and end_date:
+        # Get active contracts for this future
+        active_contracts = get_active_contracts(future_config)
+        logger.info(f"Active contracts for {base_symbol}: {', '.join(active_contracts)}")
+        
+        # Get frequencies from config
+        frequencies = future_config.get('frequencies', ['daily'])
+        
+        # Fetch data for each contract
+        for symbol in active_contracts:
+            # Get contract dates (90 days back for active contracts)
+            start_date = datetime.now().date() - timedelta(days=90)
+            end_date = datetime.now().date()
+            
             # Check if the contract exists in the database
             if check_if_contract_exists(symbol, DB_PATH):
                 logger.info(f"Contract {symbol} exists, updating recent data")
             else:
                 logger.info(f"Contract {symbol} is new, fetching all available data")
             
-            # Fetch the data
-            success, message = fetch_single_contract(symbol, start_date, end_date, DB_PATH)
-            results.append((symbol, success, message))
-        else:
-            logger.error(f"Could not determine dates for {symbol}")
-            results.append((symbol, False, "Could not determine contract dates"))
+            # Fetch the data for all frequencies
+            frequency_results = fetch_single_contract(symbol, start_date, end_date, DB_PATH, frequencies)
+            results.extend([(symbol, freq, success, msg) for freq, success, msg in frequency_results])
     
     # Log summary of results
     logger.info("Update results summary:")
-    for symbol, success, message in results:
-        logger.info(f"{symbol}: {'SUCCESS' if success else 'FAILED'} - {message}")
+    for symbol, frequency, success, message in results:
+        logger.info(f"{symbol} ({frequency}): {'SUCCESS' if success else 'FAILED'} - {message}")
     
     # Print summary of successful fetches
-    successful = [r for r in results if r[1]]
-    logger.info(f"Successfully updated {len(successful)} out of {len(all_contracts)} contracts")
+    successful = [r for r in results if r[2]]
+    logger.info(f"Successfully updated {len(successful)} out of {len(results)} frequency/contract combinations")
     
     # Additional final message with next steps
     if len(successful) > 0:

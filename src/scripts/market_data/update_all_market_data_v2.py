@@ -24,7 +24,6 @@ from typing import Dict, List, Optional, Tuple, Any
 
 # Add project root to path for imports
 project_root = str(Path(__file__).resolve().parent.parent.parent.parent)
-sys.path.append(project_root)
 
 # Application imports
 from src.core.app import Application
@@ -32,6 +31,7 @@ from src.core.config import ConfigManager
 from src.processors.continuous.registry import get_registry
 from src.processors.cleaners.pipeline import DataCleaningPipeline
 from src.processors.cleaners.vx_zero_prices import VXZeroPricesCleaner
+from src.processors.continuous.panama import PanamaContractBuilder
 
 # Set up logging
 logging.basicConfig(
@@ -67,9 +67,9 @@ def parse_arguments():
     parser.add_argument("--skip-continuous", action="store_true", help="Skip continuous contract generation")
     parser.add_argument("--skip-cleaning", action="store_true", help="Skip data cleaning")
     
-    # Specific component options
-    parser.add_argument("--update-active-es-15min", action="store_true", help="Update active ES 15min data")
-    parser.add_argument("--update-active-es-1min", action="store_true", help="Update active ES 1min data")
+    # Specific component options (These are now handled by YAML frequency configuration)
+    # parser.add_argument("--update-active-es-15min", action="store_true", help="Update active ES 15min data")
+    # parser.add_argument("--update-active-es-1min", action="store_true", help="Update active ES 1min data")
     
     # Advanced options
     parser.add_argument("--lookback-days", type=int, default=5, 
@@ -95,13 +95,12 @@ def main():
     if args.dry_run:
         logger.info("DRY RUN MODE - No changes will be made")
     
-    # Initialize the application
+    app = None  # Initialize app to None
     try:
         app = Application(
-            config_path=args.config_path,
-            db_path=args.db_path,
-            read_only=args.dry_run
+            config_path=args.config_path
         )
+        app.init_database(db_path_override=args.db_path, read_only=args.dry_run)
         
         # Step 1: Update symbol metadata
         if not args.skip_metadata:
@@ -119,82 +118,124 @@ def main():
         else:
             logger.info("Skipping VIX index update")
         
-        if not args.skip_futures:
-            logger.info("Updating VX futures data...")
-            app.update_vx_futures(force_full=args.full_update)
-            logger.info("VX futures update completed")
-        else:
-            logger.info("Skipping VX futures update")
-        
-        if not args.skip_es_nq:
-            logger.info("Updating ES/NQ futures data...")
+        # Step 2b: Update Raw Futures Data (ES, NQ, VX, CL, GC, etc.) based on YAML frequencies
+        # This new section replaces the old specific calls to app.update_vx_futures(), app.update_es_futures(), app.update_nq_futures() for raw data fetching.
+        logger.info("Updating raw futures data based on configured frequencies...")
+        root_symbol_configs = app.get_continuous_contract_symbols()
+
+        processed_roots_for_raw_update = set() # To avoid double processing if a root appears multiple times (e.g. VX)
+
+        for root_cfg in root_symbol_configs:
+            base_root_symbol = root_cfg.get('root_symbol')
+            if not base_root_symbol or base_root_symbol in processed_roots_for_raw_update:
+                if base_root_symbol in processed_roots_for_raw_update:
+                    logger.debug(f"Root {base_root_symbol} already processed for raw data update via another config entry. Skipping.")
+                continue
+
+            # Check skip flags before processing frequencies for this root
+            should_skip = False
+            if base_root_symbol == 'VX':
+                if args.skip_futures: # --skip-futures is historically for VIX futures
+                    logger.info(f"Skipping raw data update for {base_root_symbol} due to --skip-futures flag.")
+                    should_skip = True
+            elif base_root_symbol in ['ES', 'NQ']:
+                if args.skip_es_nq:
+                    logger.info(f"Skipping raw data update for {base_root_symbol} due to --skip-es-nq flag.")
+                    should_skip = True
+            # Add other general future skip flags here if they exist, e.g. a hypothetical --skip-other-futures
+            # For now, CL, GC, etc., will be updated if they have frequencies and no specific skip flag applies.
+
+            if should_skip:
+                processed_roots_for_raw_update.add(base_root_symbol)
+                continue
+
+            update_frequencies = root_cfg.get('update_frequencies', [])
+            if not update_frequencies:
+                logger.info(f"No 'update_frequencies' defined in config for {base_root_symbol}. Skipping its raw data update.")
+            else:
+                logger.info(f"Processing raw data updates for {base_root_symbol} across {len(update_frequencies)} frequencies.")
+                for freq_detail in update_frequencies:
+                    logger.info(f"Updating {base_root_symbol} for interval: {freq_detail.get('interval', 'N/A')} {freq_detail.get('unit', 'N/A')}")
+                    try:
+                        # Use the new generic method in Application class
+                        app.update_future_instrument_raw_data(
+                            symbol_root=base_root_symbol,
+                            interval_unit=freq_detail['unit'],
+                            interval_value=freq_detail['interval'], # Note: YAML uses 'interval', App method uses 'interval_value'
+                            force_full=args.full_update
+                            # fetch_mode, lookback_days, roll_proximity_threshold_days will use defaults in app method
+                        )
+                    except KeyError as ke:
+                        logger.error(f"Missing 'unit' or 'interval' in frequency detail for {base_root_symbol}: {freq_detail}. Error: {ke}", exc_info=True)
+                    except Exception as e:
+                        logger.error(f"Failed to update {base_root_symbol} for frequency {freq_detail}: {e}", exc_info=True)
             
-            # Handle specific timeframes if requested
-            if args.update_active_es_15min:
-                app.update_es_futures(interval_unit="minute", interval_value=15, 
-                                    only_active=True, force_full=args.full_update)
-            
-            if args.update_active_es_1min:
-                app.update_es_futures(interval_unit="minute", interval_value=1, 
-                                    only_active=True, force_full=args.full_update)
-            
-            # Always update daily data
-            app.update_es_futures(interval_unit="daily", interval_value=1, 
-                                force_full=args.full_update)
-            
-            app.update_nq_futures(force_full=args.full_update)
-            logger.info("ES/NQ futures update completed")
-        else:
-            logger.info("Skipping ES/NQ futures update")
-        
+            processed_roots_for_raw_update.add(base_root_symbol)
+
         # Step 3: Generate continuous contracts with Panama method
         if not args.skip_continuous:
             logger.info("Generating continuous contracts with Panama method...")
             
-            # Get continuous contract registry
-            registry = get_registry()
-            
             # Get symbols that need continuous contract generation
-            symbols = app.get_continuous_contract_symbols()
+            # root_symbol_configs is a list of dicts, one for each base (ES, NQ etc.)
+            root_symbol_configs = app.get_continuous_contract_symbols() 
             
-            for symbol_config in symbols:
-                root_symbol = symbol_config['root_symbol']
-                positions = symbol_config.get('positions', [1])
+            for root_cfg in root_symbol_configs: # e.g., root_cfg for 'ES'
+                base_root_symbol = root_cfg.get('root_symbol')
+                if not base_root_symbol:
+                    logger.warning(f"Skipping root_cfg due to missing 'root_symbol': {root_cfg}")
+                    continue
                 
-                logger.info(f"Processing continuous contracts for {root_symbol}")
-                
-                for position in positions:
-                    # Create Panama contract generator
-                    generator = registry.create(
-                        'panama',
-                        root_symbol=root_symbol,
-                        position=position,
-                        ratio_limit=args.panama_ratio,
-                        db_connector=app.db_connector,
-                        roll_strategy='volume'
-                    )
+                logger.info(f"Processing Panama continuous contracts for root: {base_root_symbol}")
+
+                # Iterate through each specific continuous symbol to be generated for this root
+                specific_symbols_list = root_cfg.get('continuous_symbols_to_generate', [])
+
+                if not specific_symbols_list:
+                    logger.warning(f"No 'continuous_symbols_to_generate' found in config for {base_root_symbol}. Skipping Panama generation for it.")
+                    continue
+
+                for specific_symbol_detail in specific_symbols_list:
+                    target_continuous_symbol = specific_symbol_detail.get('symbol')
                     
-                    # Generate continuous contract
-                    if generator:
-                        # Determine date range for update
-                        lookback_date = datetime.now() - timedelta(days=args.lookback_days)
-                        lookback_str = lookback_date.strftime('%Y-%m-%d')
+                    if not target_continuous_symbol:
+                        logger.warning(f"Missing 'symbol' key in specific_symbol_detail for {base_root_symbol}. Details: {specific_symbol_detail}")
+                        continue
+
+                    # Check if this specific symbol is meant for Panama adjustment
+                    if specific_symbol_detail.get('adjustment_method') != 'panama':
+                        logger.info(f"Skipping {target_continuous_symbol} as its adjustment method is not 'panama'.")
+                        continue
                         
-                        if args.full_update:
-                            # Use None for start_date to get full history
-                            result_df = generator.generate()
-                        else:
-                            # Use lookback date for incremental update
-                            result_df = generator.generate(start_date=lookback_str)
+                    logger.info(f"Generating Panama contract for: {target_continuous_symbol} (base: {base_root_symbol})")
+                    
+                    # Create a merged config for the builder:
+                    # Start with a copy of the root_cfg (general settings for ES, NQ)
+                    builder_config = root_cfg.copy() 
+                    # Update/add specifics from the symbol detail (e.g. adjustment_method)
+                    builder_config.update(specific_symbol_detail)
+
+                    try:
+                        generator = PanamaContractBuilder(
+                            db=app.db,
+                            config=builder_config 
+                        )
                         
-                        if not args.dry_run and not result_df.empty:
-                            # Save to database
-                            app.save_continuous_contracts(result_df)
-                            
-                            logger.info(f"Generated {len(result_df)} data points for "
-                                      f"{root_symbol} position {position}")
-                    else:
-                        logger.error(f"Failed to create Panama generator for {root_symbol}")
+                        # Call the correct method: build_continuous_series
+                        # Default interval is daily/1, start/end are None (handles full range)
+                        generated_df = generator.build_continuous_series(
+                            root_symbol=base_root_symbol,
+                            continuous_symbol=target_continuous_symbol,
+                            force=args.full_update 
+                        )
+                        if generated_df is not None and not generated_df.empty:
+                            logger.info(f"Successfully generated/updated Panama series for {target_continuous_symbol}, {len(generated_df)} rows.")
+                        elif generated_df is not None and generated_df.empty:
+                            logger.info(f"Panama series generation for {target_continuous_symbol} returned empty DataFrame (might be up-to-date or no data).")
+                        else: # None returned
+                            logger.warning(f"Panama series generation for {target_continuous_symbol} returned None.")
+                    except Exception as e_gen:
+                        logger.error(f"Error generating Panama series for {target_continuous_symbol}: {e_gen}", exc_info=True)
             
             logger.info("Continuous contract generation completed")
         else:
@@ -203,11 +244,43 @@ def main():
         # Step 4: Apply data cleaning pipeline
         if not args.skip_cleaning:
             logger.info("Running data cleaning pipeline...")
+
+            # Ensure 'data_cleaning_runs' table exists
+            data_cleaning_runs_table_sql = """
+            CREATE TABLE IF NOT EXISTS data_cleaning_runs (
+                run_id VARCHAR PRIMARY KEY,
+                pipeline_name VARCHAR NOT NULL,
+                start_time TIMESTAMP NOT NULL,
+                end_time TIMESTAMP,
+                records_count INTEGER,
+                modifications_count INTEGER,
+                elapsed_time DOUBLE,
+                status VARCHAR, -- e.g., 'success', 'error', 'skipped'
+                error_message TEXT, -- For storing error details if status is 'error'
+                cleaners_applied TEXT, -- Comma-separated list of cleaner names
+                fields_modified TEXT, -- Comma-separated list of modified fields
+                log_timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP -- When this log entry was created
+            );
+            """
+            try:
+                if not app.db.table_exists('data_cleaning_runs'):
+                    logger.info("Table 'data_cleaning_runs' does not exist. Attempting to create it now...")
+                    app.db.execute(data_cleaning_runs_table_sql)
+                    if app.db.table_exists('data_cleaning_runs'):
+                        logger.info("Successfully created 'data_cleaning_runs' table.")
+                    else:
+                        logger.error("Failed to create 'data_cleaning_runs' table after execution attempt.")
+                        # Depending on criticality, you might want to raise an error or sys.exit() here
+                else:
+                    logger.debug("'data_cleaning_runs' table already exists.")
+            except Exception as e:
+                logger.error(f"Error during check/creation of 'data_cleaning_runs' table: {e}", exc_info=True)
+                # Handle error appropriately, perhaps exit if this table is critical for logging
             
             # Create data cleaning pipeline
             cleaning_pipeline = DataCleaningPipeline(
                 name="market_data_cleaner",
-                db_connector=app.db_connector,
+                db_connector=app.db,
                 config={
                     'track_performance': True,
                     'track_modifications': True,
@@ -217,7 +290,7 @@ def main():
             
             # Add cleaners to pipeline
             cleaning_pipeline.add_cleaner(VXZeroPricesCleaner(
-                db_connector=app.db_connector,
+                db_connector=app.db,
                 config={
                     'interpolation_method': 'linear',
                     'max_gap_days': 5,
@@ -275,6 +348,9 @@ def main():
     except Exception as e:
         logger.error(f"Error during market data update: {e}", exc_info=True)
         return 1
+    finally:
+        if app:
+            app.close() # Ensure app is closed if it was initialized
 
 if __name__ == "__main__":
     sys.exit(main())

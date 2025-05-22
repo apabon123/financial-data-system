@@ -23,6 +23,7 @@ from .core.config import get_config
 from .modules.sql_executor import get_sql_executor
 from .modules.schema_browser import get_schema_browser
 from .modules.data_quality import get_quality_analyzer
+from .utils.terminal import run_terminal_cmd
 
 # Setup logging
 logger = logging.getLogger(__name__)
@@ -200,7 +201,7 @@ class DBInspectorCLI:
                 "Market Structure Tools",
                 "Data Management",
                 "Database Information",
-                "Backup/Restore",
+                "Update/Backup/Restore",
                 "Exit"
             ]
             
@@ -220,7 +221,7 @@ class DBInspectorCLI:
             elif choice == '5':
                 self.data_management_menu()
             elif choice == '6':
-                self.show_database_info()
+                self.database_info_menu()
             elif choice == '7':
                 self.backup_restore_menu()
             elif choice == '8':
@@ -248,13 +249,13 @@ class DBInspectorCLI:
         if choice == '1':
             self.console.print("Futures contract analysis not yet implemented")
         elif choice == '2':
-            self.console.print("Continuous contract explorer not yet implemented")
+            self.console.print("Continuous contract exploration not yet implemented")
         elif choice == '3':
             self.console.print("Roll calendar visualization not yet implemented")
         elif choice == '4':
             self.console.print("Correlation matrix not yet implemented")
         elif choice == '5':
-            self.console.print("Volatility/volume profile not yet implemented")
+            self.console.print("Volatility/Volume profile not yet implemented")
         elif choice == '6':
             return
     
@@ -297,6 +298,7 @@ class DBInspectorCLI:
             "Create Backup",
             "Restore from Backup",
             "List Backups",
+            "Update Market Data",
             "Back to Main Menu"
         ]
         
@@ -312,8 +314,50 @@ class DBInspectorCLI:
         elif choice == '3':
             self.list_backups()
         elif choice == '4':
+            self._run_market_data_update_script()
+        elif choice == '5':
             return
     
+    def _run_market_data_update_script(self) -> None:
+        """Runs the specified market data update batch script."""
+        script_path = r"C:\Users\alexp\OneDrive\Gdrive\Trading\GitHub Projects\data-management\financial-data-system\update_market_data_v2.bat"
+        self.console.print(f"\n[bold yellow]Attempting to run market data update script:[/bold yellow]\n{script_path}")
+        
+        confirm_run = Confirm.ask("Do you want to proceed?", default=True)
+        if not confirm_run:
+            self.console.print("[italic]Market data update cancelled.[/italic]")
+            return
+
+        self.console.print("[italic blue]Executing script...[/italic blue]")
+        logger.info(f"User confirmed to run market data update script: {script_path}")
+        
+        # Close database connection before running script
+        self.console.print("[italic blue]Closing database connection...[/italic blue]")
+        self.app.shutdown()
+        
+        try:
+            # Execute the command using run_terminal_cmd
+            run_terminal_cmd(
+                command=f'"{script_path}"',
+                is_background=False,
+                require_user_approval=True,
+                explanation="Execute the market data update batch script."
+            )
+            
+            # Reinitialize app and database connection
+            self.console.print("[italic blue]Reopening database connection...[/italic blue]")
+            self.app = get_app()
+            if self.args.database:
+                self.app = get_app(self.args.database, not self.args.write)
+            
+        except Exception as e:
+            # Reinitialize app and database connection even if script fails
+            self.console.print("[italic blue]Reopening database connection...[/italic blue]")
+            self.app = get_app()
+            if self.args.database:
+                self.app = get_app(self.args.database, not self.args.write)
+            raise e
+
     def create_backup(self) -> None:
         """Create a database backup."""
         if self.app.db_manager.read_only:
@@ -460,6 +504,183 @@ class DBInspectorCLI:
         self.app.shutdown()
         self.console.print("[bold green]Goodbye![/bold green]")
 
+    def database_info_menu(self) -> None:
+        """Display database information menu."""
+        while True:
+            self.console.print("\n[bold cyan]Database Information[/bold cyan]")
+            options = [
+                "Show General Info",
+                "Generate Data Summary Report",
+                "Back to Main Menu"
+            ]
+            for i, option in enumerate(options, 1):
+                self.console.print(f"{i}. {option}")
+            
+            choice = Prompt.ask("Enter your choice", choices=[str(i) for i in range(1, len(options) + 1)])
+
+            if choice == '1':
+                self.show_database_info()
+            elif choice == '2':
+                self.generate_data_summary_report()
+            elif choice == '3':
+                break
+
+    def generate_data_summary_report(self) -> None:
+        """Generates and displays a summary report for key market data tables,
+        optionally filtered by a root symbol."""
+        self.console.print("\n[bold cyan]Generating Data Summary Report...[/bold cyan]")
+
+        root_symbol_input = Prompt.ask(
+            "Enter root symbol (e.g., ES, VX) or leave blank for all", default=""
+        ).strip().upper()
+
+        base_queries = {
+            "market_data": """
+                SELECT
+                    symbol,
+                    interval_value,
+                    interval_unit,
+                    source,
+                    MIN(timestamp) AS first_date,
+                    MAX(timestamp) AS last_date,
+                    COUNT(*) AS observation_count
+                FROM market_data
+                {where_clause}
+                GROUP BY symbol, interval_value, interval_unit, source
+                ORDER BY
+                    interval_unit,
+                    interval_value,
+                    CASE
+                        WHEN SUBSTRING(symbol FROM LENGTH(symbol)-1 FOR 2) ~ '^[0-9]{{2}}$'
+                        THEN CAST(SUBSTRING(symbol FROM LENGTH(symbol)-1 FOR 2) AS INTEGER)
+                        ELSE NULL
+                    END,
+                    CASE
+                        WHEN SUBSTRING(symbol FROM LENGTH(symbol)-1 FOR 2) ~ '^[0-9]{{2}}$' AND LENGTH(symbol) > 2
+                        THEN
+                            CASE SUBSTRING(symbol FROM LENGTH(symbol)-2 FOR 1)
+                                WHEN 'F' THEN 1 WHEN 'G' THEN 2 WHEN 'H' THEN 3 WHEN 'J' THEN 4
+                                WHEN 'K' THEN 5 WHEN 'M' THEN 6 WHEN 'N' THEN 7 WHEN 'Q' THEN 8
+                                WHEN 'U' THEN 9 WHEN 'V' THEN 10 WHEN 'X' THEN 11 WHEN 'Z' THEN 12
+                                ELSE 99
+                            END
+                        ELSE 99
+                    END,
+                    symbol,
+                    source;
+            """,
+            "market_data_cboe": """
+                SELECT
+                    symbol,
+                    interval_value,
+                    interval_unit,
+                    source,
+                    MIN(timestamp) AS first_date,
+                    MAX(timestamp) AS last_date,
+                    COUNT(*) AS observation_count
+                FROM market_data_cboe
+                {where_clause}
+                GROUP BY symbol, interval_value, interval_unit, source
+                ORDER BY
+                    interval_unit,
+                    interval_value,
+                    CASE
+                        WHEN SUBSTRING(symbol FROM LENGTH(symbol)-1 FOR 2) ~ '^[0-9]{{2}}$'
+                        THEN CAST(SUBSTRING(symbol FROM LENGTH(symbol)-1 FOR 2) AS INTEGER)
+                        ELSE NULL
+                    END,
+                    CASE
+                        WHEN SUBSTRING(symbol FROM LENGTH(symbol)-1 FOR 2) ~ '^[0-9]{{2}}$' AND LENGTH(symbol) > 2
+                        THEN
+                            CASE SUBSTRING(symbol FROM LENGTH(symbol)-2 FOR 1)
+                                WHEN 'F' THEN 1 WHEN 'G' THEN 2 WHEN 'H' THEN 3 WHEN 'J' THEN 4
+                                WHEN 'K' THEN 5 WHEN 'M' THEN 6 WHEN 'N' THEN 7 WHEN 'Q' THEN 8
+                                WHEN 'U' THEN 9 WHEN 'V' THEN 10 WHEN 'X' THEN 11 WHEN 'Z' THEN 12
+                                ELSE 99
+                            END
+                        ELSE 99
+                    END,
+                    symbol,
+                    source;
+            """,
+            "continuous_contracts": """
+                SELECT
+                    symbol,
+                    interval_value,
+                    interval_unit,
+                    source,
+                    MIN(timestamp) AS first_date,
+                    MAX(timestamp) AS last_date,
+                    COUNT(*) AS observation_count
+                FROM continuous_contracts
+                {where_clause}
+                GROUP BY symbol, interval_value, interval_unit, source
+                ORDER BY
+                    interval_unit,
+                    interval_value,
+                    CASE
+                        WHEN SUBSTRING(symbol FROM LENGTH(symbol)-1 FOR 2) ~ '^[0-9]{{2}}$'
+                        THEN CAST(SUBSTRING(symbol FROM LENGTH(symbol)-1 FOR 2) AS INTEGER)
+                        ELSE NULL
+                    END,
+                    CASE
+                        WHEN SUBSTRING(symbol FROM LENGTH(symbol)-1 FOR 2) ~ '^[0-9]{{2}}$' AND LENGTH(symbol) > 2
+                        THEN
+                            CASE SUBSTRING(symbol FROM LENGTH(symbol)-2 FOR 1)
+                                WHEN 'F' THEN 1 WHEN 'G' THEN 2 WHEN 'H' THEN 3 WHEN 'J' THEN 4
+                                WHEN 'K' THEN 5 WHEN 'M' THEN 6 WHEN 'N' THEN 7 WHEN 'Q' THEN 8
+                                WHEN 'U' THEN 9 WHEN 'V' THEN 10 WHEN 'X' THEN 11 WHEN 'Z' THEN 12
+                                ELSE 99
+                            END
+                        ELSE 99
+                    END,
+                    symbol,
+                    source;
+            """
+        }
+
+        where_clause_sql = ""
+        if root_symbol_input:
+            # Escape single quotes in root_symbol_input to prevent SQL injection
+            # हालांकि, LIKE पैटर्न में, हमें % वाइल्डकार्ड की अनुमति देनी चाहिए
+            # इसलिए, हम केवल सिंगल कोट्स को एस्केप करेंगे।
+            safe_root_symbol = root_symbol_input.replace("'", "''")
+            where_clause_sql = f"WHERE (symbol LIKE '{safe_root_symbol}%' OR symbol LIKE '@{safe_root_symbol}%')"
+            self.console.print(f"[italic blue]Filtering by root symbol: {root_symbol_input}[/italic blue]")
+        else:
+            # Ensures a valid query even if no specific where clause is needed.
+            # Some DBs might require a WHERE clause if others are conditional.
+            # For DuckDB, an empty string for {where_clause} in f-string formatting is fine.
+             where_clause_sql = " " # Add a space to maintain formatting if no WHERE clause
+
+        for table_name, base_query_template in base_queries.items():
+            query = base_query_template.format(where_clause=where_clause_sql)
+            
+            self.console.print(f"\n[bold green]Summary for {table_name}:[/bold green]")
+            try:
+                result = self.app.db_manager.execute_query(query)
+                
+                if result.is_success and not result.is_empty:
+                    summary_table = Table(box=SIMPLE)
+                    # Add columns based on the first row's keys, if dataframe exists
+                    if result.dataframe is not None and not result.dataframe.empty:
+                        for col_name in result.dataframe.columns:
+                            summary_table.add_column(col_name.replace('_', ' ').title())
+                        
+                        for index, row in result.dataframe.iterrows():
+                            summary_table.add_row(*(str(row[col]) for col in result.dataframe.columns))
+                        self.console.print(summary_table)
+                    else:
+                        self.console.print("No data found or dataframe is empty.")
+                        
+                elif not result.is_success:
+                    self.console.print(f"[red]Error executing query for {table_name}: {result.error}[/red]")
+                else: # result.is_empty
+                    self.console.print("No data found in this table matching the criteria.")
+            except Exception as e:
+                self.console.print(f"[red]Failed to generate summary for {table_name}: {e}[/red]")
+                logger.error(f"Error generating summary for {table_name}: {e}", exc_info=True)
+
 def main():
     """Main entry point for DB Inspector CLI."""
     try:
@@ -476,7 +697,6 @@ def main():
         print("An unexpected error occurred. Check the logs for details.")
 
         if "--debug" in sys.argv:
-            import traceback
             print("\nDetailed error information (debug mode):")
             traceback.print_exc()
 

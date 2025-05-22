@@ -194,6 +194,22 @@ CREATE TABLE IF NOT EXISTS continuous_contracts (
     PRIMARY KEY (timestamp, symbol, interval_value, interval_unit)
 );
 
+-- Data Cleaning Runs Log Table
+CREATE TABLE IF NOT EXISTS data_cleaning_runs (
+    run_id VARCHAR PRIMARY KEY,
+    pipeline_name VARCHAR NOT NULL,
+    start_time TIMESTAMP NOT NULL,
+    end_time TIMESTAMP,
+    records_count INTEGER,
+    modifications_count INTEGER,
+    elapsed_time DOUBLE, -- Or REAL, depending on DuckDB precision preference for seconds
+    status VARCHAR, -- e.g., 'success', 'error', 'skipped'
+    error_message TEXT, -- For storing error details if status is 'error'
+    cleaners_applied TEXT, -- Comma-separated list of cleaner names
+    fields_modified TEXT, -- Comma-separated list of modified fields
+    log_timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP -- When this log entry was created
+);
+
 -- Create standard views
 
 -- Daily Bars View

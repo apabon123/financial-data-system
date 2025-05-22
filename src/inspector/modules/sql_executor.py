@@ -29,7 +29,7 @@ try:
     from prompt_toolkit.lexers import PygmentsLexer
     from prompt_toolkit.styles import Style
     from prompt_toolkit.completion import WordCompleter
-    from prompt_toolkit.filters import Condition
+    from prompt_toolkit.filters import Condition, has_completions
     from prompt_toolkit.key_binding import KeyBindings
     HAS_PROMPT_TOOLKIT = True
 except ImportError:
@@ -88,9 +88,25 @@ class SQLExecutor:
 
             @kb.add('f2')
             def _(event):
-                """Run query."""
+                """Run query, display results, and clear buffer."""
                 buffer = event.app.current_buffer
-                self.execute_query(buffer.text)
+                query_text = buffer.text
+                
+                if query_text.strip():
+                    # print(f"SQL> {query_text.rstrip()}") # Optional: echo the query
+                    start_time = time.time()
+                    result = self.execute_query(query_text)
+                    elapsed = time.time() - start_time
+                    
+                    if result.is_success:
+                        if not result.is_empty:
+                            self._display_result_table(result, elapsed)
+                        else:
+                            print(f"Query executed successfully in {elapsed:.2f}s, but returned no results.")
+                    else:
+                        print(f"Query error: {result.error}")
+                    buffer.text = "" # Clear buffer after execution
+                event.app.invalidate()
 
             @kb.add('f3')
             def _(event):
@@ -102,6 +118,28 @@ class SQLExecutor:
             def _(event):
                 """Show tables."""
                 self.show_tables()
+
+            @kb.add('escape')
+            def _(event):
+                """Dismiss completion menu."""
+                buffer = event.app.current_buffer
+                if buffer.complete_state:
+                    buffer.complete_state = None
+                event.app.invalidate()
+
+            # Conditional 'Enter' for accepting completions
+            @kb.add('enter', filter=has_completions, eager=True)
+            def _(event):
+                """Accept current completion if completion menu is visible."""
+                buffer = event.app.current_buffer
+                if buffer.complete_state and buffer.complete_state.current_completion:
+                    buffer.apply_completion(buffer.complete_state.current_completion)
+                # Explicitly clear completion state after applying
+                # to prevent any other Enter handlers from acting on it
+                # and to ensure the UI updates correctly.
+                if buffer.complete_state is not None: # Check before accessing
+                    buffer.complete_state = None 
+                event.app.invalidate() # Request a redraw
 
             # Set up lexer if pygments is available
             lexer = None
@@ -115,7 +153,9 @@ class SQLExecutor:
                 lexer=lexer,
                 completer=self.completer,
                 style=style,
-                key_bindings=kb
+                key_bindings=kb,
+                complete_while_typing=False,
+                enable_history_search=True
             )
         else:
             self.session = None
@@ -465,7 +505,34 @@ class SQLExecutor:
 
                 # Get query from user
                 try:
-                    query = self.session.prompt('SQL> ', multiline=True)
+                    # Revised loop for Alt+Enter submission
+                    query_from_multiline_submit = self.session.prompt('SQL> ', multiline=True)
+
+                    if query_from_multiline_submit: # prompt_toolkit returns None on Ctrl-D (EOF)
+                        if query_from_multiline_submit.strip(): # Check if it's not just empty due to F2 clearing
+                            # This block handles Alt+Enter submission
+                            start_time = time.time()
+                            result = self.execute_query(query_from_multiline_submit)
+                            elapsed = time.time() - start_time
+
+                            if result.is_success:
+                                if not result.is_empty:
+                                    self._display_result_table(result, elapsed)
+                                else:
+                                    print(f"Query executed successfully in {elapsed:.2f}s, but returned no results.")
+                            else:
+                                print(f"Query error: {result.error}")
+                        # If F2 was pressed, its binding handled everything, and buffer was cleared.
+                        # query_from_multiline_submit might be empty if F2 clears before prompt returns,
+                        # or it might be the text F2 processed if clearing happens after.
+                        # The F2 binding now clears its own buffer, so this path should be safe.
+                    else: # None typically means EOF (Ctrl-D)
+                        print("\nExiting SQL mode.")
+                        break
+
+                except EOFError: # Should be caught if prompt returns None or raises it directly
+                    print("\nExiting SQL mode.")
+                    break # Exit the while True loop
                 except Exception as e:
                     logger.error(f"Error in prompt session: {e}")
                     print(f"Error in prompt session: {e}")
@@ -473,23 +540,23 @@ class SQLExecutor:
                     return
 
                 # Execute query
-                start_time = time.time()
-                result = self.execute_query(query)
-                elapsed = time.time() - start_time
+                # This block is now largely handled by the F2 binding or the explicit Alt+Enter submission block above.
+                # We can remove or comment out this section if F2 and Alt+Enter cover all execution paths.
+                # start_time = time.time()
+                # result = self.execute_query(query) # 'query' is undefined here now
+                # elapsed = time.time() - start_time
 
-                # Display result
-                if result.is_success:
-                    if not result.is_empty:
-                        # Print result as table
-                        self._display_result_table(result, elapsed)
-                    else:
-                        print(f"Query executed successfully in {elapsed:.2f}s, but returned no results.")
-                else:
-                    print(f"Query error: {result.error}")
+                # # Display result
+                # if result.is_success:
+                #     if not result.is_empty:
+                #         # Print result as table
+                #         self._display_result_table(result, elapsed)
+                #     else:
+                #         print(f"Query executed successfully in {elapsed:.2f}s, but returned no results.")
+                # else:
+                #     print(f"Query error: {result.error}")
         except KeyboardInterrupt:
             pass
-        except EOFError:
-            print("\nExiting SQL mode.")
         except Exception as e:
             logger.error(f"Unexpected error in interactive mode: {e}")
             print(f"Unexpected error in interactive mode: {e}")

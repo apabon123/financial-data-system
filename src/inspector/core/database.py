@@ -4,12 +4,14 @@ Database module for DB Inspector.
 This module handles database connections and operations for the DB Inspector tool.
 """
 
+import os
 import time
 import logging
 import duckdb
 import pandas as pd
 from pathlib import Path
 from typing import Dict, Any, List, Optional, Union, Tuple, Set
+import shutil
 
 from .config import get_config
 
@@ -113,12 +115,13 @@ class DatabaseManager:
             self.connection = None
             logger.info("Database connection closed")
     
-    def execute_query(self, query: str) -> QueryResult:
+    def execute_query(self, query: str, params: Optional[List[Any]] = None) -> QueryResult:
         """
         Execute a SQL query.
         
         Args:
             query: SQL query to execute
+            params: Optional list of parameters for the query
             
         Returns:
             QueryResult object
@@ -128,6 +131,7 @@ class DatabaseManager:
         if not self.connection:
             self.connect()
             if not self.connection:
+                self.performance_stats["failed_queries"] += 1 # Count as failed if no connection
                 return QueryResult(
                     error="No database connection",
                     query=query,
@@ -137,7 +141,10 @@ class DatabaseManager:
         start_time = time.time()
         try:
             # Execute query
-            result_relation = self.connection.execute(query)
+            if params:
+                result_relation = self.connection.execute(query, parameters=params)
+            else:
+                result_relation = self.connection.execute(query)
             
             # Process result
             if result_relation is None:
@@ -397,7 +404,7 @@ class DatabaseManager:
         if not backup_path:
             backup_dir = Path(config.get("paths", "backup"))
             timestamp = time.strftime("%Y%m%d_%H%M%S")
-            backup_path = backup_dir / f"financial_data_backup_{timestamp}.duckdb"
+            backup_path = backup_dir / f"financial_data_{timestamp}.duckdb"
         else:
             backup_path = Path(backup_path)
         
@@ -405,14 +412,19 @@ class DatabaseManager:
             # Make sure backup directory exists
             os.makedirs(os.path.dirname(backup_path), exist_ok=True)
             
-            # Create backup
-            result = self.execute_query(f"EXPORT DATABASE '{backup_path}'")
+            # Close the connection to ensure all data is flushed
+            self.close()
             
-            if result.is_success:
-                return True, f"Database backup created at {backup_path}"
-            else:
-                return False, f"Error creating backup: {result.error}"
+            # Create backup by copying the database file
+            shutil.copy2(self.db_path, backup_path)
+            
+            # Reconnect to the database
+            self.connect()
+            
+            return True, f"Database backup created at {backup_path}"
         except Exception as e:
+            # Try to reconnect
+            self.connect()
             return False, f"Error creating backup: {e}"
     
     def restore_database(self, backup_path: Union[str, Path]) -> Tuple[bool, str]:

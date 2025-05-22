@@ -4,6 +4,7 @@ duckdb>=1.2.1
 numpy>=1.24.0
 pyyaml>=6.0.1
 rich>=13.7.0
+jsonschema>=4.0.0
 
 # Visualization dependencies
 matplotlib>=3.7.0

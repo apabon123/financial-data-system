@@ -25,7 +25,7 @@ PROJECT_ROOT = Path(__file__).parent.parent.resolve()
 
 # Import core components
 from .core import get_app
-from .core.config import load_config
+from .core.config import init_config
 from .core.database import get_database
 from .core.logging import configure_logging
 
@@ -39,7 +39,7 @@ from .processors.cleaners import DataCleanerRegistry
 __all__ = [
     '__version__',
     'get_app',
-    'load_config',
+    'init_config',
     'get_database',
     'configure_logging',
     'DataSourceRegistry',

@@ -35,6 +35,16 @@ class DataCleaner(ABC):
         self.db = db
         self.config = config
         self.name = config.get('name', self.__class__.__name__)
+        self.enabled = config.get('enabled', True)
+        self.priority = config.get('priority', 100) # Default priority
+        self.description = config.get('description', 'Base data cleaner')
+        
+        # Initialize tracking attributes
+        self._modifications_count = 0
+        self._cleaned_records_count = 0 # Number of records processed by clean()
+        self._recent_modifications = [] # Store details of recent changes
+        self._max_recent_modifications = config.get('max_recent_modifications', 100)
+        self.log_all_modifications = config.get('log_all_modifications', False)
         
         logger.info(f"Initialized data cleaner: {self.name}")
     
@@ -290,6 +300,67 @@ class DataCleaner(ABC):
         except Exception as e:
             logger.error(f"Error interpolating missing values: {e}")
             raise DataCleanerError(f"Failed to interpolate missing values: {e}")
+
+    def log_modification(
+        self,
+        timestamp: datetime,
+        symbol: str,
+        field: str,
+        old_value: Any,
+        new_value: Any,
+        reason: str,
+        details: Optional[str] = None
+    ) -> None:
+        """
+        Log a modification made by the cleaner.
+        Increments modification count and stores details.
+        """
+        self._modifications_count += 1
+        modification_details = {
+            'timestamp': timestamp,
+            'symbol': symbol,
+            'field': field,
+            'old_value': old_value,
+            'new_value': new_value,
+            'reason': reason,
+            'details': details,
+            'cleaner': self.name,
+            'log_time': datetime.now()
+        }
+        
+        if self.log_all_modifications:
+            # Log to central logger or specific modification log if configured
+            logger.debug(f"Modification by {self.name}: {modification_details}")
+            
+        # Keep track of recent modifications
+        self._recent_modifications.append(modification_details)
+        if len(self._recent_modifications) > self._max_recent_modifications:
+            self._recent_modifications.pop(0) # Keep the list size bounded
+
+    def get_recent_modifications(self) -> List[Dict[str, Any]]:
+        """Return the list of recent modifications."""
+        return self._recent_modifications
+
+    def get_modification_stats(self) -> Dict[str, Any]:
+        """
+        Return statistics about modifications made by this cleaner.
+        """
+        return {
+            'name': self.name,
+            'modifications_count': self._modifications_count,
+            'cleaned_records_count': self._cleaned_records_count,
+            'enabled': self.enabled,
+            'priority': self.priority
+        }
+
+    def reset_stats(self) -> None:
+        """
+        Reset the modification and record counts for this cleaner.
+        """
+        self._modifications_count = 0
+        self._cleaned_records_count = 0
+        self._recent_modifications = []
+        logger.debug(f"Stats reset for cleaner: {self.name}")
 
 
 class DataCleanerRegistry:
