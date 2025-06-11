@@ -51,7 +51,7 @@ except ImportError:
         def __init__(self, text=""):
             self.text = text
 
-from ..core.app import get_app
+from ..core.app import get_app, DBInspectorApp
 from ..core.config import get_config
 from ..core.schema import get_schema_manager
 
@@ -61,9 +61,9 @@ logger = logging.getLogger(__name__)
 class SchemaBrowser:
     """Interactive database schema browser with visualization capabilities."""
     
-    def __init__(self):
+    def __init__(self, app_context: Optional[DBInspectorApp] = None):
         """Initialize schema browser."""
-        self.app = get_app()
+        self.app = app_context if app_context else get_app()
         self.config = get_config()
         self.schema_manager = get_schema_manager()
         self.console = Console()
@@ -564,18 +564,18 @@ class SchemaBrowser:
         print(help_text)
 
 # Global instance
-schema_browser = None
+schema_browser_instance: Optional[SchemaBrowser] = None
 
-def get_schema_browser() -> SchemaBrowser:
+def get_schema_browser(app_context: Optional[DBInspectorApp] = None) -> SchemaBrowser:
     """
     Get the global schema browser instance.
-    
-    Returns:
-        Global schema browser instance
+    If app_context is provided, it can be used to create a new instance.
     """
-    global schema_browser
+    global schema_browser_instance
     
-    if schema_browser is None:
-        schema_browser = SchemaBrowser()
+    if app_context is not None or schema_browser_instance is None:
+        schema_browser_instance = SchemaBrowser(app_context=app_context)
+    elif schema_browser_instance.app != (app_context if app_context else get_app()):
+        schema_browser_instance = SchemaBrowser(app_context=app_context)
         
-    return schema_browser
+    return schema_browser_instance

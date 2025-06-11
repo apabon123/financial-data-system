@@ -44,7 +44,7 @@ except ImportError:
     HAS_RICH = False
     logging.error("Rich is not installed. CLI interface will be degraded.")
 
-from ..core.app import get_app
+from ..core.app import get_app, DBInspectorApp
 from ..core.config import get_config
 from ..core.database import QueryResult
 
@@ -54,9 +54,9 @@ logger = logging.getLogger(__name__)
 class SQLExecutor:
     """Interactive SQL query executor with syntax highlighting."""
 
-    def __init__(self):
+    def __init__(self, app_context: Optional[DBInspectorApp] = None):
         """Initialize SQL executor."""
-        self.app = get_app()
+        self.app = app_context if app_context else get_app()
         self.config = get_config()
 
         # Check for required dependencies
@@ -701,18 +701,24 @@ class SQLExecutor:
             print(f"Unexpected error: {e}")
 
 # Global instance
-sql_executor = None
+sql_executor_instance: Optional[SQLExecutor] = None
 
-def get_sql_executor() -> SQLExecutor:
+def get_sql_executor(app_context: Optional[DBInspectorApp] = None) -> SQLExecutor:
     """
     Get the global SQL executor instance.
-    
-    Returns:
-        Global SQL executor instance
+    If app_context is provided, it can be used to create a new instance or reconfigure an existing one.
     """
-    global sql_executor
+    global sql_executor_instance
     
-    if sql_executor is None:
-        sql_executor = SQLExecutor()
+    # If an instance specific to an app context is needed, or if no instance exists,
+    # create a new one. This is a simplified model; for true multi-app-context
+    # scenarios, a dictionary mapping contexts to instances might be better.
+    if app_context is not None or sql_executor_instance is None:
+        # If re-creating with a new context, ensure the old one (if global) is replaced.
+        sql_executor_instance = SQLExecutor(app_context=app_context)
+    elif sql_executor_instance.app != (app_context if app_context else get_app()):
+        # If the existing global instance's app context doesn't match the implicitly
+        # or explicitly requested one, re-create.
+        sql_executor_instance = SQLExecutor(app_context=app_context)
         
-    return sql_executor
+    return sql_executor_instance

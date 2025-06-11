@@ -9,6 +9,8 @@ import sys
 import logging
 import argparse
 import traceback
+import subprocess
+import time # Added for delay
 from pathlib import Path
 from typing import Dict, Any, List, Optional, Union, Tuple, Set
 
@@ -18,7 +20,7 @@ from rich.table import Table
 from rich.box import SIMPLE
 from rich.prompt import Prompt, Confirm
 
-from .core.app import get_app
+from .core.app import get_app, close_and_clear_global_app_instance
 from .core.config import get_config
 from .modules.sql_executor import get_sql_executor
 from .modules.schema_browser import get_schema_browser
@@ -269,6 +271,7 @@ class DBInspectorCLI:
             "Clean/Filter Data",
             "Delete Old Contracts",
             "Manage Symbol Metadata",
+            "Generate Continuous Futures Series",
             "Back to Main Menu"
         ]
         
@@ -288,8 +291,147 @@ class DBInspectorCLI:
         elif choice == '5':
             self.console.print("Symbol metadata manager not yet implemented")
         elif choice == '6':
+            self._generate_continuous_futures_series()
+        elif choice == '7':
             return
     
+    def _generate_continuous_futures_series(self) -> None:
+        """Prompt for parameters and run the generate_back_adjusted_futures.py script."""
+        self.console.print("\n[bold cyan]Generate Continuous Futures Series[/bold cyan]")
+        self.console.print("This will run the `src/scripts/scripts/generate_back_adjusted_futures.py` script.")
+
+        try:
+            # Get Python executable
+            python_executable = sys.executable
+            if not python_executable:
+                self.console.print("[bold red]Error: Could not determine Python executable path.[/bold red]")
+                return
+
+            # Get script path (assuming execution from project root)
+            # Resolve script path relative to the project root.
+            # Assuming this cli.py file is at src/inspector/cli.py
+            project_root = Path(__file__).resolve().parents[2]
+            script_path = project_root / "src" / "scripts" / "scripts" / "generate_back_adjusted_futures.py"
+            
+            if not script_path.exists():
+                self.console.print(f"[bold red]Error: Script not found at {script_path}[/bold red]")
+                self.console.print("Ensure you are running from the project's root directory and the script exists.")
+                return
+
+            # --- Prompt for parameters ---
+            root_symbol = Prompt.ask("Enter Root Symbol (e.g., ES, NQ)")
+            if not root_symbol.strip():
+                self.console.print("[bold red]Root Symbol cannot be empty.[/bold red]")
+                return
+
+            roll_type = Prompt.ask("Enter Roll Type (e.g., 01X, volume)")
+            if not roll_type.strip():
+                self.console.print("[bold red]Roll Type cannot be empty.[/bold red]")
+                return
+
+            contract_position_str = Prompt.ask("Enter Contract Position (e.g., 1, 2)", default="1")
+            try:
+                contract_position = int(contract_position_str)
+                if contract_position <= 0:
+                    raise ValueError("Contract position must be positive.")
+            except ValueError as e:
+                self.console.print(f"[bold red]Invalid Contract Position: {e}. Must be a positive integer.[/bold red]")
+                return
+
+            interval_value_str = Prompt.ask("Enter Interval Value (e.g., 1, 15)")
+            try:
+                interval_value = int(interval_value_str)
+                if interval_value <= 0:
+                    raise ValueError("Interval value must be positive.")
+            except ValueError as e:
+                self.console.print(f"[bold red]Invalid Interval Value: {e}. Must be a positive integer.[/bold red]")
+                return
+            
+            interval_unit = Prompt.ask("Enter Interval Unit", choices=["minute", "daily", "hour"], default="daily")
+            
+            adjustment_type = Prompt.ask("Enter Adjustment Type (C for constant, N for none)", choices=["C", "N"], default="C")
+
+            # Hardcoded values from batch script
+            output_symbol_suffix = "_d"
+            source_identifier_base = "inhouse_backadj"
+
+            # Optional flags
+            cmd_flags = []
+            if Confirm.ask("Force delete existing data for this symbol?", default=False):
+                cmd_flags.append("--force-delete")
+            
+            if Confirm.ask("Recreate table on PK mismatch (DEV ONLY)?", default=False):
+                self.console.print("[bold red]WARNING: --recreate-table-on-pk-mismatch is a developer option and can lead to data loss. Use with extreme caution.[/bold red]")
+                if Confirm.ask("Are you sure you want to enable --recreate-table-on-pk-mismatch?", default=False):
+                    cmd_flags.append("--recreate-table-on-pk-mismatch")
+                else:
+                    self.console.print("[italic]--recreate-table-on-pk-mismatch was NOT enabled.[/italic]")
+
+
+            # Construct command
+            command_to_run = [
+                str(python_executable), str(script_path),
+                "--root-symbol", root_symbol,
+                "--roll-type", roll_type,
+                "--contract-position", str(contract_position),
+                "--interval-value", str(interval_value),
+                "--interval-unit", interval_unit,
+                "--adjustment-type", adjustment_type,
+                "--output-symbol-suffix", output_symbol_suffix,
+                "--source-identifier", source_identifier_base
+            ]
+            command_to_run.extend(cmd_flags)
+
+            self.console.print("\n[bold yellow]The following command will be executed:[/bold yellow]")
+            self.console.print(f"`{' '.join(command_to_run)}`")
+            
+            if not Confirm.ask("\nRun this command?", default=True):
+                self.console.print("[italic]Operation cancelled by user.[/italic]")
+                return
+
+            # Execute script
+            self.console.print("\n[italic blue]Attempting to close database connection before script execution...[/italic blue]")
+            close_and_clear_global_app_instance()
+            
+            # Add a small delay to allow OS to release file locks
+            time.sleep(0.5) 
+            
+            self.console.print(f"[italic blue]Executing script: {script_path}...[/italic blue]")
+            process = subprocess.run(command_to_run, capture_output=True, text=True, check=False)
+            
+            self.console.print("\n[bold green]Script Standard Output:[/bold green]")
+            if process.stdout:
+                self.console.print(process.stdout)
+            else:
+                self.console.print("[italic]No standard output.[/italic]")
+
+            if process.stderr:
+                self.console.print("\n[bold red]Script Standard Error:[/bold red]")
+                self.console.print(process.stderr)
+            
+            if process.returncode == 0:
+                self.console.print("\n[bold green]Script executed successfully.[/bold green]")
+            else:
+                self.console.print(f"\n[bold red]Script failed with exit code {process.returncode}.[/bold red]")
+
+        except Exception as e:
+            self.console.print("\n[bold red]An error occurred: {e}[/bold red]")
+            logger.error(f"Error in _generate_continuous_futures_series: {e}", exc_info=True)
+        finally:
+            self.console.print("\n[italic blue]Re-initializing application and database connection...[/italic blue]")
+            
+            db_path_for_reinit = self.args.database
+            read_only_for_reinit = not self.args.write
+            
+            self.app = get_app(db_path_for_reinit, read_only_for_reinit)
+            
+            # Re-fetch module handlers for the CLI instance to use the new app state
+            self.sql_executor = get_sql_executor(self.app)
+            self.schema_browser = get_schema_browser(self.app)
+            self.quality_analyzer = get_quality_analyzer(self.app)
+            
+            self.console.print("[italic blue]Application re-initialized.[/italic blue]")
+
     def backup_restore_menu(self) -> None:
         """Display backup/restore menu."""
         self.console.print("\n[bold cyan]Backup/Restore[/bold cyan]")
@@ -319,9 +461,15 @@ class DBInspectorCLI:
             return
     
     def _run_market_data_update_script(self) -> None:
-        """Runs the specified market data update batch script."""
-        script_path = r"C:\Users\alexp\OneDrive\Gdrive\Trading\GitHub Projects\data-management\financial-data-system\update_market_data_v2.bat"
-        self.console.print(f"\n[bold yellow]Attempting to run market data update script:[/bold yellow]\n{script_path}")
+        """Runs the market data update Python script directly, with --skip-panama."""
+        # Construct the path to the Python script
+        project_root = Path(__file__).resolve().parent.parent.parent # financial-data-system
+        script_path = project_root / "src" / "scripts" / "market_data" / "update_all_market_data_v2.py"
+        python_executable = project_root / "venv" / "Scripts" / "python.exe"
+
+        command_to_run = f'"{python_executable}" "{script_path}" --skip-panama'
+        
+        self.console.print(f"\n[bold yellow]Attempting to run market data update script:[/bold yellow]\n{command_to_run}")
         
         confirm_run = Confirm.ask("Do you want to proceed?", default=True)
         if not confirm_run:
@@ -329,7 +477,7 @@ class DBInspectorCLI:
             return
 
         self.console.print("[italic blue]Executing script...[/italic blue]")
-        logger.info(f"User confirmed to run market data update script: {script_path}")
+        logger.info(f"User confirmed to run market data update script: {command_to_run}")
         
         # Close database connection before running script
         self.console.print("[italic blue]Closing database connection...[/italic blue]")
@@ -337,25 +485,42 @@ class DBInspectorCLI:
         
         try:
             # Execute the command using run_terminal_cmd
-            run_terminal_cmd(
-                command=f'"{script_path}"',
-                is_background=False,
-                require_user_approval=True,
-                explanation="Execute the market data update batch script."
-            )
+            # Note: The run_terminal_cmd in the tool definition doesn't have require_user_approval
+            # We will rely on the user confirming above.
+            run_terminal_cmd_result = self.tool_registry.get_tool("run_terminal_cmd").call({
+                "command": command_to_run,
+                "is_background": False,
+                # "require_user_approval": True, # This arg is not in the tool definition
+                "explanation": "Execute the market data update Python script with --skip-panama."
+            })
             
+            # This part assumes run_terminal_cmd_result might give some feedback or raise on error
+            # For now, we just log and proceed.
+            logger.info(f"Terminal command proposed. Result: {run_terminal_cmd_result}")
+
             # Reinitialize app and database connection
             self.console.print("[italic blue]Reopening database connection...[/italic blue]")
-            self.app = get_app()
-            if self.args.database:
-                self.app = get_app(self.args.database, not self.args.write)
+            
+            db_path_for_reinit = self.args.database
+            read_only_for_reinit = not self.args.write
+            self.app = get_app(db_path_for_reinit, read_only_for_reinit)
+            
+            # Re-fetch module handlers
+            self.sql_executor = get_sql_executor(self.app)
+            self.schema_browser = get_schema_browser(self.app)
+            self.quality_analyzer = get_quality_analyzer(self.app)
             
         except Exception as e:
             # Reinitialize app and database connection even if script fails
-            self.console.print("[italic blue]Reopening database connection...[/italic blue]")
-            self.app = get_app()
-            if self.args.database:
-                self.app = get_app(self.args.database, not self.args.write)
+            self.console.print("[italic blue]Reopening database connection after error...[/italic blue]")
+            db_path_for_reinit = self.args.database
+            read_only_for_reinit = not self.args.write
+            self.app = get_app(db_path_for_reinit, read_only_for_reinit)
+
+            # Re-fetch module handlers
+            self.sql_executor = get_sql_executor(self.app)
+            self.schema_browser = get_schema_browser(self.app)
+            self.quality_analyzer = get_quality_analyzer(self.app)
             raise e
 
     def create_backup(self) -> None:

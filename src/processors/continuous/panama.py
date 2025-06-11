@@ -120,19 +120,33 @@ class PanamaContractBuilder(ContinuousContractBuilder):
                 # If no existing data or force rebuild, we're building from scratch
                 # Set a reasonable default start date if not provided
                 if start_date is None:
-                    # Look for a symbol_metadata record for this symbol
-                    query = """
-                    SELECT start_date 
-                    FROM symbol_metadata 
-                    WHERE base_symbol = ? 
-                    LIMIT 1
-                    """
-                    df = self.db.query_to_df(query, [root_symbol])
-                    if not df.empty and df.iloc[0]['start_date'] is not None:
-                        start_date = df.iloc[0]['start_date']
+                    metadata_query_specific = '''
+                        SELECT start_date
+                        FROM symbol_metadata
+                        WHERE symbol = ? 
+                        LIMIT 1
+                    '''
+                    metadata_df = self.db.query_to_df(metadata_query_specific, [continuous_symbol])
+
+                    if metadata_df.empty or metadata_df.iloc[0]['start_date'] is None:
+                        logger.info(f"No start_date in symbol_metadata for specific '{continuous_symbol}'. Trying base_symbol '{root_symbol}'.")
+                        metadata_query_root = '''
+                            SELECT start_date
+                            FROM symbol_metadata
+                            WHERE base_symbol = ?
+                            LIMIT 1 
+                        '''
+                        metadata_df = self.db.query_to_df(metadata_query_root, [root_symbol])
+
+                    if not metadata_df.empty and metadata_df.iloc[0]['start_date'] is not None:
+                        # Ensure start_date is a string in 'YYYY-MM-DD' format
+                        retrieved_start_date = pd.to_datetime(metadata_df.iloc[0]['start_date'])
+                        start_date = retrieved_start_date.strftime('%Y-%m-%d')
+                        logger.info(f"Using start_date '{start_date}' from symbol_metadata for {continuous_symbol} (derived from root/specific query).")
                     else:
-                        # Fall back to a reasonable default
-                        start_date = '2000-01-01'
+                        default_start_date = '2000-01-01'
+                        logger.warning(f"No start_date found in symbol_metadata for {continuous_symbol} or its root {root_symbol}. Using default: {default_start_date}")
+                        start_date = default_start_date
                         
                 logger.info(f"Building new continuous series for {continuous_symbol} "
                           f"from {start_date} to {end_date}")
@@ -152,8 +166,10 @@ class PanamaContractBuilder(ContinuousContractBuilder):
                     logger.info(f"Found active contract at start date: {active_contract}")
                     
                     # Add this contract to our processing
+                    full_active_contract_symbol = f"{root_symbol}{active_contract}"
+                    logger.info(f"Attempting to load data for full symbol: {full_active_contract_symbol}")
                     contract_data = self.load_contract_data(
-                        active_contract, start_date, end_date, interval_unit, interval_value
+                        full_active_contract_symbol, start_date, end_date, interval_unit, interval_value
                     )
                     
                     continuous_data = self._build_continuous_from_contracts(
@@ -177,12 +193,13 @@ class PanamaContractBuilder(ContinuousContractBuilder):
                     df = self.db.query_to_df(query, params)
                     
                     if not df.empty:
-                        active_contract = df.iloc[0]['symbol']
-                        logger.info(f"Found oldest contract: {active_contract}")
+                        # df.iloc[0]['symbol'] here is already the full symbol like 'ESH03'
+                        active_contract_full_symbol = df.iloc[0]['symbol'] 
+                        logger.info(f"Found oldest contract: {active_contract_full_symbol}")
                         
                         # Add this contract to our processing
                         contract_data = self.load_contract_data(
-                            active_contract, start_date, end_date, interval_unit, interval_value
+                            active_contract_full_symbol, start_date, end_date, interval_unit, interval_value
                         )
                         
                         continuous_data = self._build_continuous_from_contracts(
@@ -225,16 +242,18 @@ class PanamaContractBuilder(ContinuousContractBuilder):
                         
                         # Only process segments that overlap with our date range
                         if pd.Timestamp(segment_end) >= pd.Timestamp(start_date) and pd.Timestamp(segment_start) <= pd.Timestamp(end_date):
-                            segment_contract = rollover.from_contract
+                            segment_contract_code = rollover.from_contract # This is just 'H03', 'M03' etc.
                             
                             # Load contract data for this segment
+                            full_segment_contract_symbol = f"{root_symbol}{segment_contract_code}"
+                            logger.info(f"Attempting to load segment data for full symbol: {full_segment_contract_symbol}")
                             contract_data = self.load_contract_data(
-                                segment_contract, segment_start, segment_end, interval_unit, interval_value
+                                full_segment_contract_symbol, segment_start, segment_end, interval_unit, interval_value
                             )
                             
                             if not contract_data.empty:
                                 contract_segments.append(contract_data)
-                                logger.info(f"Loaded {len(contract_data)} rows for {segment_contract}")
+                                logger.info(f"Loaded {len(contract_data)} rows for {segment_contract_code}")
                     
                     # Add the final segment after the last rollover
                     if rollovers:

@@ -15,7 +15,8 @@ from pathlib import Path
 import logging
 from datetime import datetime
 import argparse
-from typing import Optional
+from typing import Optional, Dict, Any
+import json # Added for additional_metadata
 
 # Add project root to Python path
 project_root = str(Path(__file__).resolve().parent.parent.parent.parent)
@@ -85,7 +86,14 @@ def determine_metadata_for_interval(symbol_config: dict, interval_unit: str, int
     """Determine the table, source, and script paths for a specific symbol and interval.
     Prioritizes source/table info from freq_config if provided.
     """
-    base_symbol = symbol_config.get('base_symbol') or symbol_config.get('symbol')
+    # Determine the effective symbol name (could be 'symbol' or 'identifier_base' from continuous_group)
+    # This 'item_symbol_name' is what gets stored in the 'symbol' column of symbol_metadata table.
+    item_symbol_name = symbol_config.get('symbol') or symbol_config.get('identifier_base')
+    
+    # base_symbol is the root part, e.g., ES, NQ, VX. For equities/indices, it's the same as item_symbol_name.
+    # For continuous_group, symbol_config['identifier_base'] is used. For individual futures, it's symbol_config['base_symbol'].
+    effective_base_symbol = symbol_config.get('base_symbol', item_symbol_name)
+
     # Prioritize source from specific frequency config, then symbol config, then default
     source = (freq_config.get('source') if freq_config else None) or symbol_config.get('source') or symbol_config.get('default_source')
     asset_type = symbol_config.get('type', 'future').lower()
@@ -104,16 +112,16 @@ def determine_metadata_for_interval(symbol_config: dict, interval_unit: str, int
         data_table = raw_table or 'market_data_cboe' # Default CBOE table
         
         # Script assignments based on asset type and interval
-        if asset_type == 'index' and base_symbol == '$VIX.X' and interval_unit == 'daily':
+        if asset_type == 'index' and effective_base_symbol == '$VIX.X' and interval_unit == 'daily':
             hist_script = 'src/scripts/market_data/vix/update_vix_index.py' 
             upd_script = 'src/scripts/market_data/vix/update_vix_index.py'
-        elif asset_type == 'future' and base_symbol == 'VX' and interval_unit == 'daily':
+        elif asset_type == 'future_group' and effective_base_symbol == 'VX' and interval_unit == 'daily':
             # Daily VX futures: update from CBOE script, historical fetch from fetch_market_data (which reads CBOE table)
             hist_script = 'src/scripts/market_data/fetch_market_data.py' 
             upd_script = 'src/scripts/market_data/vix/update_vx_futures.py'
         else:
             # Fallback for other potential CBOE sources/intervals - needs specific handling if added
-            logging.warning(f"Unhandled CBOE source case for {base_symbol} {interval_unit} {interval_value}. Using default scripts.")
+            logging.warning(f"Unhandled CBOE source case for {effective_base_symbol} {interval_unit} {interval_value}. Using default scripts.")
             hist_script = None 
             upd_script = None 
     
@@ -133,7 +141,7 @@ def determine_metadata_for_interval(symbol_config: dict, interval_unit: str, int
         # based on the initial 'source' resolution (which considers default_source).
         # We only need to override 'data_source' here for truly special continuous future types
         # that have a source different from what their original symbol_config might imply.
-        if base_symbol == '@VX': # The generic @VX symbol, typically locally-generated.
+        if item_symbol_name == '@VX': # The generic @VX symbol, typically locally-generated.
              data_source = 'generated' # Override source to 'generated' for this specific case.
         # For other continuous futures like @ES, @NQ, or our @VX=...XN symbols,
         # the 'data_source' (e.g., 'tradestation') is assumed to be correctly set
@@ -161,305 +169,251 @@ def determine_metadata_for_interval(symbol_config: dict, interval_unit: str, int
         'asset_type': asset_type
     }
 
-def create_metadata_table(conn: duckdb.DuckDBPyConnection):
-    """Create the symbol_metadata table with composite PK if it doesn't exist.
-    Drops the table first if it exists with an old schema (missing interval_unit).
-    """
-    table_exists = False
-    old_schema = False
+def create_metadata_table_if_not_exists(conn: duckdb.DuckDBPyConnection):
+    """Create the symbol_metadata table with the new schema if it doesn't exist."""
     try:
-        # Check if table exists and if it has the new columns
+        # Check if table exists
         table_info = conn.execute(f"PRAGMA table_info('{METADATA_TABLE_NAME}')").fetchall()
         if table_info:
-            table_exists = True
+            # Basic check for a few key new/changed columns to infer if it's the new schema
             column_names = [col[1] for col in table_info]
-            if 'interval_unit' not in column_names:
-                old_schema = True
-                logging.warning(f"Table '{METADATA_TABLE_NAME}' exists with old schema. Dropping it.")
-                conn.execute(f"DROP TABLE {METADATA_TABLE_NAME};")
-                table_exists = False # Treat as if it doesn't exist now
-            else:
-                logging.info(f"Table '{METADATA_TABLE_NAME}' already exists with the correct schema.")
-        
-    except duckdb.CatalogException:
-        # Table doesn't exist, which is fine
-        table_exists = False
-        logging.info(f"Table '{METADATA_TABLE_NAME}' does not exist yet.")
+            if 'symbol' in column_names and 'start_date' in column_names and 'additional_metadata' in column_names and 'base_symbol' in column_names:
+                logging.info(f"Table '{METADATA_TABLE_NAME}' already exists with the expected new schema.")
+                return # Assume schema is correct
+            else: # Columns mismatch, could be old schema or something else.
+                  # For safety, this script won't drop/recreate if main init should handle it.
+                  # However, if run standalone and it's an old schema, it should be updated.
+                  # Given user dropped it, this path might not be hit on first run.
+                logging.warning(f"Table '{METADATA_TABLE_NAME}' exists but schema seems incorrect. "
+                                f"Expected columns like 'symbol', 'start_date', 'additional_metadata', 'base_symbol'. Found: {column_names}. "
+                                f"The table should have been created/updated by the main application's schema initialization. "
+                                "This script will attempt to proceed but mismatches may cause errors.")
+                # Optionally, one could re-run the CREATE TABLE IF NOT EXISTS, but that doesn't alter.
+                # Or, raise an error here if strict schema adherence is required before populating.
+                # conn.execute(f"DROP TABLE IF EXISTS {METADATA_TABLE_NAME};") # Risky if shared
+                # logging.info(f"Dropped table '{METADATA_TABLE_NAME}' due to schema mismatch for re-creation.")
+        else: # Table does not exist
+             logging.info(f"Table '{METADATA_TABLE_NAME}' does not exist. Attempting to create.")
+
+        # Create table (IF NOT EXISTS handles if it's already there and matches this exact schema)
+        # This schema MUST match init_schema.sql
+        conn.execute(f"""
+            CREATE TABLE IF NOT EXISTS {METADATA_TABLE_NAME} (
+                symbol VARCHAR NOT NULL,         -- Actual symbol, e.g. @ES=102XC or SPY
+                base_symbol VARCHAR,             -- Root symbol, e.g. ES or SPY
+                description VARCHAR,
+                exchange VARCHAR,
+                asset_type VARCHAR NOT NULL,     -- e.g. 'future', 'continuous_future', 'equity'
+                data_source VARCHAR,
+                data_table VARCHAR NOT NULL,
+                interval_unit VARCHAR NOT NULL,
+                interval_value INTEGER NOT NULL,
+                config_path VARCHAR,             -- Path to the main market_symbols.yaml
+                start_date DATE,                 -- Earliest data date from config
+                last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                historical_script_path VARCHAR,
+                update_script_path VARCHAR,
+                additional_metadata JSON,        -- Full item_config from YAML
+                PRIMARY KEY (symbol, interval_unit, interval_value)
+            );
+        """)
+        logging.info(f"Ensured table '{METADATA_TABLE_NAME}' is present (created if it didn't exist).")
+
     except duckdb.Error as e:
-        logging.error(f"Error checking schema for {METADATA_TABLE_NAME}: {e}")
-        # Decide whether to raise or try to proceed
-        raise # Re-raise error if schema check fails unexpectedly
+        logging.error(f"Database error during setup of {METADATA_TABLE_NAME}: {e}")
+        raise
 
-    # Proceed with creation only if it doesn't exist or was just dropped
-    if not table_exists:
-        try:
-            conn.execute(f"""
-                CREATE TABLE {METADATA_TABLE_NAME} (
-                    base_symbol VARCHAR NOT NULL,
-                    interval_unit VARCHAR NOT NULL,
-                    interval_value INTEGER NOT NULL,
-                    data_table VARCHAR NOT NULL,
-                    data_source VARCHAR,
-                    historical_script_path VARCHAR,
-                    update_script_path VARCHAR,
-                    asset_type VARCHAR NOT NULL,
-                    config_path VARCHAR,
-                    last_updated TIMESTAMP,
-                    PRIMARY KEY (base_symbol, interval_unit, interval_value)
-                );
-            """)
-            logging.info(f"Created table '{METADATA_TABLE_NAME}' with composite PK.")
-        except duckdb.Error as e:
-            logging.error(f"Error creating table {METADATA_TABLE_NAME}: {e}")
-            raise
-
-def populate_metadata(conn: duckdb.DuckDBPyConnection, config_file: str):
+def populate_metadata(conn: duckdb.DuckDBPyConnection, config_file_path: str):
     """Read the config and populate the metadata table for each symbol/interval."""
     try:
-        with open(config_file, 'r') as f:
+        with open(config_file_path, 'r') as f:
             config = yaml.safe_load(f)
     except FileNotFoundError:
-        logging.error(f"Configuration file not found: {config_file}")
+        logging.error(f"Configuration file not found: {config_file_path}")
         return
     except yaml.YAMLError as e:
-        logging.error(f"Error parsing configuration file {config_file}: {e}")
+        logging.error(f"Error parsing configuration file {config_file_path}: {e}")
         return
 
-    # --- Clean up old 'day' and 'continuous' interval_unit entries --- #
-    try:
-        conn.execute(f"DELETE FROM {METADATA_TABLE_NAME} WHERE interval_unit IN ('day', 'continuous')")
-        logging.info(f"Attempted to delete any old entries with interval_unit='day' or 'continuous'.")
-    except duckdb.Error as e:
-        logging.error(f"Error trying to delete old 'day'/'continuous' interval_unit entries: {e}")
+    default_start_date_str = config.get('settings', {}).get('default_start_date', '2000-01-01')
+    records_to_upsert = []
 
-    # --- ADDED: Explicitly delete old generic continuous_future metadata for @ES, @NQ, @VX ---
-    specific_symbols_to_delete = ('@ES', '@NQ', '@VX')
-    try:
-        for sym_to_del in specific_symbols_to_delete:
-            # Delete any metadata entries for these specific base_symbols, regardless of other attributes,
-            # as they represent the old generic continuous entries we want to remove.
-            # The new, correct entries (e.g. for @ES=102XC) will be re-added later.
-            deleted_rows = conn.execute(f"DELETE FROM {METADATA_TABLE_NAME} WHERE base_symbol = ? RETURNING 1", [sym_to_del]).fetchall()
-            if deleted_rows and len(deleted_rows) > 0:
-                logging.info(f"Deleted {len(deleted_rows)} old metadata entries for generic symbol '{sym_to_del}'.")
-            else:
-                logging.info(f"No old metadata entries found/deleted for generic symbol '{sym_to_del}'.")
-    except duckdb.Error as e:
-        logging.error(f"Error deleting specific old generic symbol metadata (@ES, @NQ, @VX): {e}")
-    # --- End explicit clean up ---
+    symbol_categories = ['indices', 'futures', 'equities', 'forex', 'crypto'] # Add other categories if present in YAML
 
-    entries_to_insert = []
-    now = datetime.now()
+    for category in symbol_categories:
+        if category not in config:
+            continue
 
-    asset_configs = [
-        (config.get('futures', []), 'future'), 
-        (config.get('indices', []), 'index'), 
-        (config.get('equities', []), 'equity')
-    ]
-
-    for config_list, default_asset_type in asset_configs:
-        for item_config in config_list:
-            # --- ADDED: Handle continuous_group ---
+        for item_config in config[category]:
             if 'continuous_group' in item_config:
+                # Handle continuous_group expansion
                 group_details = item_config['continuous_group']
-                identifier_base = group_details.get('identifier_base')
+                id_base = group_details['identifier_base'] # e.g., "@VX"
                 month_codes = group_details.get('month_codes', [])
-                settings_code = group_details.get('settings_code', "") # Ensure it's a string
-                description_template = group_details.get('description_template', "Continuous Future {symbol}")
-
-                if not identifier_base or not month_codes:
-                    logging.warning(f"Skipping continuous_group due to missing 'identifier_base' or 'month_codes': {group_details}")
-                    continue
-
-                # Prepare a base item_config for the generated symbols
-                generated_item_config_base = {
-                    'exchange': group_details.get('exchange'),
-                    'type': group_details.get('type', 'continuous_future'), # Default to continuous_future
-                    'default_source': group_details.get('default_source'),
-                    'default_raw_table': group_details.get('default_raw_table'),
-                    'start_date': group_details.get('start_date'),
-                    'calendar': group_details.get('calendar')
-                }
-
-                # Parse frequencies ONCE from the group config
-                group_yaml_frequencies = group_details.get('frequencies', [])
-                group_parsed_frequencies = _parse_symbol_frequencies(group_yaml_frequencies, identifier_base)
-
-                if not group_parsed_frequencies:
-                    logging.warning(f"No valid frequencies defined for continuous_group '{identifier_base}'. Skipping this group.")
-                    continue
+                settings_code = group_details.get('settings_code', "") # e.g., "01XN"
                 
-                for idx, month_code in enumerate(month_codes):
-                    actual_symbol_val = f"{identifier_base}={str(month_code)}{settings_code}" # Ensure month_code is string
+                for mc_idx, month_code in enumerate(month_codes):
+                    # Construct the specific continuous symbol name
+                    # Example: @VX + = + 1 + 01XN -> @VX=101XN (if month_code_is_nth_month=false)
+                    # Example: @VX + = + 1 (as nth month) + 01XN -> @VX=101XN
+                    # The original YAML has 'month_codes' which seems to imply the actual Nth month identifier part
                     
-                    current_generated_item_config = generated_item_config_base.copy()
-                    current_generated_item_config['symbol'] = actual_symbol_val
-                    current_generated_item_config['description'] = description_template.format(
-                        nth_month=get_ordinal_suffix(idx + 1), symbol=actual_symbol_val
-                    )
-                    # 'type' is already in current_generated_item_config from generated_item_config_base
+                    # Default way to form symbol: @VX + = + month_code + settings_code
+                    # If settings_code already contains type (like XN, XC), month_code is likely just the number part
+                    # For "@VX=101XN", month_code is "1", settings_code is "01XN"
+                    # Let's assume settings_code may already imply type (like XN)
+                    # and month_code is the numeric part for Nth month
+                    
+                    # A more robust way might be needed if symbol construction varies greatly
+                    # For "@VX=101XN", "1" is the month code here.
+                    # The template for description suggests {nth_month}
+                    
+                    nth_month_str = get_ordinal_suffix(int(month_code)) # Assuming month_code is '1', '2' etc.
+                    current_symbol_name = f"{id_base}={month_code}{settings_code}"
+                    
+                    current_description = group_details.get('description_template', "").format(nth_month=nth_month_str)
+                    current_base_symbol = id_base # For @VX=101XN, base_symbol is @VX
+                    
+                    # Use group's settings, override with specifics if any (though continuous_group usually defines all)
+                    # This constructed_item_config is what gets stored in additional_metadata
+                    constructed_item_config = {**group_details, 
+                                               'symbol': current_symbol_name, 
+                                               'description': current_description,
+                                               'base_symbol': current_base_symbol # Store the group's base_symbol
+                                               }
+                    # Remove keys that are not part of a standard item_config or are group-specific
+                    constructed_item_config.pop('identifier_base', None)
+                    constructed_item_config.pop('month_codes', None)
+                    constructed_item_config.pop('settings_code', None)
+                    constructed_item_config.pop('description_template', None)
+                    
+                    # Frequencies for the group apply to each generated symbol
+                    yaml_frequencies = group_details.get('frequencies', [])
+                    parsed_frequencies = _parse_symbol_frequencies(yaml_frequencies, current_symbol_name)
+                    
+                    item_start_date_str = group_details.get('start_date', default_start_date_str)
+                    item_exchange = group_details.get('exchange')
+                    # asset_type for continuous_group items is usually 'continuous_future'
+                    item_asset_type = group_details.get('type', 'continuous_future').lower()
 
-                    for unit, value, freq_dict_for_interval in group_parsed_frequencies:
-                        interval_metadata = determine_metadata_for_interval(
-                            current_generated_item_config,
-                            unit,
-                            value,
-                            freq_dict_for_interval
+                    for interval_unit, interval_value, freq_specific_config in parsed_frequencies:
+                        interval_metadata = determine_metadata_for_interval(constructed_item_config, interval_unit, interval_value, freq_specific_config)
+                        record = (
+                            current_symbol_name, # symbol
+                            current_base_symbol, # base_symbol
+                            current_description, # description
+                            item_exchange,       # exchange
+                            interval_metadata['asset_type'] or item_asset_type, # asset_type
+                            interval_metadata['data_source'],
+                            interval_metadata['data_table'],
+                            interval_unit,
+                            interval_value,
+                            config_file_path, # config_path (main YAML)
+                            item_start_date_str, # start_date
+                            datetime.now(), # last_updated
+                            interval_metadata['historical_script_path'],
+                            interval_metadata['update_script_path'],
+                            json.dumps(constructed_item_config) # additional_metadata (JSON of the constructed item_config)
                         )
-                        entries_to_insert.append({
-                            'base_symbol': actual_symbol_val, # Use the fully generated symbol
-                            'interval_unit': unit,
-                            'interval_value': value,
-                            'data_table': interval_metadata['data_table'],
-                            'data_source': interval_metadata['data_source'],
-                            'historical_script_path': interval_metadata['historical_script_path'],
-                            'update_script_path': interval_metadata['update_script_path'],
-                            'asset_type': interval_metadata['asset_type'],
-                            'config_path': config_file,
-                            'last_updated': now
-                        })
-                continue # Move to the next item_config in the outer loop
-            # --- END ADDED: Handle continuous_group ---
+                        records_to_upsert.append(record)
+                        logging.debug(f"DEBUG_POPULATOR (continuous_group_item): Preparing to insert for {current_symbol_name} | {interval_unit} | {interval_value} with metadata: {interval_metadata}")
 
-            base_symbol = item_config.get('base_symbol') or item_config.get('symbol')
-            if not base_symbol: continue
+            else: # Handle individual symbol entries (not in a continuous_group)
+                item_symbol_name = item_config.get('symbol')
+                if not item_symbol_name:
+                    logging.warning(f"Skipping item in {category} due to missing 'symbol': {item_config}")
+                    continue
 
-            # MODIFIED: Use the new _parse_symbol_frequencies helper
-            frequencies_config_list = item_config.get('frequencies', [])
-            parsed_frequencies_with_config = _parse_symbol_frequencies(frequencies_config_list, base_symbol)
-            
-            if not parsed_frequencies_with_config:
-                logging.warning(f"No valid frequencies determined for {base_symbol}. Skipping metadata entry.")
-                continue
-
-            asset_type = item_config.get('type', default_asset_type).lower()
-            item_config['type'] = asset_type 
-            
-            # Process Individual Symbol/Intervals (Non-Continuous)
-            for unit, value, freq_config_for_interval in parsed_frequencies_with_config:
-                interval_specific_metadata = determine_metadata_for_interval(item_config, unit, value, freq_config_for_interval)
+                # For non-group items, base_symbol is either specified or defaults to the symbol itself
+                item_base_symbol = item_config.get('base_symbol', item_symbol_name)
+                item_description = item_config.get('description')
+                item_exchange = item_config.get('exchange')
+                item_asset_type = item_config.get('type', 'unknown').lower() # Default to 'unknown' if not specified
                 
-                # Debug logging for individual symbol items (which includes explicitly defined continuous_future types)
-                if base_symbol in ['@ES=102XC', '@VX=101XN', '@ES=101XN', '@NQ=101XN', '@NQ=102XC']:
-                    logging.info(f"DEBUG_POPULATOR (individual_symbol): Preparing to insert for {base_symbol} | {unit} | {value} with metadata: {interval_specific_metadata}")
+                yaml_frequencies = item_config.get('frequencies', [])
+                parsed_frequencies = _parse_symbol_frequencies(yaml_frequencies, item_symbol_name)
 
-                try:
-                    conn.execute(f"""
-                        INSERT INTO {METADATA_TABLE_NAME} (base_symbol, interval_unit, interval_value, data_table, data_source, asset_type, config_path, last_updated)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                        ON CONFLICT (base_symbol, interval_unit, interval_value) DO UPDATE SET
-                            data_table = EXCLUDED.data_table,
-                            data_source = EXCLUDED.data_source,
-                            asset_type = EXCLUDED.asset_type,
-                            config_path = EXCLUDED.config_path,
-                            last_updated = EXCLUDED.last_updated;
-                    """, (
-                        base_symbol,
-                        unit,
-                        value,
-                        interval_specific_metadata['data_table'],
-                        interval_specific_metadata['data_source'],
-                        interval_specific_metadata['asset_type'],
-                        config_file,
-                        now
-                    ))
-                except duckdb.Error as e:
-                    logging.error(f"Database error populating metadata: {e}")
-                    raise
+                item_start_date_str = item_config.get('start_date', default_start_date_str)
 
-    # Insert/Replace entries into the database
-    if not entries_to_insert:
-        logging.warning("No metadata entries generated from config.")
-        return
+                for interval_unit, interval_value, freq_specific_config in parsed_frequencies:
+                    interval_metadata = determine_metadata_for_interval(item_config, interval_unit, interval_value, freq_specific_config)
+                    record = (
+                        item_symbol_name,    # symbol
+                        item_base_symbol,    # base_symbol
+                        item_description,    # description
+                        item_exchange,       # exchange
+                        interval_metadata['asset_type'] or item_asset_type, # asset_type
+                        interval_metadata['data_source'],
+                        interval_metadata['data_table'],
+                        interval_unit,
+                        interval_value,
+                        config_file_path,    # config_path (main YAML)
+                        item_start_date_str, # start_date
+                        datetime.now(),      # last_updated
+                        interval_metadata['historical_script_path'],
+                        interval_metadata['update_script_path'],
+                        json.dumps(item_config) # additional_metadata (JSON of the item_config from YAML)
+                    )
+                    records_to_upsert.append(record)
+                    logging.debug(f"DEBUG_POPULATOR (individual_symbol): Preparing to insert for {item_symbol_name} | {interval_unit} | {interval_value} with metadata: {interval_metadata}")
 
-    try:
-        conn.begin()
-        for entry in entries_to_insert:
-            # Use INSERT OR REPLACE to handle updates based on composite PK
-            # Ensure new script path columns exist if we are inserting into them
-            # Check if new columns exist in the target table
-            cols_exist = conn.execute(f"SELECT column_name FROM information_schema.columns WHERE table_name = '{METADATA_TABLE_NAME}'").fetchall()
-            col_names = [col[0] for col in cols_exist]
-            
-            sql_columns = "base_symbol, interval_unit, interval_value, data_table, data_source, asset_type, config_path, last_updated"
-            sql_placeholders = "?, ?, ?, ?, ?, ?, ?, ?"
-            sql_params = [
-                entry['base_symbol'], entry['interval_unit'], entry['interval_value'],
-                entry['data_table'], entry['data_source'], entry['asset_type'], 
-                entry['config_path'], entry['last_updated']
+    if records_to_upsert:
+        try:
+            # Column names must match the CREATE TABLE statement
+            column_names = [
+                "symbol", "base_symbol", "description", "exchange", "asset_type", 
+                "data_source", "data_table", "interval_unit", "interval_value",
+                "config_path", "start_date", "last_updated", 
+                "historical_script_path", "update_script_path", "additional_metadata"
             ]
+            columns_str = ", ".join(column_names)
+            placeholders = ", ".join(["?"] * len(column_names))
+
+            # Prepare for ON CONFLICT: PK is (symbol, interval_unit, interval_value)
+            # Columns to update: all except PK.
+            # Create SET statements for each column except PK: col_name = excluded.col_name
+            update_setters = []
+            pk_columns = {"symbol", "interval_unit", "interval_value"}
+            for col in column_names:
+                if col not in pk_columns:
+                    update_setters.append(f"{col} = excluded.{col}")
+            update_setters_str = ", ".join(update_setters)
             
-            # Conditionally add new script path columns
-            if 'historical_script_path' in col_names:
-                sql_columns += ", historical_script_path"
-                sql_placeholders += ", ?"
-                sql_params.append(entry.get('historical_script_path')) # Use .get for safety
-            if 'update_script_path' in col_names:
-                 sql_columns += ", update_script_path"
-                 sql_placeholders += ", ?"
-                 sql_params.append(entry.get('update_script_path')) # Use .get for safety
-            # Handle old column if necessary (only if new ones don't exist)
-            elif 'update_script' in col_names: 
-                 sql_columns += ", update_script"
-                 sql_placeholders += ", ?"
-                 sql_params.append(entry.get('update_script')) # Fallback to old key
-
-            sql = f"""
-                INSERT INTO {METADATA_TABLE_NAME} ({sql_columns})
-                VALUES ({sql_placeholders})
-                ON CONFLICT (base_symbol, interval_unit, interval_value) DO UPDATE SET
-                    data_table = EXCLUDED.data_table,
-                    data_source = EXCLUDED.data_source,
-                    asset_type = EXCLUDED.asset_type,
-                    config_path = EXCLUDED.config_path,
-                    last_updated = EXCLUDED.last_updated{', historical_script_path = EXCLUDED.historical_script_path' if 'historical_script_path' in col_names else ''}{', update_script_path = EXCLUDED.update_script_path' if 'update_script_path' in col_names else (', update_script = EXCLUDED.update_script' if 'update_script' in col_names else '')};
+            upsert_sql = f"""
+                INSERT INTO {METADATA_TABLE_NAME} ({columns_str})
+                VALUES ({placeholders})
+                ON CONFLICT (symbol, interval_unit, interval_value) DO UPDATE SET
+                {update_setters_str};
             """
-            conn.execute(sql, sql_params)
-
-        conn.commit()
-        logging.info(f"Successfully populated/updated {len(entries_to_insert)} entries in {METADATA_TABLE_NAME}.")
-    except duckdb.Error as e:
-        conn.rollback()
-        logging.error(f"Database error populating metadata: {e}")
-    except Exception as e:
-        conn.rollback()
-        logging.error(f"Unexpected error: {e}")
+            
+            conn.executemany(upsert_sql, records_to_upsert)
+            logging.info(f"Successfully populated/updated {len(records_to_upsert)} entries in {METADATA_TABLE_NAME}.")
+        except duckdb.Error as e:
+            logging.error(f"Error upserting records into {METADATA_TABLE_NAME}: {e}")
+            logging.error(f"Sample record that may have caused error: {records_to_upsert[0] if records_to_upsert else 'No records'}")
 
 def main():
-    parser = argparse.ArgumentParser(description='Populate the symbol_metadata table from configuration.')
+    parser = argparse.ArgumentParser(description=f"Populate or update the {METADATA_TABLE_NAME} table.")
     parser.add_argument("--db-path", default=DEFAULT_DB_PATH, help="Path to the DuckDB database file.")
     parser.add_argument("--config-path", default=CONFIG_PATH, help="Path to the market symbols YAML configuration file.")
     args = parser.parse_args()
 
-    db_file = Path(args.db_path).resolve()
-    config_file = Path(args.config_path).resolve()
-
-    if not db_file.exists():
-        logging.error(f"Error: Database file not found at {db_file}")
-        sys.exit(1)
-    if not config_file.exists():
-        logging.error(f"Error: Configuration file not found at {config_file}")
-        sys.exit(1)
-
-    conn = None
     try:
-        conn = duckdb.connect(database=str(db_file), read_only=False)
-        logging.info(f"Connected to database: {db_file}")
-
-        # Ensure table exists
-        create_metadata_table(conn)
-
-        # Populate the table
-        populate_metadata(conn, str(config_file))
-
+        conn = duckdb.connect(args.db_path, read_only=False)
+        logging.info(f"Connected to database: {args.db_path}")
+        
+        # Ensure table exists with the correct schema
+        create_metadata_table_if_not_exists(conn)
+        
+        # Populate metadata
+        populate_metadata(conn, args.config_path)
+        
     except duckdb.Error as e:
-        logging.error(f"Failed to connect to or operate on database {db_file}: {e}")
-        sys.exit(1)
+        logging.error(f"Database operation failed: {e}")
     except Exception as e:
         logging.error(f"An unexpected error occurred: {e}")
-        sys.exit(1)
     finally:
-        if conn:
+        if 'conn' in locals() and conn:
             conn.close()
             logging.info("Database connection closed.")
 

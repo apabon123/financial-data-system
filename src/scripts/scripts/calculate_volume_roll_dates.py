@@ -2,7 +2,7 @@ import yaml
 import pandas as pd
 from pathlib import Path
 import argparse
-from datetime import timedelta, date
+from datetime import timedelta, date, datetime
 import duckdb
 import pandas_market_calendars as mcal
 
@@ -22,11 +22,14 @@ def load_config(config_path='config/market_symbols.yaml'):
 # Determine the database path relative to the script location or workspace root
 # Assumes the script is run from the workspace root or the path is adjusted accordingly
 DEFAULT_DB_PATH = Path("data/financial_data.duckdb")
+DEFAULT_WRITE_DB_PATH = Path("data/financial_data.duckdb") # For explicit write connection path
 
-def get_db_connection(db_path=DEFAULT_DB_PATH):
+def get_db_connection(db_path=DEFAULT_DB_PATH, read_only=True):
     """Establishes a connection to the DuckDB database."""
     try:
-        con = duckdb.connect(database=str(db_path), read_only=True)
+        print(f"Attempting to connect to DB: {db_path}, read_only={read_only}")
+        con = duckdb.connect(database=str(db_path), read_only=read_only)
+        print(f"Successfully connected to DB: {db_path}")
         return con
     except Exception as e:
         print(f"Error connecting to database at {db_path}: {e}")
@@ -95,6 +98,14 @@ def get_historical_volume(con, contract_symbol, start_date, end_date):
 
 # Cache for market calendars to avoid reloading
 _calendar_cache = {}
+
+def get_contract_month_code(month_num: int) -> str | None:
+    """Convert month number to futures contract month code."""
+    month_codes = {
+        1: 'F', 2: 'G', 3: 'H', 4: 'J', 5: 'K', 6: 'M',
+        7: 'N', 8: 'Q', 9: 'U', 10: 'V', 11: 'X', 12: 'Z'
+    }
+    return month_codes.get(month_num)
 
 def get_trading_calendar(calendar_name='CME'):
     """Gets a pandas_market_calendars object for the given exchange name."""
@@ -262,6 +273,15 @@ def generate_contract_symbols(symbol_config):
              symbols.append(f"{base}{month_code}{yr_code}")
     return symbols
 
+def _extract_year_month_code(contract_symbol_with_root):
+    # This function is not used in the new version of the script
+    # It's kept here for potential future use
+    # The logic for extracting year and month code from a contract symbol is not provided in the new version
+    # It's assumed to be unchanged from the original version
+    # If you need to implement this function, you'll need to add the appropriate logic here
+    # This is a placeholder and should be replaced with the actual implementation
+    return None
+
 # --- Database Table Handling ---
 
 def _ensure_roll_dates_table(con):
@@ -291,16 +311,27 @@ def save_roll_dates_to_db(df: pd.DataFrame, roll_type: str, db_con):
         db_con: Active DuckDB database connection.
     """
     if df.empty:
-        print("No roll dates to save to the database.")
+        print(f"No roll dates to save for RollType '{roll_type}'.")
         return
 
     df_to_save = df.copy()
+    # Ensure RollType column is set from the argument for this specific save operation
     df_to_save['RollType'] = roll_type
-    # Ensure RollDate is in correct format (YYYY-MM-DD string or date object)
     df_to_save['RollDate'] = pd.to_datetime(df_to_save['RollDate']).dt.date
 
     required_cols = ['SymbolRoot', 'Contract', 'RollDate', 'RollType']
+    
+    # Ensure all required columns exist, add if not (though they should be from calculation)
+    for col in required_cols:
+        if col not in df_to_save.columns:
+            if col == 'RollType': # Should be set above
+                 print(f"Warning: 'RollType' column was missing before explicit set in save_roll_dates_to_db for {roll_type}.")
+            else:
+                 print(f"Warning: Column '{col}' was missing in DataFrame for RollType '{roll_type}'. This might indicate an issue.")
+                 # df_to_save[col] = None # Or handle more gracefully
+
     df_to_save = df_to_save[required_cols]
+
 
     table_name = "futures_roll_dates"
     temp_view_name = f"temp_{table_name}_upsert_view"
@@ -446,61 +477,229 @@ def calculate_volume_roll(symbol_root, config, db_con, num_days_before_expiry=5)
 
     return pd.DataFrame(roll_dates)
 
-# --- Main Execution ---
+def calculate_calendar_offset_rolls(symbol_root: str, config: dict, db_con, offsets: list[int]) -> pd.DataFrame:
+    """
+    Calculates roll dates based on N business days before the last trading day from futures_roll_calendar.
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Calculate futures volume roll dates and save to DB.")
-    parser.add_argument("symbol_root", help="Base futures symbol (e.g., ES, NQ, VX).")
-    parser.add_argument("-c", "--config", default="config/market_symbols.yaml", help="Path to market symbols config file.")
-    parser.add_argument("-o", "--output-csv", default=None, help="(Optional) Output CSV file path for roll dates.")
-    parser.add_argument("-d", "--days", type=int, default=5, help="Number of trading days before expiry to check volume.")
-    parser.add_argument("--db-path", default=str(DEFAULT_DB_PATH), help="Path to the DuckDB database file.")
-    parser.add_argument("--roll-type", default="volume", help="Identifier for this roll calculation method (e.g., volume).")
+    Args:
+        symbol_root (str): The root symbol (e.g., 'ES').
+        config (dict): The market symbols configuration dictionary.
+        db_con: Active DuckDB database connection.
+        offsets (list[int]): List of N days to offset (e.g., [1, 2, 3] for 1, 2, 3 days before).
+
+    Returns:
+        pd.DataFrame: DataFrame with columns [SymbolRoot, Contract, RollDate, RollType].
+                      RollType will be like '01X', '02X', etc.
+    """
+    print(f"Calculating calendar offset rolls for {symbol_root} with offsets: {offsets}")
+    all_calendar_rolls = []
+
+    # Get the specific configuration for the futures of the given root symbol
+    # The config['futures'] is a LIST of configurations.
+    symbol_config = None
+    if 'futures' in config and isinstance(config['futures'], list):
+        for future_conf in config['futures']:
+            if future_conf.get('base_symbol') == symbol_root:
+                symbol_config = future_conf
+                break
+    
+    if not symbol_config:
+        print(f"Warning: No futures configuration found for base_symbol '{symbol_root}' in the list under 'futures' in market_symbols.yaml. Skipping calendar rolls.")
+        return pd.DataFrame()
+
+    calendar_name = symbol_config.get('calendar', 'CME')
+    trading_calendar = get_trading_calendar(calendar_name)
+
+    query = f"""
+    SELECT contract_code, last_trading_day, year, month
+    FROM futures_roll_calendar
+    WHERE root_symbol = ?
+    ORDER BY last_trading_day;
+    """
+    try:
+        calendar_entries_df = db_con.execute(query, [symbol_root]).fetchdf()
+        if calendar_entries_df.empty:
+            print(f"No entries found in futures_roll_calendar for {symbol_root}. Cannot calculate calendar offset rolls.")
+            return pd.DataFrame()
+    except Exception as e:
+        print(f"Error querying futures_roll_calendar for {symbol_root}: {e}")
+        return pd.DataFrame()
+
+    for _, row in calendar_entries_df.iterrows():
+        try:
+            last_trading_day_dt = pd.to_datetime(row['last_trading_day']).normalize()
+            # Expect year and month to come from the DB query
+            contract_year = int(row['year'])
+            contract_month_num = int(row['month'])
+
+            month_code = get_contract_month_code(contract_month_num)
+            if not month_code:
+                print(f"Warning: Could not get month code for month number {contract_month_num}. Skipping contract {row['contract_code']}.")
+                continue
+            
+            # Construct Contract field like "H24"
+            contract_identifier = f"{month_code}{str(contract_year)[-2:]}"
+
+            # Fetch a schedule around the last_trading_day to find its index for safe offsetting
+            # Ensure the schedule covers enough range for offsets
+            schedule_start = last_trading_day_dt - timedelta(days=max(offsets) + 15) # Extra buffer
+            schedule_end = last_trading_day_dt + timedelta(days=5) # Small buffer past
+            
+            schedule = trading_calendar.schedule(start_date=schedule_start.strftime('%Y-%m-%d'), 
+                                                 end_date=schedule_end.strftime('%Y-%m-%d'))
+            
+            if last_trading_day_dt not in schedule.index:
+                # This can happen if last_trading_day from DB isn't an actual trading day on the calendar
+                # Try to find the closest preceding trading day
+                print(f"Warning: last_trading_day {last_trading_day_dt.date()} for {row['contract_code']} is not on the {calendar_name} trading calendar. Attempting to find prior trading day.")
+                # Get valid days up to last_trading_day_dt
+                valid_days_up_to = trading_calendar.valid_days(start_date=schedule_start.strftime('%Y-%m-%d'), end_date=last_trading_day_dt.strftime('%Y-%m-%d'))
+                if not valid_days_up_to.empty:
+                    actual_ref_date = valid_days_up_to[-1] # Closest actual trading day
+                    print(f"Using {actual_ref_date.date()} as reference for {row['contract_code']} instead of {last_trading_day_dt.date()}.")
+                else: # Should not happen if schedule_start is reasonable
+                    print(f"Error: Could not find any valid trading day before or on {last_trading_day_dt.date()} for {row['contract_code']}. Skipping.")
+                    continue
+            else:
+                actual_ref_date = last_trading_day_dt
+
+            # Find the index of actual_ref_date in the full schedule (not just the small one we fetched for safety)
+            # For simplicity, we'll use the small schedule, assuming it's sufficient
+            # Or, more robustly, use date_offset if available and reliable.
+            # pandas_market_calendars schedule is a DatetimeIndex.
+            
+            try:
+                # Get the series of trading sessions (dates)
+                session_dates = schedule.index.normalize()
+                loc = session_dates.get_loc(actual_ref_date)
+            except KeyError:
+                print(f"Error: {actual_ref_date.date()} (derived from {row['last_trading_day']}) not found in fetched {calendar_name} schedule for {row['contract_code']}. Dates available: {session_dates[:3]}...{session_dates[-3:]}. Skipping contract.")
+                continue
+
+
+            for offset in offsets:
+                if loc >= offset:
+                    roll_date = session_dates[loc - offset]
+                    roll_type_str = f"{offset:02d}X"
+                    all_calendar_rolls.append({
+                        'SymbolRoot': symbol_root,
+                        'Contract': contract_identifier,
+                        'RollDate': roll_date.to_pydatetime().date(), # Store as python date
+                        'RollType': roll_type_str
+                    })
+                else:
+                    print(f"Warning: Not enough trading days before {actual_ref_date.date()} to offset by {offset} days for {row['contract_code']}. Skipping this offset.")
+        
+        except Exception as e:
+            print(f"Error processing contract {row.get('contract_code', 'N/A')} for calendar offset rolls: {e}")
+            import traceback
+            traceback.print_exc()
+
+
+    return pd.DataFrame(all_calendar_rolls)
+
+def main():
+    parser = argparse.ArgumentParser(description="Calculate and store futures roll dates based on volume or calendar rules.")
+    parser.add_argument("--symbol-roots", type=str, help="Comma-separated list of symbol roots to process for volume rolls (e.g., ES,NQ).")
+    parser.add_argument("--config-path", type=str, default="config/market_symbols.yaml", help="Path to the market symbols configuration file.")
+    parser.add_argument("--db-path", type=str, default=str(DEFAULT_DB_PATH), help="Path to the DuckDB database file (for read operations).")
+    parser.add_argument("--db-write-path", type=str, default=str(DEFAULT_WRITE_DB_PATH), help="Path to the DuckDB database file (for write operations).")
+    parser.add_argument("--write-to-db", action="store_true", help="If set, writes calculated roll dates to the database.")
+    parser.add_argument("--days-before-expiry-volume", type=int, default=5, help="Number of trading days before theoretical expiry to scan for volume roll.")
+    
+    # Arguments for calendar-based rolls
+    parser.add_argument("--calculate-calendar-rolls", action="store_true", help="If set, calculates calendar-offset based roll dates.")
+    parser.add_argument("--calendar-roll-offsets", type=str, default="1,2,3", help="Comma-separated list of N days before expiry to calculate (e.g., '1,2,3' for 01X, 02X, 03X).")
+    parser.add_argument("--symbol-roots-calendar", type=str, help="Comma-separated list of symbol roots for calendar rolls (e.g., ES,NQ). Default is same as --symbol-roots if not provided and calendar rolls are active.")
 
     args = parser.parse_args()
 
-    db_connection = None
+    config = load_config(args.config_path)
+    db_connection = None # Single connection object
+
     try:
-        print(f"Connecting to database: {args.db_path}")
-        db_connection = duckdb.connect(database=args.db_path, read_only=False)
+        # Determine connection mode based on whether writing is needed
+        read_only_mode = not args.write_to_db
+        db_path_to_use = args.db_write_path if args.write_to_db else args.db_path
+        
+        print(f"Connecting to database: {db_path_to_use}, Read-only: {read_only_mode}")
+        db_connection = get_db_connection(db_path_to_use, read_only=read_only_mode)
 
-        _ensure_roll_dates_table(db_connection)
+        if args.write_to_db:
+            _ensure_roll_dates_table(db_connection) # Ensure table exists before writing
 
-        print(f"Loading configuration from: {args.config}")
-        config = load_config(args.config)
+        # Volume Roll Calculation (existing logic)
+        if args.symbol_roots:
+            symbol_roots_volume = [s.strip().upper() for s in args.symbol_roots.split(',')]
+            print(f"Processing volume rolls for: {symbol_roots_volume}")
+            for symbol_root in symbol_roots_volume:
+                print(f"--- Calculating Volume Roll for {symbol_root} ---")
+                volume_roll_df = calculate_volume_roll(symbol_root, config, db_connection, args.days_before_expiry_volume)
+                if not volume_roll_df.empty:
+                    if args.write_to_db:
+                        save_roll_dates_to_db(volume_roll_df, 'volume', db_connection)
+                    else:
+                        print(f"Volume rolls for {symbol_root} (not writing to DB):\n{volume_roll_df}")
+                else:
+                    print(f"No volume roll dates calculated for {symbol_root}.")
+        
+        # Calendar Roll Calculation (new logic)
+        if args.calculate_calendar_rolls:
+            symbol_roots_cal = [] # Initialize
+            if args.symbol_roots_calendar:
+                symbol_roots_cal = [s.strip().upper() for s in args.symbol_roots_calendar.split(',')]
+            elif args.symbol_roots: # Fallback to general symbols if specific calendar symbols not given
+                print("Using --symbol-roots for calendar roll calculation as --symbol-roots-calendar not specified.")
+                symbol_roots_cal = [s.strip().upper() for s in args.symbol_roots.split(',')]
+            
+            if not symbol_roots_cal:
+                print("No symbol roots specified for calendar roll calculation. Use --symbol-roots-calendar or --symbol-roots when --calculate-calendar-rolls is active.")
+            else: # symbol_roots_cal is populated, proceed with offset parsing and calculation
+                offsets = [] # Initialize offsets
+                try:
+                    offsets = [int(offset.strip()) for offset in args.calendar_roll_offsets.split(',')]
+                    if not all(o > 0 for o in offsets):
+                        raise ValueError("Calendar roll offsets must be positive integers.")
+                except ValueError as e:
+                    print(f"Error: Invalid format for --calendar-roll-offsets. Expected comma-separated positive integers (e.g., '1,2,3'). {e}")
+                    # offsets will remain empty, so the next 'if offsets:' block won't run
 
-        print(f"Calculating '{args.roll_type}' roll dates for: {args.symbol_root}")
-        roll_df = calculate_volume_roll(args.symbol_root, config, db_connection, num_days_before_expiry=args.days)
+                if offsets: # Proceed only if offsets were successfully parsed and are not empty
+                    print(f"Processing calendar offset rolls for: {symbol_roots_cal} with offsets {offsets}")
+                    for symbol_root in symbol_roots_cal:
+                        print(f"--- Calculating Calendar Offset Rolls for {symbol_root} ---")
+                        # Pass the single connection for querying futures_roll_calendar
+                        calendar_df = calculate_calendar_offset_rolls(symbol_root, config, db_connection, offsets)
+                        
+                        if not calendar_df.empty:
+                            if args.write_to_db:
+                                # Iterate through each RollType in the df and save separately
+                                # because save_roll_dates_to_db expects a single roll_type argument
+                                # to set for the entire batch it saves.
+                                for roll_type_val in calendar_df['RollType'].unique():
+                                    df_subset = calendar_df[calendar_df['RollType'] == roll_type_val]
+                                    # The 'RollType' column is already correctly set in df_subset
+                                    # The `roll_type_val` argument to save_roll_dates_to_db will ensure
+                                    # the print messages and any internal logic dependent on it are correct.
+                                    print(f"Saving {len(df_subset)} rows for {symbol_root} with RollType '{roll_type_val}'")
+                                    save_roll_dates_to_db(df_subset, roll_type_val, db_connection)
+                            else:
+                                print(f"Calendar offset rolls for {symbol_root} (not writing to DB):\n{calendar_df}")
+                        else:
+                            print(f"No calendar offset roll dates calculated for {symbol_root}.")
+        # This implicit else (for `if args.calculate_calendar_rolls:`) means no calendar rolls are processed if flag is false.
+        
+        if not args.symbol_roots and not args.calculate_calendar_rolls:
+            print("No action specified. Use --symbol-roots for volume rolls or --calculate-calendar-rolls for calendar rolls.")
 
-        if not roll_df.empty:
-            save_roll_dates_to_db(roll_df, args.roll_type, db_connection)
-
-            if args.output_csv:
-                 output_path = Path(args.output_csv)
-                 output_path.parent.mkdir(parents=True, exist_ok=True)
-                 roll_df.to_csv(output_path, index=False)
-                 print(f"Roll dates also saved to CSV: {output_path}")
-        else:
-            print("No roll dates were calculated.")
-
-    except FileNotFoundError as e:
-        print(f"Error: {e}")
-    except ValueError as e:
-        print(f"Configuration Error: {e}")
-    except RuntimeError as e: # Changed from mcal.InvalidCalendarNameError
-        # Check if it's the specific calendar name error
-        if "is not one of the registered classes" in str(e):
-             print(f"Calendar Error: {e} - Ensure calendar names in {args.config} are valid for pandas-market-calendars.")
-        else:
-             # Log other RuntimeErrors
-             print(f"An unexpected runtime error occurred: {e}")
-             import traceback
-             traceback.print_exc()
     except Exception as e:
-        print(f"An unexpected error occurred: {e}")
+        print(f"An error occurred in main: {e}")
         import traceback
         traceback.print_exc()
     finally:
         if db_connection:
             db_connection.close()
             print("Database connection closed.") 
+
+if __name__ == "__main__":
+    main() 

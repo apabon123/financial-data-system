@@ -7,7 +7,7 @@ SET LOGFILE=logs\update_market_data_v2.log
 echo Starting market data update with the new architecture... >> %LOGFILE%
 echo. >> %LOGFILE%
 
-python -m src.scripts.market_data.update_all_market_data_wrapper %* >> %LOGFILE% 2>>&1
+python -m src.scripts.market_data.update_all_market_data_wrapper --skip-panama %* >> %LOGFILE% 2>>&1
 
 if %ERRORLEVEL% NEQ 0 (
   echo. >> %LOGFILE%

@@ -88,6 +88,7 @@ def parse_arguments():
     parser.add_argument("--skip-es-nq", action="store_true", help="Skip ES/NQ futures update")
     parser.add_argument("--skip-continuous", action="store_true", help="Skip continuous contract generation")
     parser.add_argument("--skip-cleaning", action="store_true", help="Skip data cleaning")
+    parser.add_argument("--skip-panama", action="store_true", help="Skip Panama continuous contract generation specifically (new architecture)")
     
     # New architecture options (will be ignored in legacy mode)
     parser.add_argument("--panama-ratio", type=float, default=0.75,

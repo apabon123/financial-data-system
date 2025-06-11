@@ -187,11 +187,13 @@ CREATE TABLE IF NOT EXISTS continuous_contracts (
     up_volume BIGINT,
     down_volume BIGINT,
     source VARCHAR,
+    built_by VARCHAR,        -- How the continuous row was built ('local_generator', 'tradestation')
     interval_value INTEGER,
     interval_unit VARCHAR,
     adjusted BOOLEAN DEFAULT FALSE,
     quality INTEGER DEFAULT 100,
-    PRIMARY KEY (timestamp, symbol, interval_value, interval_unit)
+    settle DOUBLE,           -- Settlement price. Added missing column
+    PRIMARY KEY (symbol, timestamp, interval_value, interval_unit) -- Changed order
 );
 
 -- Data Cleaning Runs Log Table
@@ -208,6 +210,26 @@ CREATE TABLE IF NOT EXISTS data_cleaning_runs (
     cleaners_applied TEXT, -- Comma-separated list of cleaner names
     fields_modified TEXT, -- Comma-separated list of modified fields
     log_timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP -- When this log entry was created
+);
+
+-- Symbol Metadata Table
+CREATE TABLE IF NOT EXISTS symbol_metadata (
+    symbol VARCHAR NOT NULL,
+    base_symbol VARCHAR,          -- e.g. ES, NQ
+    description VARCHAR,
+    exchange VARCHAR,
+    asset_type VARCHAR,           -- 'future', 'continuous_future', 'equity', 'forex', 'crypto', 'option', 'index'
+    data_source VARCHAR,          -- Preferred data source for this symbol, e.g., 'tradestation', 'ibkr', 'polygon'
+    data_table VARCHAR,           -- Table where data is stored, e.g. 'market_data', 'continuous_contracts'
+    interval_unit VARCHAR,        -- e.g., 'minute', 'daily', 'tick'
+    interval_value INTEGER,       -- e.g., 1, 5, 15 for minutes, or 1 for daily
+    config_path VARCHAR,          -- Path to the specific YAML config for this symbol if applicable
+    start_date DATE,              -- Earliest date for which historical data should be considered/fetched
+    last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    historical_script_path VARCHAR, -- Path to script for historical data
+    update_script_path VARCHAR,   -- Path to script for incremental updates
+    additional_metadata JSON,     -- For any other source or symbol specific metadata
+    PRIMARY KEY (symbol, interval_unit, interval_value)
 );
 
 -- Create standard views

@@ -75,9 +75,10 @@ except ImportError:
         def update(self, *args, **kwargs):
             pass
 
-from ..core.app import get_app
+from ..core.app import get_app, DBInspectorApp
 from ..core.config import get_config
 from ..core.schema import get_schema_manager
+from ..core.database import QueryResult
 
 # Setup logging
 logger = logging.getLogger(__name__)
@@ -85,12 +86,12 @@ logger = logging.getLogger(__name__)
 class DataQualityAnalyzer:
     """Data quality analysis tools for financial market data."""
 
-    def __init__(self):
+    def __init__(self, app_context: Optional[DBInspectorApp] = None):
         """Initialize data quality analyzer."""
         # Check if required dependencies are available
         self._check_dependencies()
 
-        self.app = get_app(db_path="data/financial_data.duckdb")
+        self.app = app_context if app_context else get_app()
         self.config = get_config()
         self.schema_manager = get_schema_manager()
         self.console = Console()
@@ -241,21 +242,39 @@ class DataQualityAnalyzer:
                 query_interval_unit = parsed_interval[1]
                 logger.info(f"User specified interval for continuous contract: {query_interval_value} {query_interval_unit}")
 
-                # If a specific continuous contract (e.g., @ES=102XC) is given 
-                # AND a sub-daily interval is requested, switch to the root symbol (e.g., @ES)
+                # If a specific continuous contract (e.g., @ES=102XC_d) is given 
+                # AND a sub-daily interval is requested, we should use the given symbol directly.
+                # The original logic incorrectly switched to a generic root symbol.
                 if symbol and "=" in symbol and query_interval_unit != "daily":
-                    root_symbol_candidate = symbol.split("=")[0]
-                    # Basic validation: check if it looks like a root (e.g., starts with @, doesn't have too many chars after @)
-                    if root_symbol_candidate.startswith("@") and len(root_symbol_candidate) < 6: # Heuristic
-                        logger.info(f"Sub-daily interval ('{query_interval_unit}') requested for specific continuous symbol '{symbol}'. Switching to root symbol '{root_symbol_candidate}' for analysis.")
-                        query_symbol = root_symbol_candidate
-                    else:
-                        logger.warning(f"Could not reliably determine root symbol from '{symbol}' for sub-daily analysis. Proceeding with original symbol.")
+                    # Check if it looks like a specific continuous symbol (e.g. @ES=102XC or @ES=102XC_d)
+                    # If so, we intend to use this specific symbol, not derive a root.
+                    logger.info(f"Sub-daily interval ('{query_interval_unit}') requested for specific continuous symbol '{symbol}'. Verifying symbol for query.")
+                    # No change to query_symbol here, it will use the original 'symbol'
+                    # The old logic was:
+                    # root_symbol_candidate = symbol.split("=")[0]
+                    # if root_symbol_candidate.startswith("@") and len(root_symbol_candidate) < 6: # Heuristic
+                    #     logger.info(f"Switching to root symbol '{root_symbol_candidate}' for analysis.")
+                    #     query_symbol = root_symbol_candidate 
+                    # else:
+                    #     logger.warning(f"Could not reliably determine root symbol from '{symbol}'. Proceeding with original symbol.")
+                    # Ensure query_symbol remains the initially provided symbol in this path
+                    pass # Explicitly do nothing to query_symbol, it remains as the original 'symbol'
             else:
-                # Default to daily if no interval is specified by the user for continuous contracts
-                query_interval_value = 1
-                query_interval_unit = "daily"
-                logger.info(f"No interval specified for continuous contract. Defaulting to {query_interval_value} {query_interval_unit}.")
+                # If no interval is specified by the user for continuous contracts,
+                # query_interval_value and query_interval_unit will remain None.
+                # This means the query will not filter by a specific interval,
+                # effectively using the intervals stored with that continuous contract symbol.
+                query_interval_value = None
+                query_interval_unit = None
+                if symbol and "=" in symbol: # Only log this if it looks like a continuous symbol
+                    logger.info(f"No interval specified for continuous symbol '{symbol}'. Will use stored interval(s).")
+                # If an interval *was* parsed, but it was daily (e.g. user entered '1D' for continuous),
+                # ensure these are still set for the query if we didn't go into the sub-daily specific path.
+                elif parsed_interval and parsed_interval[1] == "daily":
+                    query_interval_value = parsed_interval[0]
+                    query_interval_unit = parsed_interval[1]
+                    logger.info(f"Using specified daily interval for continuous symbol '{symbol}': {query_interval_value} {query_interval_unit}")
+
         else:
             target_table = "market_data"
             date_column = "timestamp"
@@ -1486,9 +1505,9 @@ class DataQualityAnalyzer:
                     end_date_str = Prompt.ask("Enter end date (YYYY-MM-DD, optional)", default=None)
                     
                     # --- Interval Selection ---
-                    interval_prompt = "Enter data interval (e.g., 1D, 1H, 30Min, optional, default: 1D for individual, best available for continuous)"
-                    default_interval = None if is_continuous else "1D" # Continuous might infer best, individual defaults to Daily
-                    interval = Prompt.ask(interval_prompt, default=default_interval)
+                    default_interval_display = "(e.g., 1D, 30Min. For continuous, omit to use stored interval, or specify to filter)"
+                    interval_prompt = f"Enter data interval {default_interval_display}:"
+                    interval = Prompt.ask(interval_prompt, default=None) # Default to None, logic will handle it
 
                     # Validate and parse dates
                     start_date, end_date = None, None
@@ -1637,18 +1656,18 @@ def _format_duration(seconds: Union[float, int]) -> str:
     return " ".join(parts)
 
 # Global instance
-quality_analyzer = None
+quality_analyzer_instance: Optional[DataQualityAnalyzer] = None
 
-def get_quality_analyzer() -> DataQualityAnalyzer:
+def get_quality_analyzer(app_context: Optional[DBInspectorApp] = None) -> DataQualityAnalyzer:
     """
     Get the global data quality analyzer instance.
-    
-    Returns:
-        Global data quality analyzer instance
+    If app_context is provided, it can be used to create a new instance.
     """
-    global quality_analyzer
+    global quality_analyzer_instance
     
-    if quality_analyzer is None:
-        quality_analyzer = DataQualityAnalyzer()
+    if app_context is not None or quality_analyzer_instance is None:
+        quality_analyzer_instance = DataQualityAnalyzer(app_context=app_context)
+    elif quality_analyzer_instance.app != (app_context if app_context else get_app()):
+        quality_analyzer_instance = DataQualityAnalyzer(app_context=app_context)
         
-    return quality_analyzer
+    return quality_analyzer_instance

@@ -326,11 +326,13 @@ class DBInspectorApp:
         logger.info("DB Inspector application shutdown complete")
 
 # Global instance
-app = None
+app: Optional[DBInspectorApp] = None # Added type hint
 
 def get_app(db_path: Optional[Union[str, Path]] = None, read_only: bool = True) -> DBInspectorApp:
     """
     Get the global application instance.
+    If db_path is provided, or if the existing app's read_only status differs,
+    a new instance is created.
     
     Args:
         db_path: Path to database file
@@ -341,7 +343,38 @@ def get_app(db_path: Optional[Union[str, Path]] = None, read_only: bool = True) 
     """
     global app
     
-    if app is None or db_path is not None:
+    should_reinitialize = False
+    if app is None:
+        should_reinitialize = True
+    elif db_path is not None and Path(app.db_manager.db_path) != Path(db_path):
+        logger.info(f"DB path changed from {app.db_manager.db_path} to {db_path}. Re-initializing app.")
+        app.shutdown() # Shutdown old instance
+        should_reinitialize = True
+    elif app.db_manager.read_only != read_only:
+        logger.info(f"Read-only mode changed from {app.db_manager.read_only} to {read_only}. Re-initializing app.")
+        app.shutdown() # Shutdown old instance
+        should_reinitialize = True
+    
+    if should_reinitialize:
+        logger.info(f"Creating new DBInspectorApp instance. DB: {db_path or 'default'}, Read-only: {read_only}")
         app = DBInspectorApp(db_path, read_only)
-        
+    
     return app
+
+def close_and_clear_global_app_instance() -> None:
+    """
+    Shuts down the current global app instance (if it exists) and sets it to None.
+    This is useful for ensuring resources like database connections are released,
+    especially before an external script might need to access the same resources.
+    """
+    global app
+    if app is not None:
+        logger.info("Shutting down and clearing global DBInspectorApp instance.")
+        try:
+            app.shutdown()
+        except Exception as e:
+            logger.error(f"Error during explicit shutdown of global app instance: {e}", exc_info=True)
+        finally:
+            app = None
+    else:
+        logger.info("No global DBInspectorApp instance to clear.")

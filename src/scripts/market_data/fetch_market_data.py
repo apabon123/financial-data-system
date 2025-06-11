@@ -8,24 +8,30 @@ It first checks the database to see what data is already available, then fetches
 
 import os
 import sys
-import yaml
-import time
 import logging
-import argparse
-from datetime import datetime, timedelta, date
-from dateutil.relativedelta import relativedelta
 import pandas as pd
-import requests
+import numpy as np
+from datetime import datetime, timedelta, date
+from typing import Optional, Dict, Any, List, Union, Tuple
+import yaml
 import duckdb
 from pathlib import Path
-from dotenv import load_dotenv
-from typing import List, Dict, Any, Optional
-import re
 import pandas_market_calendars as mcal
-import io
+from dotenv import load_dotenv
+import requests
+import re
+import time # Added import
+import io # Added import, was implicitly used in _fetch_cboe_vx_daily
 
 # Load environment variables
-load_dotenv(os.path.join(os.path.dirname(os.path.dirname(__file__)), 'config', '.env'))
+load_dotenv()
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
 # Add the project root directory to the Python path
 project_root = str(Path(__file__).resolve().parent.parent.parent.parent)
@@ -34,14 +40,6 @@ project_root = str(Path(__file__).resolve().parent.parent.parent.parent)
 
 # Import from our project
 from src.agents.market import TradeStationMarketDataAgent
-
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='[%(asctime)s] %(levelname)-8s %(message)s',
-    datefmt='%H:%M:%S'
-)
-logger = logging.getLogger(__name__)
 
 # Get database path from environment variable
 DATA_DIR = os.getenv('DATA_DIR', './data')
@@ -83,48 +81,77 @@ def get_trading_calendar(calendar_name='NYSE'): # Default to NYSE if not specifi
 # --- End Expiry Calendar Helper --- #
 
 class MarketDataFetcher:
-    """Class to fetch market data from TradeStation and update the database."""
+    """Fetches market data from various sources."""
     
-    def __init__(self, config_path=None, start_date=None, db_path=None, existing_conn=None):
-        """Initialize the market data fetcher.
+    def __init__(self, db_path: Optional[str] = None, config_path: Optional[str] = None, db_connector: Optional[Any] = None, existing_conn: Optional[Any] = None): # Added existing_conn
+        """
+        Initialize the MarketDataFetcher.
         
         Args:
-            config_path: Path to config file (optional)
-            start_date: Start date for historical data (optional)
-            db_path: Path to the database file (optional, used if existing_conn is None)
-            existing_conn: An existing DuckDB connection object (optional)
+            db_path: Path to the database file
+            config_path: Path to the configuration file
+            db_connector: Optional existing database connection
+            existing_conn: Alias for db_connector
         """
+        # Load main configuration
+        if config_path is None:
+            config_path = os.path.join(project_root, 'config', 'market_symbols.yaml')
+        
+        try:
+            with open(config_path, 'r') as f:
+                self.config = yaml.safe_load(f)
+            logger.info(f"Main configuration (market_symbols.yaml) loaded successfully from {config_path}.")
+        except Exception as e:
+            logger.error(f"Error loading main configuration from {config_path}: {e}")
+            self.config = {}
+        
+        # Load futures.yaml configuration
+        futures_yaml_path = os.path.join(project_root, 'config', 'futures.yaml')
+        try:
+            with open(futures_yaml_path, 'r') as f:
+                self.futures_config = yaml.safe_load(f)
+            logger.info(f"Futures configuration (futures.yaml) loaded successfully from {futures_yaml_path}.")
+        except Exception as e:
+            logger.error(f"Error loading futures configuration from {futures_yaml_path}: {e}")
+            self.futures_config = {}
+        
+        # Initialize database connection
+        conn_to_use = db_connector if db_connector else existing_conn # Prioritize db_connector
+        if conn_to_use:
+            self.conn = conn_to_use
+            logger.info("Using provided database connection.")
+        else:
+            logger.info("No existing connection passed, MarketDataFetcher creating its own.")
+            if db_path is None:
+                db_path = os.path.join(project_root, 'data', 'financial_data.duckdb')
+            self.conn = duckdb.connect(db_path)
+            logger.info(f"Connected to database: {db_path}")
+        
+        # Initialize database schema
+        self._setup_database()
+        logger.info("Database schema initialized")
+        
         # Set up logger
         self.logger = logging.getLogger(__name__)
         self.logger.setLevel(logging.INFO)
         
-        # Load configuration
-        self.config = self._load_config(config_path) if config_path else {}
-        
-        # Set start date
-        self.start_date = pd.Timestamp(start_date) if start_date else pd.Timestamp('2010-01-01')
-        
-        # Set database path (needed even if connection is passed, for other logic potentially)
-        self.db_path = db_path or self.config.get('settings', {}).get('database_path', DEFAULT_DB_PATH)
-        
-        # Initialize database connection
-        if existing_conn:
-            self.conn = existing_conn
-            logger.info("Using existing database connection for MarketDataFetcher.")
-        else:
-            logger.info("No existing connection passed, MarketDataFetcher creating its own.")
-            self.conn = self._connect_database()
-            
-        # Setup schema (safe to run even on existing connection)
-        self._setup_database()
-        
         # Initialize TradeStation agent
         self.ts_agent = TradeStationMarketDataAgent(database_path=':memory:', verbose=False)
-        
+        try:
+            self.ts_agent.connect()
+            logger.info("TradeStation agent connected successfully.")
+        except Exception as e:
+            logger.error(f"Failed to connect TradeStation agent: {e}")
+            # Depending on the desired behavior, you might want to raise the exception
+            # or handle it by setting a flag that prevents TS-dependent operations.
+            # For now, we log the error and the ts_agent will not have an access_token.
+
         # Add VALID_UNITS attribute to the ts_agent if it doesn't exist
         if not hasattr(self.ts_agent, 'VALID_UNITS'):
             self.ts_agent.VALID_UNITS = ['daily', 'minute', 'weekly', 'monthly']
             
+        self.default_start_date = pd.Timestamp("2000-01-01") # Added default start date
+        
         # Create a requests session for reuse
         self.session = requests.Session()
         self.max_retries = 3
@@ -132,6 +159,7 @@ class MarketDataFetcher:
         
         # Store config path for potential reloads or use by other methods
         self._config_path = config_path 
+        self._futures_specific_config_path = futures_yaml_path # Store this path too
             
     def set_connection(self, new_conn):
         """Update the internal database connection object."""
@@ -158,52 +186,103 @@ class MarketDataFetcher:
             sys.exit(1)
         
     def _setup_database(self):
-        """Set up the database schema if it doesn't exist."""
+        """Initialize the database schema."""
         try:
-            # Create market_data table if it doesn't exist
+            # Create tables if they don't exist
             self.conn.execute("""
-            CREATE TABLE IF NOT EXISTS market_data (
-                timestamp TIMESTAMP,
-                symbol VARCHAR,
-                open DOUBLE,
-                high DOUBLE,
-                low DOUBLE,
-                close DOUBLE,
-                volume BIGINT,
-                up_volume BIGINT,
-                down_volume BIGINT,
-                source VARCHAR,
-                interval_value INTEGER,
-                interval_unit VARCHAR,
-                adjusted BOOLEAN,
-                quality INTEGER,
-                PRIMARY KEY (timestamp, symbol, interval_value, interval_unit)
-            )
+                CREATE TABLE IF NOT EXISTS market_data (
+                    timestamp TIMESTAMP NOT NULL,
+                    symbol VARCHAR NOT NULL,
+                    open DOUBLE,
+                    high DOUBLE,
+                    low DOUBLE,
+                    close DOUBLE,
+                    volume BIGINT,
+                    open_interest BIGINT,
+                    up_volume BIGINT,
+                    down_volume BIGINT,
+                    source VARCHAR,
+                    interval_value INTEGER,
+                    interval_unit VARCHAR,
+                    adjusted BOOLEAN DEFAULT FALSE,
+                    quality INTEGER DEFAULT 100,
+                    PRIMARY KEY (timestamp, symbol, interval_value, interval_unit)
+                );
             """)
-            logger.info("Database schema initialized")
-        except Exception as e:
-            logger.error(f"Error setting up database: {e}")
-            sys.exit(1)
-        
-    def _load_config(self, config_path):
-        """Load the configuration from the YAML file."""
-        try:
-            # If config_path is relative, make it relative to project root
-            if not os.path.isabs(config_path):
-                config_path = os.path.join(project_root, config_path)
             
-            with open(config_path, 'r') as f:
-                return yaml.safe_load(f)
+            self.conn.execute("""
+                CREATE TABLE IF NOT EXISTS futures_contracts (
+                    symbol VARCHAR NOT NULL,
+                    expiration_date DATE NOT NULL,
+                    roll_date DATE,
+                    is_active BOOLEAN DEFAULT TRUE,
+                    PRIMARY KEY (symbol, expiration_date)
+                );
+            """)
+            
+            self.conn.execute("""
+                CREATE TABLE IF NOT EXISTS continuous_contracts (
+                    timestamp TIMESTAMP NOT NULL,
+                    symbol VARCHAR NOT NULL,
+                    underlying_symbol VARCHAR,
+                    open DOUBLE,
+                    high DOUBLE,
+                    low DOUBLE,
+                    close DOUBLE,
+                    volume BIGINT,
+                    open_interest BIGINT,
+                    up_volume BIGINT,
+                    down_volume BIGINT,
+                    source VARCHAR,
+                    built_by VARCHAR,
+                    interval_value INTEGER,
+                    interval_unit VARCHAR,
+                    adjusted BOOLEAN DEFAULT FALSE,
+                    quality INTEGER DEFAULT 100,
+                    settle DOUBLE,
+                    PRIMARY KEY (symbol, timestamp, interval_value, interval_unit)
+                );
+            """)
+            
+            # Create indexes
+            self.conn.execute("CREATE INDEX IF NOT EXISTS idx_market_data_symbol ON market_data(symbol);")
+            self.conn.execute("CREATE INDEX IF NOT EXISTS idx_market_data_timestamp ON market_data(timestamp);")
+            self.conn.execute("CREATE INDEX IF NOT EXISTS idx_continuous_contracts_symbol ON continuous_contracts(symbol);")
+            self.conn.execute("CREATE INDEX IF NOT EXISTS idx_continuous_contracts_timestamp ON continuous_contracts(timestamp);")
+            
+            logger.info("Database schema initialized successfully")
         except Exception as e:
-            logger.error(f"Error loading configuration: {e}")
-            sys.exit(1)
+            logger.error(f"Error initializing database schema: {e}")
+            raise
+        
+    def _load_yaml_file(self, file_path: str, description: str) -> Dict[str, Any]:
+        """Loads a single YAML file and returns its content or an empty dict on error."""
+        try:
+            # If file_path is relative, make it relative to project root
+            abs_file_path = Path(file_path)
+            if not abs_file_path.is_absolute():
+                abs_file_path = Path(project_root) / file_path
+            
+            if not abs_file_path.exists():
+                self.logger.warning(f"{description} file not found at {abs_file_path}. Returning empty config.")
+                return {}
+            
+            with open(abs_file_path, 'r') as f:
+                content = yaml.safe_load(f)
+                self.logger.info(f"{description} loaded successfully from {abs_file_path}.")
+                return content if content else {} # Ensure return {} if file is empty
+        except Exception as e:
+            self.logger.error(f"Error loading {description} from {file_path}: {e}")
+            return {} # Return empty dict on any error
     
-    def get_latest_date_in_db(self, symbol):
+    def get_latest_date_in_db(self, symbol: str, interval_value: Optional[int] = None, interval_unit: Optional[str] = None):
         """
-        Get the latest date for a symbol in the database.
+        Get the latest date for a symbol in the database, optionally filtered by interval.
         
         Args:
             symbol: The symbol to check
+            interval_value: Optional interval value to filter by
+            interval_unit: Optional interval unit to filter by
             
         Returns:
             The latest date as a datetime object, or None if no data exists
@@ -212,9 +291,15 @@ class MarketDataFetcher:
             query = f"""
             SELECT MAX(timestamp) as latest_date
             FROM market_data
-            WHERE symbol = '{symbol}'
+            WHERE symbol = ?
             """
-            result = self.conn.execute(query).fetchone()
+            params = [symbol]
+            
+            if interval_value is not None and interval_unit is not None:
+                query += " AND interval_value = ? AND interval_unit = ?"
+                params.extend([interval_value, interval_unit])
+            
+            result = self.conn.execute(query, params).fetchone()
             
             if result and result[0]:
                 return pd.to_datetime(result[0])
@@ -885,6 +970,63 @@ class MarketDataFetcher:
             logger.error(f"Error getting existing data for {symbol}: {e}")
             return pd.DataFrame()
     
+    def _get_contract_details_from_symbol(self, symbol: str) -> Optional[Tuple[str, str, int, int]]:
+        """Parse a futures contract symbol to extract its components.
+
+        Args:
+            symbol: The futures contract symbol (e.g., ESH25, VXU24, ZWZ23).
+
+        Returns:
+            A tuple (root_symbol, month_code, year, month_number) or None if parsing fails.
+        """
+        # Regex to capture root (1-3 letters), month code (1 letter), and year (1 or 2 digits)
+        match = re.fullmatch(r"([A-Z]{1,3})([FGHJKMNQUVXZ])([0-9]{1,2})$", symbol)
+        if not match:
+            self.logger.debug(f"Could not parse futures symbol: {symbol} with regex.")
+            return None
+
+        root_symbol, month_code, year_str = match.groups()
+
+        # Convert year_str to a full 4-digit year
+        current_year = datetime.now().year
+        current_century = (current_year // 100) * 100
+        year_int = int(year_str)
+
+        if len(year_str) == 1: # e.g., ZCH5 -> ZCH2025 (assuming current decade)
+            # This logic might need refinement if single-digit years span across decade changes frequently.
+            # For now, assume it's current decade or next if single digit implies roll-over.
+            year = (current_year // 10) * 10 + year_int 
+            if year < current_year - 2: # Heuristic: if calculated year is too far in past, assume next decade
+                year += 10
+        elif len(year_str) == 2: # e.g., ESH25 -> ESH2025
+            # Heuristic: if year_int is e.g. 99 and current year is 2023, it's 1999.
+            # If year_int is 03 and current year is 2023, it's 2003.
+            # If year_int is 25 and current year is 2023, it's 2025.
+            # If year_int is (current_year % 100 + 5) % 100 (e.g. 23+5=28 for 2023)
+            # it's likely current century. If it's much smaller, (e.g. 01 for 2023) it's current century.
+            # If it's much larger (e.g. 98 for 2003), it's previous century.
+            if year_int + current_century > current_year + 70: # Heuristic for previous century
+                year = current_century - 100 + year_int
+            else:
+                year = current_century + year_int
+        else:
+            # Should not happen with the regex, but as a fallback
+            self.logger.error(f"Unexpected year string format '{year_str}' for symbol {symbol}")
+            return None
+
+        month_map = {
+            'F': 1, 'G': 2, 'H': 3, 'J': 4, 'K': 5, 'M': 6,
+            'N': 7, 'Q': 8, 'U': 9, 'V': 10, 'X': 11, 'Z': 12
+        }
+        month_number = month_map.get(month_code)
+
+        if month_number is None:
+            self.logger.error(f"Invalid month code '{month_code}' for symbol {symbol}")
+            return None
+
+        # self.logger.debug(f"Parsed {symbol} -> Root: {root_symbol}, Code: {month_code}, Year: {year}, MonthNum: {month_number}")
+        return root_symbol, month_code, year, month_number
+
     # --- NEW Expiry Calculation Method (Adapted from calculate_volume_roll_dates.py) --- #
     def _calculate_expiry_date_from_config(self, calendar, symbol_config, contract_year, contract_month_code):
         """
@@ -982,16 +1124,9 @@ class MarketDataFetcher:
                     # --- MODIFIED CHECK: Use valid_days index instead of is_session ---
                     # Ensure potential_expiry is normalized and timezone-naive for comparison
                     potential_expiry_normalized = potential_expiry.normalize()
-                    # We need valid_days covering the *potential_expiry* date's month, not just the *next* month.
-                    # Re-fetch valid_days around the potential_expiry date.
-                    check_start = potential_expiry_normalized - timedelta(days=5)
-                    check_end = potential_expiry_normalized + timedelta(days=5)
-                    valid_days_check = calendar.valid_days(start_date=check_start.strftime('%Y-%m-%d'),
-                                                           end_date=check_end.strftime('%Y-%m-%d'))
-                    if valid_days_check.tz is not None:
-                         valid_days_check = valid_days_check.tz_localize(None)
-
-                    if potential_expiry_normalized in valid_days_check:
+                    
+                    # Check if potential_expiry_normalized is a valid trading day
+                    if not trading_calendar.valid_days(start_date=potential_expiry_normalized, end_date=potential_expiry_normalized).empty:
                     # -----------------------------------------------------------------
                         return potential_expiry_normalized # Return Timestamp
                     else:
@@ -1024,51 +1159,394 @@ class MarketDataFetcher:
     # --- END NEW Expiry Calculation Method --- #
 
     def calculate_expiration_date(self, symbol: str) -> Optional[pd.Timestamp]:
-        """Calculate the expiration date for a specific futures contract symbol.
-           Uses the detailed _calculate_expiry_date_from_config method.
         """
-        # 1. Parse symbol to get base, month code, year
-        match = re.match(r"^([A-Z]{1,3})([FGHJKMNQUVXZ])([0-9]{1,2})$", symbol)
-        if not match:
-            self.logger.warning(f"Cannot parse futures contract symbol format: {symbol}")
-            return None
-        base_symbol, month_code, year_code = match.groups()
-        
-        # Convert year code to full year (assuming 20xx)
-        try:
-            year_int = int(year_code)
-            contract_year = 2000 + year_int
-            # Add simple validation for sensible year range if needed
-            current_year = pd.Timestamp.now().year
-            if not (2000 <= contract_year <= current_year + 5): # Allow some future years
-                 self.logger.warning(f"Parsed year {contract_year} from symbol {symbol} seems unlikely. Check symbol format.")
-                 # Continue for now, but could return None
-        except ValueError:
-             self.logger.error(f"Could not convert year code '{year_code}' to integer for symbol {symbol}")
-             return None
+        Calculate the expiration date of a given futures contract symbol.
+        This method relies on rules defined in 'futures.yaml' and resolved via _get_symbol_config.
+        """
+        logger.debug(f"Calculating expiration for symbol: {symbol}")
 
-        # 2. Get config for the base symbol
-        symbol_config = self._get_symbol_config(base_symbol)
-        if not symbol_config:
-            self.logger.warning(f"No configuration found for base symbol '{base_symbol}' when calculating expiry for {symbol}.")
+        contract_details = self._get_contract_details_from_symbol(symbol)
+        if not contract_details:
+            logger.warning(f"Could not parse contract details from symbol: {symbol}")
             return None
+        
+        root_symbol, contract_month_code, contract_year, contract_month_num = contract_details
+        
+        # Get the fully resolved configuration for the root symbol (includes inherited templates)
+        future_product_config = self._get_symbol_config(root_symbol) 
+        if not future_product_config:
+            logger.warning(f"No configuration (after merge) found for root symbol '{root_symbol}' when calculating expiration for {symbol}. Source: {getattr(future_product_config, '_config_source', 'N/A')}")
+            return None
+        
+        # --- ADDED DEBUG LOGGING ---
+        logger.debug(f"[{symbol}] future_product_config keys: {list(future_product_config.keys())}")
+        logger.debug(f"[{symbol}] Full future_product_config: {future_product_config}")
+        # --- END ADDED DEBUG LOGGING ---
             
-        # 3. Get the correct trading calendar
-        calendar_name = symbol_config.get('calendar', 'NYSE') # Default to NYSE if not specified
+        # Get the expiry_rule dictionary from the resolved future_product_config
+        # This expiry_rule should contain the actual rule definition (e.g., 'rule', 'special_rule') and calendar info
+        expiry_rule_config = future_product_config.get('expiry_rule')
+        
+        # --- ADDED DEBUG LOGGING ---
+        logger.debug(f"[{symbol}] expiry_rule_config from future_product_config.get('expiry_rule'): {expiry_rule_config}")
+        # --- END ADDED DEBUG LOGGING ---
+
+        if not expiry_rule_config or not isinstance(expiry_rule_config, dict):
+            logger.warning(f"No 'expiry_rule' dictionary found in the resolved configuration for root symbol '{root_symbol}' (contract {symbol}). Config keys: {list(future_product_config.keys()) if future_product_config else 'None'}. Source: {future_product_config.get('_config_source', 'N/A')}")
+            return None
+
+        # Extract the rule definition and calendar from the expiry_rule_config
+        actual_rule_definition = expiry_rule_config.get('rule') 
+        special_rule_type = expiry_rule_config.get('special_rule')
+        # Calendar can be in expiry_rule_config, or at future_product_config level, or default to NYSE
+        calendar_name = expiry_rule_config.get('calendar', future_product_config.get('calendar', 'NYSE'))
+        
         try:
-             calendar = get_trading_calendar(calendar_name) # Use the helper function in this file
-        except Exception as e:
-             self.logger.error(f"Failed to get trading calendar '{calendar_name}' for {symbol}: {e}")
-             return None
-             
-        # 4. Call the detailed calculation method
-        try:
-             expiry_date = self._calculate_expiry_date_from_config(calendar, symbol_config, contract_year, month_code)
-             # Method returns normalized Timestamp or None
-             return expiry_date 
-        except Exception as e:
-             self.logger.error(f"Error during detailed expiry calculation for {symbol}: {e}", exc_info=True)
-             return None
+            trading_calendar = get_trading_calendar(calendar_name)
+        except ValueError as e:
+            logger.error(f"Failed to get trading calendar '{calendar_name}' for {symbol}: {e}")
+            return None
+
+        expiry_date = None
+        
+        # --- Get the actual rule details ---
+        # The 'rule' could be a string (e.g., "third_friday") or a dictionary (e.g., for VX_expiry or nth_weekday)
+        # The 'expiry_rule' variable here will hold the actual rule definition.
+        # 'expiry_rule_config' is the dict that *contains* the rule definition (and calendar).
+        
+        actual_rule_definition = expiry_rule_config.get('rule') # This might be None if rule is defined by other keys like 'special_rule'
+        
+        # Check for special_rule (like VX_expiry) first if actual_rule_definition is not a simple string
+        # or if the structure implies a special rule (e.g., presence of 'special_rule' key)
+        
+        special_rule_type = expiry_rule_config.get('special_rule') # e.g., "VX_expiry"
+
+        # Rule: Third Friday of the contract month
+        if actual_rule_definition == "third_friday":
+            # Find the first day of the contract month
+            first_day_of_month = date(contract_year, contract_month_num, 1)
+            
+            # Determine the day of the week for the first day (0=Monday, 4=Friday)
+            day_of_week_first_day = first_day_of_month.weekday()
+            
+            # Calculate days needed to reach the first Friday
+            # If first day is Friday (4), days_to_first_friday is 0.
+            # If first day is Saturday (5), days_to_first_friday is 6 (next Friday).
+            # If first day is Sunday (6), days_to_first_friday is 5.
+            # Formula: (4 - day_of_week_first_day + 7) % 7
+            days_to_first_friday = (4 - day_of_week_first_day + 7) % 7
+            first_friday = first_day_of_month + timedelta(days=days_to_first_friday)
+            
+            # The third Friday is 14 days after the first Friday
+            expiry_dt = first_friday + timedelta(weeks=2)
+            expiry_date = pd.Timestamp(expiry_dt)
+
+        # Rule: Nth specific weekday of the month (e.g., 2nd Tuesday)
+        elif isinstance(actual_rule_definition, dict) and "nth_weekday" in actual_rule_definition:
+            try:
+                n = actual_rule_definition["nth_weekday"]["n"] # e.g., 3 for third
+                weekday_target = actual_rule_definition["nth_weekday"]["weekday"] # e.g., "Wednesday" or 2 (0=Mon)
+                
+                if isinstance(weekday_target, str):
+                    weekday_map = {"monday": 0, "tuesday": 1, "wednesday": 2, "thursday": 3, "friday": 4, "saturday": 5, "sunday": 6}
+                    weekday_int = weekday_map.get(weekday_target.lower())
+                    if weekday_int is None:
+                        logger.error(f"Invalid weekday name '{weekday_target}' in expiry rule for {symbol}.")
+                        return None
+                elif isinstance(weekday_target, int):
+                    weekday_int = weekday_target
+                else:
+                    logger.error(f"Invalid weekday format '{weekday_target}' in expiry rule for {symbol}.")
+                    return None
+
+                first_day_of_month = date(contract_year, contract_month_num, 1)
+                day_of_week_first_day = first_day_of_month.weekday() # 0=Monday
+
+                days_to_first_target_weekday = (weekday_int - day_of_week_first_day + 7) % 7
+                first_target_weekday_date = first_day_of_month + timedelta(days=days_to_first_target_weekday)
+                
+                # Add (n-1) weeks to the first target weekday
+                nth_target_weekday_date = first_target_weekday_date + timedelta(weeks=n - 1)
+                
+                # Check if this date is still in the contract month
+                if nth_target_weekday_date.month == contract_month_num:
+                    expiry_date = pd.Timestamp(nth_target_weekday_date)
+                else:
+                    # This can happen if e.g. 5th Friday is requested but month doesn't have one
+                    logger.warning(f"Calculated {n}th {weekday_target} ({nth_target_weekday_date}) is not in contract month {contract_month_num} for {symbol}. Trying prior week.")
+                    # Fallback: try (n-1)th target weekday (which is (n-2) weeks from first)
+                    # This logic might need refinement based on specific exchange rules for such edge cases.
+                    # For now, let's assume it means the last such weekday in the month.
+                    # A simpler approach for "last X day" would be to find first of NEXT month, subtract days.
+                    # However, this rule is for Nth weekday. If 5th is requested and doesn't exist, it usually means the contract spec is different.
+                    # For now, this will likely fail or give an unexpected result if n is too large.
+                    expiry_date = pd.Timestamp(first_target_weekday_date + timedelta(weeks=n-2)) # try one week earlier
+                    if expiry_date.month != contract_month_num:
+                         logger.error(f"Could not determine {n}th {weekday_target} for {symbol} within contract month after fallback.")
+                         return None
+            except KeyError as ke:
+                logger.error(f"Missing key {ke} in 'nth_weekday' expiry rule for {symbol}.")
+                return None
+            except Exception as e_nth:
+                logger.error(f"Error processing 'nth_weekday' rule for {symbol}: {e_nth}")
+                return None
+
+        # Rule: Tuesday prior to the week of the third Wednesday of the month
+        # Used by VIX Futures (VX) - This was a direct string check, now superseded by special_rule
+        # elif actual_rule_definition == "tuesday_before_third_wednesday_week":
+            # ... (logic for this was here, now handled by vx_style/VX_expiry below)
+
+        # Rule: Business day prior to the business day prior to the 25th day of the month prior to the contract month
+        # (Example logic for a complex rule like some CL contracts, needs verification)
+        elif actual_rule_definition == "cl_style_approx": # This is an example, actual CL rules are complex
+            month_prior = contract_month_num - 1
+            year_prior = contract_year
+            if month_prior == 0:
+                month_prior = 12
+                year_prior -= 1
+            
+            target_day = date(year_prior, month_prior, 25)
+            
+            # Get schedule around target_day
+            schedule = trading_calendar.schedule(start_date=target_day - timedelta(days=10), end_date=target_day + timedelta(days=2))
+            if schedule.empty:
+                logger.warning(f"Trading calendar '{calendar_name}' returned empty schedule around {target_day} for {symbol}")
+                return None
+
+            # Business day strictly prior to the 25th (if 25th is not a business day) or the 25th if it is
+            # Find first trading day <= 25th
+            actual_25th_or_prior_trading_day = schedule[schedule.index <= pd.Timestamp(target_day)].index.max()
+            
+            # Business day prior to that
+            idx_loc = schedule.index.get_loc(actual_25th_or_prior_trading_day)
+            if idx_loc > 0:
+                day_minus_1 = schedule.index[idx_loc - 1]
+                # Business day prior to THAT (day_minus_2)
+                if idx_loc > 1:
+                    day_minus_2 = schedule.index[idx_loc - 2]
+                    expiry_date = day_minus_2
+                else:
+                    logger.warning(f"Not enough trading days before {actual_25th_or_prior_trading_day} for CL style rule for {symbol}")
+                    return None
+            else:
+                logger.warning(f"Cannot find trading day prior to {actual_25th_or_prior_trading_day} for CL style rule for {symbol}")
+                return None
+
+        # Rule: Specific day of the month (e.g., 15th), if it's a business day, else prior business day.
+        elif isinstance(actual_rule_definition, dict) and "day_of_month" in actual_rule_definition:
+            try:
+                day = actual_rule_definition["day_of_month"]["day"]
+                settlement_logic = actual_rule_definition["day_of_month"].get("settlement", "same_day_or_prior_bday") # 'same_day_or_prior_bday' or 'exact_day'
+
+                # Tentative expiry date
+                tentative_expiry_dt = date(contract_year, contract_month_num, day)
+
+                if settlement_logic == "exact_day":
+                    expiry_date = pd.Timestamp(tentative_expiry_dt)
+                elif settlement_logic == "same_day_or_prior_bday":
+                    # Check if this day is a trading day
+                    schedule = trading_calendar.schedule(start_date=tentative_expiry_dt - timedelta(days=7), end_date=tentative_expiry_dt + timedelta(days=7))
+                    if schedule.empty:
+                         logger.warning(f"Trading calendar '{calendar_name}' returned empty schedule around {tentative_expiry_dt} for {symbol}")
+                         return None
+                    
+                    # Find the closest trading session at or before the tentative_expiry_dt
+                    valid_expiry_dates = schedule.index[schedule.index <= pd.Timestamp(tentative_expiry_dt)]
+                    if not valid_expiry_dates.empty:
+                        expiry_date = valid_expiry_dates.max()
+                    else:
+                        # Should not happen if calendar is correct and range is sufficient
+                        logger.error(f"Could not find a valid trading day at or before {tentative_expiry_dt} for {symbol} on calendar {calendar_name}")
+                        return None
+                else:
+                    logger.error(f"Unknown settlement logic '{settlement_logic}' for day_of_month rule for {symbol}")
+                    return None
+
+            except KeyError as ke:
+                logger.error(f"Missing key {ke} in 'day_of_month' expiry rule for {symbol}.")
+                return None
+            except ValueError as ve: # e.g. day is 31 for a 30 day month
+                logger.error(f"Date value error for 'day_of_month' rule for {symbol} (Year {contract_year}, Month {contract_month_num}, Day {day}): {ve}")
+                return None
+
+
+        # Rule: Specific date (YYYY-MM-DD) - for overrides or very specific contracts
+        elif isinstance(actual_rule_definition, str) and re.match(r"\d{4}-\d{2}-\d{2}", actual_rule_definition):
+            try:
+                expiry_date = pd.Timestamp(actual_rule_definition)
+                if expiry_date.year != contract_year or expiry_date.month != contract_month_num:
+                    logger.warning(f"Specified expiry date {actual_rule_definition} for {symbol} does not match contract year/month {contract_year}-{contract_month_num}. Using specified date anyway.")
+            except ValueError:
+                logger.error(f"Invalid specific date format '{actual_rule_definition}' for {symbol}.")
+                return None
+        
+        # Rule for energy futures (e.g., CL): N business days before a specific calendar day of the month
+        elif isinstance(actual_rule_definition, dict) and "business_days_before_day_of_month" in actual_rule_definition:
+            try:
+                rule_details = actual_rule_definition["business_days_before_day_of_month"]
+                days_b = int(rule_details["days_before"])
+                ref_day_num = int(rule_details["day_of_month"])
+
+                # Tentative reference date: the specified day in the contract month
+                tentative_ref_date = pd.Timestamp(date(contract_year, contract_month_num, ref_day_num))
+
+                # Find the last trading day at or before this tentative_ref_date
+                schedule_around_ref = trading_calendar.schedule(start_date=tentative_ref_date - timedelta(days=10), 
+                                                                end_date=tentative_ref_date + timedelta(days=2))
+                if schedule_around_ref.empty:
+                    logger.warning(f"Trading calendar '{calendar_name}' returned empty schedule around {tentative_ref_date.date()} for {symbol} (energy rule).")
+                    return None
+                
+                actual_ref_trading_day = schedule_around_ref[schedule_around_ref.index <= tentative_ref_date].index.max()
+                if pd.isna(actual_ref_trading_day):
+                    logger.warning(f"Could not find actual reference trading day at or before {tentative_ref_date.date()} for {symbol} (energy rule).")
+                    return None
+
+                # Now find `days_b` business days before this actual_ref_trading_day
+                # Get the index of actual_ref_trading_day in a broader schedule
+                # We need a schedule that definitely includes days_b prior to actual_ref_trading_day
+                extended_search_start = actual_ref_trading_day - timedelta(days=days_b + 15) # More buffer
+                full_schedule = trading_calendar.schedule(start_date=extended_search_start, end_date=actual_ref_trading_day)
+                
+                if actual_ref_trading_day not in full_schedule.index:
+                    logger.error(f"Logic error: actual_ref_trading_day {actual_ref_trading_day} not in its own schedule for {symbol}")
+                    return None
+
+                ref_day_idx = full_schedule.index.get_loc(actual_ref_trading_day)
+
+                if ref_day_idx >= days_b:
+                    expiry_date = full_schedule.index[ref_day_idx - days_b]
+                else:
+                    logger.warning(f"Not enough trading days ({ref_day_idx + 1}) before {actual_ref_trading_day.date()} to find {days_b} prior business days for {symbol} (energy rule).")
+                    return None
+
+            except KeyError as ke:
+                logger.error(f"Missing key {ke} in 'business_days_before_day_of_month' rule for {symbol}.")
+                return None
+            except ValueError as ve: # For int() conversions or date creation
+                logger.error(f"Value error in 'business_days_before_day_of_month' rule for {symbol}: {ve}")
+                return None
+
+        # Rule for metal futures (e.g., GC): N business days before the last business day of the contract month
+        elif isinstance(actual_rule_definition, dict) and "business_days_before_last_bday_of_month" in actual_rule_definition:
+            try:
+                rule_details = actual_rule_definition["business_days_before_last_bday_of_month"]
+                days_b = int(rule_details["days_before"])
+
+                # Find all trading days in the contract month
+                first_day_cm = date(contract_year, contract_month_num, 1)
+                # To get the last day, go to first of next month and subtract one day
+                if contract_month_num == 12:
+                    last_day_cm = date(contract_year, 12, 31)
+                else:
+                    last_day_cm = date(contract_year, contract_month_num + 1, 1) - timedelta(days=1)
+                
+                month_schedule = trading_calendar.schedule(start_date=first_day_cm, end_date=last_day_cm)
+                if month_schedule.empty:
+                    logger.warning(f"Trading calendar '{calendar_name}' returned empty schedule for {contract_year}-{contract_month_num} for {symbol} (metal rule).")
+                    return None
+                
+                # Last business day of the month is the last day in this schedule
+                last_bday_of_month = month_schedule.index.max()
+
+                # Now find `days_b` business days before this last_bday_of_month
+                # The month_schedule itself can be used if it has enough entries
+                last_bday_idx = month_schedule.index.get_loc(last_bday_of_month)
+
+                if last_bday_idx >= days_b:
+                    expiry_date = month_schedule.index[last_bday_idx - days_b]
+                else:
+                    logger.warning(f"Not enough trading days in {contract_year}-{contract_month_num} (found {last_bday_idx + 1} up to last bday) to find {days_b} prior business days for {symbol} (metal rule).")
+                    return None
+
+            except KeyError as ke:
+                logger.error(f"Missing key {ke} in 'business_days_before_last_bday_of_month' rule for {symbol}.")
+                return None
+            except ValueError as ve: # For int() conversions or date creation
+                logger.error(f"Value error in 'business_days_before_last_bday_of_month' rule for {symbol}: {ve}")
+                return None
+
+        # Rule for VX style futures based on CBOE VIX options expiry
+        # This now checks the special_rule_type from the YAML config
+        elif special_rule_type == "VX_expiry": 
+            # This rule is complex: Settlement date is usually the Wednesday prior to or on the 3rd Friday of the *next* month's SPX options expiry.
+            # CFE Rule: "Expire on the Wednesday that is 30 days prior to the third Friday of the calendar month immediately following the month in which the contract expires"
+            # Example: VXH24 (Mar 2024 contract)
+            # 1. Month immediately following contract month: April 2024
+            # 2. Third Friday of April 2024: April 19, 2024
+            # 3. 30 days prior to April 19, 2024: March 20, 2024 (This is a Wednesday) -> This is the settlement date.
+            # The actual expiry/last trading day can be this settlement day or the day before. For simplicity, we'll use this as the expiry.
+
+            # Determine the month immediately following the contract month
+            following_month_num = contract_month_num + 1
+            following_month_year = contract_year
+            if following_month_num > 12:
+                following_month_num = 1
+                following_month_year += 1
+
+            # Find the first day of that following month
+            first_day_of_following_month = date(following_month_year, following_month_num, 1)
+
+            # Find the third Friday of that following month
+            day_of_week_first_day_fm = first_day_of_following_month.weekday()
+            days_to_first_friday_fm = (4 - day_of_week_first_day_fm + 7) % 7
+            first_friday_fm = first_day_of_following_month + timedelta(days=days_to_first_friday_fm)
+            third_friday_fm = first_friday_fm + timedelta(weeks=2)
+
+            # Expiry is 30 days prior to this third Friday
+            expiry_dt = third_friday_fm - timedelta(days=30)
+            
+            # Ensure this expiry_dt is a Wednesday. If not, something is off or rule needs adjustment.
+            if expiry_dt.weekday() != 2: # 2 = Wednesday
+                 logger.warning(f"VX_STYLE calculated expiry {expiry_dt.strftime('%Y-%m-%d')} for {symbol} is not a Wednesday (it's {expiry_dt.strftime('%A')}). Check rule or calendar logic for {root_symbol}.")
+                 # Optional: Adjust to nearest prior Wednesday if that's the convention
+                 # expiry_dt = expiry_dt - timedelta(days=(expiry_dt.weekday() - 2 + 7) % 7)
+
+
+            expiry_date = pd.Timestamp(expiry_dt)
+
+
+        else:
+            logger.warning(f"Unknown or unsupported expiry rule. Rule definition from YAML: '{actual_rule_definition}', Special rule type: '{special_rule_type}' for root symbol '{root_symbol}' (contract {symbol}).")
+            return None
+
+        if expiry_date:
+            # Ensure the date is not on a weekend or holiday according to the specific calendar
+            # Some rules might naturally fall on non-trading days if not careful.
+            # Most rules above try to land on a specific weekday or use calendar logic.
+            # Final check: if expiry_date is not a session on its calendar, roll back to previous session.
+            
+            # Make expiry_date timezone-naive for comparison with calendar session dates
+            expiry_date_naive = expiry_date.tz_localize(None) if expiry_date.tz is not None else expiry_date
+
+            # if not trading_calendar.is_session(expiry_date_naive):
+            # Replacement for is_session:
+            if trading_calendar.valid_days(start_date=expiry_date_naive.date(), end_date=expiry_date_naive.date()).empty:
+                logger.debug(f"Calculated expiry {expiry_date_naive.strftime('%Y-%m-%d')} for {symbol} is not a trading session on {calendar_name}. Finding prior trading day.")
+                # Get previous valid trading day using the calendar
+                # Search a small window before the calculated expiry_date_naive
+                search_end = expiry_date_naive
+                search_start = expiry_date_naive - timedelta(days=7) # Look back up to 7 days
+                
+                # Get the schedule and find the last valid session <= expiry_date_naive
+                schedule = trading_calendar.schedule(start_date=search_start, end_date=search_end)
+                valid_days = schedule.index[schedule.index <= expiry_date_naive]
+                
+                if not valid_days.empty:
+                    actual_expiry_day = valid_days.max()
+                    if actual_expiry_day != expiry_date_naive:
+                        logger.info(f"Adjusted expiry for {symbol} from {expiry_date_naive.strftime('%Y-%m-%d')} to previous trading day {actual_expiry_day.strftime('%Y-%m-%d')} based on calendar {calendar_name}.")
+                        expiry_date = actual_expiry_day
+                else:
+                    logger.warning(f"Could not find a valid prior trading day for non-session expiry {expiry_date_naive.strftime('%Y-%m-%d')} for {symbol} on {calendar_name}.")
+                    # Keep original calculated date, or handle as error? For now, keep.
+
+            # Log the rule that was actually used
+            rule_log_info = f"rule '{actual_rule_definition}'" if actual_rule_definition else f"special_rule '{special_rule_type}'"
+            logger.info(f"Calculated expiration for {symbol} ({root_symbol}): {expiry_date.strftime('%Y-%m-%d')} based on {rule_log_info} and calendar '{calendar_name}'.")
+            return expiry_date.normalize() # Normalize to remove time component, keep as pd.Timestamp
+            
+        return None
 
     def process_symbol(self, symbol: str, update_history: bool = False, force: bool = False, interval_value: Optional[int] = None, interval_unit: Optional[str] = None) -> None:
         """Process a single symbol, fetching and storing its data.
@@ -1088,48 +1566,36 @@ class MarketDataFetcher:
                 logger.error(f"No configuration found for symbol {symbol}")
                 return
                 
-            actual_symbol = symbol_info.get('specific_contract', symbol_info.get('symbol', symbol))
+            # Prioritize 'specific_contract' if available, otherwise use 'symbol', finally fallback to original symbol.
+            actual_symbol = symbol_info.get('specific_contract') or symbol_info.get('symbol') or symbol
             logger.debug(f"Found configuration for {symbol}. Actual symbol for fetch/store: {actual_symbol}")
             
-            latest_date = self.get_latest_date_in_db(actual_symbol)
-            logger.debug(f"Latest date in DB for {actual_symbol}: {latest_date}")
-            
-            # Determine start date for fetching
-            start_date = None
-            config_start_date_str = symbol_info.get('start_date', self.start_date.strftime('%Y-%m-%d'))
+            # Initial start date from config or script default
+            config_start_date_str = symbol_info.get('start_date', self.default_start_date.strftime('%Y-%m-%d')) # Use default_start_date
             config_start_date = pd.Timestamp(config_start_date_str)
-            is_specific_contract = 'specific_contract' in symbol_info
+
+            # Determine specific contract start date if applicable
+            # Corrected multi-line assignment with walrus operator
+            is_specific_contract = (
+                'specific_contract' in symbol_info or 
+                (
+                    (fut_match := re.compile(r"^([A-Z]{1,3})([FGHJKMNQUVXZ])([0-9]{1,2})$").match(actual_symbol)) is not None
+                )
+            )
+
+            calculated_contract_start_date = config_start_date # Default to overall config start date
             if is_specific_contract:
                 expiry_date = self.calculate_expiration_date(actual_symbol)
                 logger.debug(f"Calculated expiry date for {actual_symbol}: {expiry_date}")
                 if expiry_date:
-                    contract_start_calc = expiry_date - timedelta(days=270) 
-                    start_date = max(contract_start_calc.tz_localize(None), config_start_date)
-                    logger.info(f"Calculated fetch start date for specific contract {actual_symbol}: {start_date.date()}")
+                    # Ensure timezone-naive for comparison if expiry_date is tz-aware
+                    expiry_date_naive = expiry_date.tz_localize(None) if expiry_date.tzinfo is not None else expiry_date
+                    contract_start_calc = expiry_date_naive - timedelta(days=270) 
+                    calculated_contract_start_date = max(contract_start_calc, config_start_date)
+                    logger.info(f"Calculated base fetch start date for specific contract {actual_symbol}: {calculated_contract_start_date.date()}")
                 else:
-                    logger.warning(f"Could not calculate expiry for {actual_symbol}, using config start date {config_start_date.date()}")
-                    start_date = config_start_date
-            else:
-                 start_date = config_start_date
+                    logger.warning(f"Could not calculate expiry for {actual_symbol}, using config start date {config_start_date.date()} as base for contract.")
             
-            # Adjust start date based on mode and existing data
-            if latest_date and not force and not update_history:
-                fetch_start_date = latest_date
-                logger.info(f"Found existing data for {actual_symbol}, last timestamp: {latest_date}. Fetching backward to include data since this time.")
-            elif update_history:
-                fetch_start_date = start_date
-                logger.info(f"Update history mode: fetching {actual_symbol} from {fetch_start_date.date()} to current date")
-            elif force:
-                 fetch_start_date = start_date
-                 logger.info(f"Force mode: overwriting {actual_symbol} data from {fetch_start_date.date()} to current date")
-            else: 
-                 fetch_start_date = start_date
-                 logger.info(f"No existing data for {actual_symbol}, fetching from {fetch_start_date.date()} to current date")
-            
-            if fetch_start_date > pd.Timestamp.now():
-                 logger.info(f"Fetch start date {fetch_start_date} is in the future. Skipping {actual_symbol}.")
-                 return
-                 
             # --- Get Frequencies to Process (Handles simple list and list of dicts) --- #
             config_frequencies_setting = symbol_info.get('frequencies', [])
             frequencies_to_process = []
@@ -1240,17 +1706,45 @@ class MarketDataFetcher:
                     interval = freq_info['interval']
                     unit = freq_info['unit']
                     source = freq_info['source']
-                    target_table = freq_info['raw_table'] # Use the resolved raw_table
+                    target_table = freq_info['raw_table']
                     # ------------------------------------------------------------------ #
 
-                    logger.info(f"Fetching {freq_name} ({interval} {unit}) data for {actual_symbol} from {source} (start: {fetch_start_date}) -> Target Table: {target_table}")
+                    # Determine fetch_start_date for THIS specific frequency
+                    latest_date_for_this_frequency = self.get_latest_date_in_db(actual_symbol, interval, unit)
+                    logger.debug(f"Latest date in DB for {actual_symbol} ({freq_name}): {latest_date_for_this_frequency}")
+
+                    # Base start date for this symbol (either specific contract start or general config start)
+                    base_symbol_start_date = calculated_contract_start_date if is_specific_contract else config_start_date
+
+                    fetch_start_date_for_this_frequency = None
+                    if latest_date_for_this_frequency and not force and not update_history:
+                        fetch_start_date_for_this_frequency = latest_date_for_this_frequency # Start from day after last data
+                        # For intraday, we want to ensure we get the current day if latest_date is from a previous session.
+                        # For daily, starting from latest_date (which is a date) means we'll fetch data *after* that date.
+                        # If latest_date is today, fetch_data_since should handle getting today's new bars correctly.
+                        logger.info(f"Found existing data for {actual_symbol} ({freq_name}) up to {latest_date_for_this_frequency}. Will fetch new data since then.")
+                    elif update_history:
+                        fetch_start_date_for_this_frequency = base_symbol_start_date
+                        logger.info(f"Update history mode for {actual_symbol} ({freq_name}): fetching from {fetch_start_date_for_this_frequency.date()}")
+                    elif force:
+                        fetch_start_date_for_this_frequency = base_symbol_start_date
+                        logger.info(f"Force mode for {actual_symbol} ({freq_name}): overwriting data from {fetch_start_date_for_this_frequency.date()}")
+                    else: # No existing data for this frequency
+                        fetch_start_date_for_this_frequency = base_symbol_start_date
+                        logger.info(f"No existing data for {actual_symbol} ({freq_name}), fetching from {fetch_start_date_for_this_frequency.date()}")
+
+                    if fetch_start_date_for_this_frequency > pd.Timestamp.now(tz='UTC').tz_localize(None): # Ensure timezone-naive comparison
+                        logger.info(f"Fetch start date {fetch_start_date_for_this_frequency} for {actual_symbol} ({freq_name}) is in the future. Skipping this frequency.")
+                        continue # Skip this frequency
+
+                    logger.info(f"Fetching {freq_name} ({interval} {unit}) data for {actual_symbol} from {source} (effective start: {fetch_start_date_for_this_frequency}) -> Target Table: {target_table}")
                     
                     data = None # Initialize data DataFrame
                     # --- Source-specific Fetching --- #
                     if source == 'cboe':
                         # --- MODIFIED: Call direct CBOE download for daily ---
                         if unit == 'daily':
-                            data = self._fetch_cboe_vx_daily(actual_symbol, interval, unit, fetch_start_date)
+                            data = self._fetch_cboe_vx_daily(actual_symbol, interval, unit, fetch_start_date_for_this_frequency)
                         else:
                             # Handle non-daily CBOE sources if they ever exist
                             logger.error(f"Fetching non-daily data from CBOE source is not currently supported for {actual_symbol} ({interval} {unit}). Skipping.")
@@ -1262,7 +1756,7 @@ class MarketDataFetcher:
                                  logger.error("Failed to authenticate with TradeStation API for tradestation source. Skipping.")
                                  continue
                              
-                        data = self.fetch_data_since(actual_symbol, interval, unit, start_date=fetch_start_date)
+                        data = self.fetch_data_since(actual_symbol, interval, unit, start_date=fetch_start_date_for_this_frequency)
                     else:
                         logger.error(f"Unsupported source '{source}' defined for {actual_symbol} frequency {freq_name}. Skipping.")
                         continue # Skip this frequency
@@ -1279,7 +1773,7 @@ class MarketDataFetcher:
                         # Pass target_table to save_to_db
                         self.save_to_db(data, target_table)
                     else:
-                        logger.warning(f"No new {freq_name} data retrieved for {actual_symbol} from {source} starting {fetch_start_date}")
+                        logger.warning(f"No new {freq_name} data retrieved for {actual_symbol} from {source} starting {fetch_start_date_for_this_frequency}")
                 except Exception as e:
                     logger.error(f"Error processing {actual_symbol} for frequency {freq_name}: {str(e)}", exc_info=True)
                     continue # Continue to next frequency
@@ -1310,81 +1804,193 @@ class MarketDataFetcher:
             logger.error(f"Error deleting data for {symbol}: {str(e)}")
             
     def _get_symbol_config(self, symbol: str) -> Optional[Dict[str, Any]]:
-        """Get the configuration for a symbol.
-
-        Handles base symbols (ES, NQ, SPY), indices ($VIX.X), specific
-        futures contracts (ESH25, NQM25, VXF24), and continuous contracts (@BASE=...)
-        by looking up their base config.
+        """Get the configuration for a symbol, merging market_symbols.yaml (defaults) 
+           and futures.yaml (overrides and continuous contract definitions).
         """
         self.logger.debug(f"_get_symbol_config checking for: {symbol}")
+        final_config = {}
+
+        # Identify if symbol is a specific continuous contract (e.g., @ES=101XN, @ES=101XN_d)
+        # or a standard future (ESH25), or a base/root (ES, $VIX.X, SPY).
+        is_specific_continuous_future = symbol.startswith('@') and '=' in symbol
+        is_standard_future_contract = bool(re.match(r"^([A-Z]{1,3})([FGHJKMNQUVXZ])([0-9]{1,2})$", symbol))
         
-        # 0. Handle specific continuous contracts explicitly if needed (e.g. @VX=101XN)
-        # If these have their own top-level entries in the YAML
-        for future in self.config.get('futures', []):
-            if future.get('symbol') == symbol and future.get('asset_type') == 'continuous_future':
-                 self.logger.debug(f"Found explicit continuous config for {symbol}")
-                 return future
-        # Add checks for indices/equities if they can be continuous
+        base_symbol_for_futures_lookup = None
+        if is_specific_continuous_future:
+            base_symbol_for_futures_lookup = symbol.split('=')[0].lstrip('@') # e.g., ES from @ES=101XN
+        elif is_standard_future_contract:
+            # --- MODIFIED: Use _get_contract_details_from_symbol to get the correct root ---
+            contract_details = self._get_contract_details_from_symbol(symbol)
+            if contract_details:
+                base_symbol_for_futures_lookup = contract_details[0] # e.g., VX from VXM25
+            else:
+                # Fallback, though should ideally not be needed if _get_contract_details_from_symbol is robust
+                self.logger.warning(f"Could not parse contract details for '{symbol}' to determine base for futures lookup. Falling back to regex.")
+                match = re.match(r"^([A-Z]{1,3})", symbol) 
+                if match:
+                    base_symbol_for_futures_lookup = match.group(1)
+            # --- END MODIFICATION ---
+        # else, symbol might be a base future root itself (ES), an index ($VIX.X), or equity (SPY)
 
-        # 1. Check for continuous contract pattern (@BASE=...)
-        # Example: @ES=102XC, @VX=101XN
-        continuous_pattern = re.compile(r"^(@[A-Z]{1,3})(?:=.*)?$") # Match @BASE or @BASE=...
-        cont_match = continuous_pattern.match(symbol)
-        base_symbol_from_cont = None
-        if cont_match:
-            base_symbol_from_cont = cont_match.group(1).lstrip('@') # Extract BASE (e.g., ES, VX)
-            self.logger.debug(f"Detected continuous pattern: {symbol}, Extracted Base: {base_symbol_from_cont}")
-            # Find config for the extracted base symbol (ES, NQ, VX...)
-            for future in self.config.get('futures', []):
-                if future.get('base_symbol') == base_symbol_from_cont:
-                    config = future.copy()
-                    config['_derived_from_continuous'] = True # Mark that this config was found via a continuous pattern
-                    config['_original_symbol'] = symbol # Store original full symbol for reference
-                    self.logger.debug(f"Found base config for continuous symbol '{symbol}' using base '{base_symbol_from_cont}'")
-                    return config
-            # If base config not found, log warning but continue to check other types
-            self.logger.warning(f"Found continuous pattern {symbol} but no base config found for '{base_symbol_from_cont}'")
+        # 1. Handle specific continuous futures defined in futures.yaml
+        if is_specific_continuous_future and base_symbol_for_futures_lookup and self.futures_config:
+            future_product_config = self.futures_config.get('futures', {}).get(base_symbol_for_futures_lookup, {})
+            for cc_def in future_product_config.get('continuous_contracts', []):
+                if cc_def.get('identifier') == symbol:
+                    self.logger.debug(f"Found explicit continuous config for '{symbol}' in futures.yaml.")
+                    # This is the authoritative config for this specific continuous symbol.
+                    # We might still want to layer some root defaults from market_symbols for exchange/calendar if not in cc_def.
+                    base_defaults = {}
+                    for item_cfg in self.config.get('futures', []):
+                        if item_cfg.get('base_symbol') == base_symbol_for_futures_lookup and item_cfg.get('asset_type') == 'future_group':
+                            base_defaults = item_cfg.copy()
+                            break
+                    merged_cc_def = {**base_defaults, **cc_def} # cc_def overrides base_defaults
+                    merged_cc_def['_config_source'] = 'futures.yaml (continuous_contract list)'
+                    return merged_cc_def
+            # Also check continuous_contract_group if applicable (e.g. @VX=101XN)
+            group_cfg = future_product_config.get('continuous_contract_group')
+            if group_cfg and group_cfg.get('identifier_base') == symbol.split('=')[0]:
+                # Regenerate to find match (simplified, actual generation is in Application class)
+                month_codes = group_cfg.get('month_codes', [])
+                settings_template = group_cfg.get('settings_code', '')
+                for pos_str in month_codes:
+                    # This logic for final_identifier needs to be identical to Application class one.
+                    gen_id = f"{group_cfg['identifier_base']}={pos_str}{settings_template[1:]}" if settings_template.startswith('0') else f"{group_cfg['identifier_base']}={pos_str}{settings_template}"
+                    if gen_id == symbol:
+                        self.logger.debug(f"Found continuous config for '{symbol}' via group in futures.yaml.")
+                        base_defaults = {}
+                        for item_cfg in self.config.get('futures', []):
+                            if item_cfg.get('base_symbol') == base_symbol_for_futures_lookup and item_cfg.get('asset_type') == 'future_group':
+                                base_defaults = item_cfg.copy()
+                                break
+                        # Construct a cc_def like structure from group_cfg for this specific symbol
+                        group_match_config = { 
+                            **base_defaults, # Start with market_symbols defaults for the root
+                            'identifier': symbol, 
+                            'description': group_cfg.get('description_template', '').format(nth_month=pos_str),
+                            'type': group_cfg.get('type', 'continuous_future'),
+                            'default_source': group_cfg.get('default_source'),
+                            'exchange': group_cfg.get('exchange', base_defaults.get('exchange')),
+                            'calendar': group_cfg.get('calendar', base_defaults.get('calendar')),
+                            'frequencies': group_cfg.get('frequencies', []),
+                            'start_date': group_cfg.get('start_date'),
+                            'method': group_cfg.get('method'),
+                            'position': int(pos_str) if pos_str.isdigit() else None,
+                            '_config_source': 'futures.yaml (continuous_contract_group)'
+                        }
+                        return group_match_config
 
-        # 2. Check indices directly
-        for index in self.config.get('indices', []):
-            if index.get('symbol') == symbol:
-                self.logger.debug(f"Found index config for {symbol}")
-                return index
+        # 2. Handle indices & equities (from market_symbols.yaml only)
+        for index_cfg in self.config.get('indices', []):
+            if index_cfg.get('symbol') == symbol:
+                self.logger.debug(f"Found index config for {symbol} in market_symbols.yaml")
+                final_config = index_cfg.copy()
+                final_config['_config_source'] = 'market_symbols.yaml (indices)'
+                return final_config
+        for equity_cfg in self.config.get('equities', []):
+            if equity_cfg.get('symbol') == symbol:
+                self.logger.debug(f"Found equity config for {symbol} in market_symbols.yaml")
+                final_config = equity_cfg.copy()
+                final_config['_config_source'] = 'market_symbols.yaml (equities)'
+                return final_config
 
-        # 3. Check equities directly
-        for equity in self.config.get('equities', []):
-            if equity.get('symbol') == symbol:
-                self.logger.debug(f"Found equity config for {symbol}")
-                return equity
+        # 3. Handle future_group defaults (from market_symbols.yaml) and overrides (from futures.yaml)
+        # This applies if `symbol` is a base future root (e.g., "ES"), a standard contract (e.g., "ESH25"),
+        # or a generic continuous future (e.g., "@ES" from market_symbols.yaml).
 
-        # 4. Check if it looks like a standard futures contract (e.g., ESH25, NQM25)
-        # This pattern might need adjustment depending on exact symbol formats used
-        futures_pattern = re.compile(r"^([A-Z]{1,3})([FGHJKMNQUVXZ])([0-9]{1,2})$")
-        fut_match = futures_pattern.match(symbol)
-        base_symbol_from_fut = None
-        if fut_match:
-            base_symbol_from_fut = fut_match.group(1) # Extract Base (e.g., ES, VX)
-            self.logger.debug(f"Detected standard futures pattern: {symbol}, Extracted Base: {base_symbol_from_fut}")
-            # Find the config for the base symbol
-            for future in self.config.get('futures', []):
-                if future.get('base_symbol') == base_symbol_from_fut:
-                    config = future.copy()
-                    config['_derived_from_standard_future'] = True # Mark how config was found
-                    config['_original_symbol'] = symbol
-                    self.logger.debug(f"Found base config for standard future '{symbol}' using base '{base_symbol_from_fut}'")
-                    return config
-            # If base config not found, log warning but continue
-            self.logger.warning(f"Found standard future {symbol} but no base config found for '{base_symbol_from_fut}'")
+        # Determine the root symbol we are working with for lookup.
+        # If `symbol` is "@ES", its base_symbol is "ES".
+        # If `symbol` is "ESH25", its base_symbol is "ES".
+        # If `symbol` is "ES", its base_symbol is "ES".
+        effective_base_symbol = symbol 
+        is_generic_continuous_at_symbol = symbol.startswith('@') and not is_specific_continuous_future # e.g. @ES, @NQ
 
-        # 5. Fallback: Check if the provided symbol itself is a base future symbol in the config
-        for future in self.config.get('futures', []):
-             if future.get('base_symbol') == symbol:
-                 self.logger.debug(f"Found base future config matching symbol directly: {symbol}")
-                 return future # Return the base config directly
+        if is_standard_future_contract:
+            effective_base_symbol = base_symbol_for_futures_lookup # ES from ESH25
+        elif is_generic_continuous_at_symbol:
+            effective_base_symbol = symbol.lstrip('@') # ES from @ES
+        
+        # Step 3a: Get defaults from market_symbols.yaml for the effective_base_symbol
+        market_symbols_defaults = None
+        for item_cfg in self.config.get('futures', []):
+            condition1 = (item_cfg.get('base_symbol') == effective_base_symbol and item_cfg.get('asset_type') == 'future_group')
+            condition2 = (item_cfg.get('symbol') == symbol and is_generic_continuous_at_symbol)
+            if condition1 or condition2:
+                market_symbols_defaults = item_cfg.copy()
+                self.logger.debug(f"Found market_symbols.yaml defaults for base '{effective_base_symbol}' (or generic 'symbol={symbol}'): {list(market_symbols_defaults.keys())}")
+                break
+        
+        # Ensure final_config is initialized based on whether defaults were found
+        if market_symbols_defaults:
+            final_config = market_symbols_defaults # It's already a copy
+            final_config['_config_source'] = 'market_symbols.yaml (futures defaults)'
+        else:
+            final_config = {} # Initialize as empty dict if no defaults
+            final_config['_config_source'] = 'market_symbols.yaml (no specific future_group defaults found)'
 
-        # If no match found after all checks
-        self.logger.error(f"No configuration match found for symbol: {symbol}")
-        return None
+        # --- MODIFICATION FOR TEMPLATE INHERITANCE ---
+        def deep_merge_dicts(base, override):
+            """Recursively merge override dict into base dict."""
+            merged = base.copy() # Start with a copy of the base
+            for key, value in override.items():
+                if isinstance(value, dict) and key in merged and isinstance(merged[key], dict):
+                    merged[key] = deep_merge_dicts(merged[key], value)
+                else:
+                    merged[key] = value
+            return merged
+
+        # Step 3b: Get overrides from futures.yaml for the effective_base_symbol
+        # This now also handles template inheritance
+        if self.futures_config and effective_base_symbol in self.futures_config.get('futures', {}):
+            product_specific_config = self.futures_config['futures'][effective_base_symbol].copy()
+            self.logger.debug(f"Found product-specific config in futures.yaml for '{effective_base_symbol}': {list(product_specific_config.keys())}")
+
+            template_config = {}
+            if 'inherit' in product_specific_config:
+                template_name = product_specific_config.pop('inherit') # Remove 'inherit' key
+                if template_name in self.futures_config.get('templates', {}):
+                    template_config = self.futures_config['templates'][template_name].copy()
+                    self.logger.debug(f"Loaded template '{template_name}' for '{effective_base_symbol}': {list(template_config.keys())}")
+                    final_config['_config_source'] += f" (template: {template_name})"
+                else:
+                    self.logger.warning(f"Template '{template_name}' specified by '{effective_base_symbol}' not found in futures.yaml templates.")
+            
+            # Merge order: market_symbols_defaults -> template_config -> product_specific_config
+            # Start with market_symbols_defaults (already in final_config)
+            if template_config:
+                final_config = deep_merge_dicts(final_config, template_config) # Merge template into market_symbols defaults
+            
+            # Now merge product_specific_config, which takes highest precedence
+            final_config = deep_merge_dicts(final_config, product_specific_config)
+            
+            final_config['_config_source'] += ' + futures.yaml (specific product config / overrides)'
+            
+        elif not market_symbols_defaults and not is_specific_continuous_future: # Neither market_symbols nor futures.yaml had the base
+             self.logger.warning(f"No base future config found in market_symbols.yaml or futures.yaml for: {effective_base_symbol} (derived from symbol {symbol})")
+             return None # Cannot proceed if no base config for a future type
+
+        # Step 3c: If the original symbol was a specific standard contract (e.g., ESH25), adjust final_config
+        if is_standard_future_contract:
+            final_config['symbol'] = symbol  # Ensure 'symbol' is the specific contract like ESH25
+            final_config['specific_contract'] = symbol # Add a dedicated key for the specific contract
+            final_config['_derived_from_standard_future'] = True
+            final_config['_config_source'] += ' (adjusted for specific contract)'
+            self.logger.debug(f"Adjusted config for standard future '{symbol}'. Final keys: {list(final_config.keys())}")
+        
+        # Step 3d: If symbol was a generic @ES type from market_symbols.yaml (already handled by final_config using market_symbols_defaults)
+        elif is_generic_continuous_at_symbol:
+            # The final_config should already be based on the market_symbols.yaml entry for "@ES"
+            # and potentially overridden by an "ES:" block in futures.yaml if relevant keys were there.
+            # Ensure `symbol` field in final_config is indeed the generic @Symbol.
+            final_config['symbol'] = symbol 
+            self.logger.debug(f"Final config for generic continuous '{symbol}'. Final keys: {list(final_config.keys())}")
+
+        if not final_config: # Should not happen if logic is correct and symbol is valid type
+            self.logger.error(f"_get_symbol_config: No configuration ultimately resolved for symbol: {symbol}")
+            return None
+
+        return final_config
 
     def generate_futures_contracts(self, root_symbol, start_date, end_date=None):
         """
@@ -1607,8 +2213,9 @@ class MarketDataFetcher:
                 start_date=start_gen_date, 
                 end_date=end_gen_date
             )
-        except AttributeError:
-             logger.error(f"MarketDataFetcher does not have 'generate_futures_contracts' method.")
+        except AttributeError as ae:
+             logger.error(f"MarketDataFetcher does not have 'generate_futures_contracts' method. Error: {ae}")
+             logger.error(f"Attributes of self (MarketDataFetcher instance): {dir(self)}")
              return []
         except Exception as e:
              logger.error(f"Error generating potential contracts for {base_symbol}: {e}", exc_info=True)

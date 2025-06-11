@@ -122,6 +122,11 @@ class TradeStationMarketDataAgent:
         
         self._connect_database()
     
+    def connect(self) -> bool:
+        """Connect to the TradeStation API by authenticating."""
+        logger.debug("Connecting to TradeStation API...")
+        return self.authenticate()
+    
     def _connect_database(self) -> None:
         """Connect to DuckDB database.
         
@@ -299,7 +304,7 @@ class TradeStationMarketDataAgent:
         Returns:
             DataFrame containing the fetched market data
         """
-        if not self.authenticate():
+        if not self.connect():
             logger.error("Authentication failed. Cannot fetch market data.")
             return pd.DataFrame()
         

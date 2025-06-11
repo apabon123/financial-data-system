@@ -11,9 +11,11 @@ templates:
     frequencies: ["1min", "15min", "daily"]
     roll_method: "volume"
     expiry_rule:
-      day_type: "friday"
-      day_number: 3
-      adjust_for_holiday: true
+      rule:
+        nth_weekday:
+          n: 3
+          weekday: "friday"
+      calendar: "CME_Equity"
     tick_size: 0.25
     tick_value: 12.50
     
@@ -23,7 +25,6 @@ templates:
     frequencies: ["1min", "15min", "daily"]
     roll_method: "volume"
     expiry_rule:
-      day_type: "wednesday"
       special_rule: "VX_expiry"
     tick_size: 0.05
     tick_value: 50.00
@@ -34,10 +35,11 @@ templates:
     frequencies: ["1min", "15min", "daily"]
     roll_method: "volume"
     expiry_rule:
-      day_type: "business_day"
-      days_before: 3
-      reference_day: 25
-      adjust_for_holiday: true
+      rule:
+        business_days_before_day_of_month:
+          days_before: 3
+          day_of_month: 25
+      calendar: "CMEGlobex_CL"
       
   metal_futures:
     default_source: "tradestation"
@@ -45,10 +47,10 @@ templates:
     frequencies: ["daily"]
     roll_method: "volume"
     expiry_rule:
-      day_type: "business_day"
-      days_before: 3
-      reference_point: "last_business_day"
-      adjust_for_holiday: true
+      rule:
+        business_days_before_last_bday_of_month:
+          days_before: 3
+      calendar: "CMEGlobex_GC"
 
 # Futures contract specifications
 futures:
@@ -62,30 +64,55 @@ futures:
     currency: "USD"
     calendar: "CME_Equity"
     calendar_ref: "${exchanges.CME.calendars.CME_Equity}"
+    contract_info:
+      patterns: ["H", "M", "U", "Z"]
+      start_year: 2003
+      num_active_contracts: 2
     continuous_contracts:
-      - identifier: "@ES=101XN"
+      - identifier: "@ES=102XN"
         description: "ES Continuous Contract (Unadjusted, TradeStation)"
         type: "continuous_future"
         method: "none"
         position: 1
-        frequencies: ["1min", "15min", "daily"]
+        frequencies: ["15min", "daily"]
         start_date: "2003-01-01"
+        default_source: "tradestation"
+      - identifier: "@ES=102XN_d"
+        description: "ES Continuous Contract (Unadjusted, In-house Built, 2-day Roll)"
+        type: "continuous_future"
+        method: "none"
+        position: 1
+        frequencies: ["15min", "daily"]
+        start_date: "2003-01-01"
+        default_source: "inhouse_built"
+        base_contract_for_build: "@ES=102XN"
+        build_roll_type: "02X"
+        build_contract_position: 1
+        build_adjustment_type: "N"
+        build_output_symbol_suffix: "_d"
+        build_source_identifier: "inhouse_unadj_2day_1pos_d"
       - identifier: "@ES=102XC"
-        description: "ES Continuous Contract (Adjusted, Backwards Ratio, TradeStation)"
+        description: "ES Continuous Contract (Adjusted, Backward Constant, TradeStation)"
         type: "continuous_future"
-        method: "backwards_ratio"
+        method: "backwards_constant"
         position: 1
-        frequencies: ["1min", "15min", "daily"]
+        frequencies: ["15min", "daily"]
         start_date: "2003-01-01"
-      - identifier: "@ES=1P75V"
-        description: "ES Continuous Contract (Panama Method, Volume-Based Rolls)"
+        default_source: "tradestation"
+      - identifier: "@ES=102XC_d"
+        description: "ES Continuous Contract (Adjusted, Backward Constant, In-house Built, 2-day Roll)"
         type: "continuous_future"
-        method: "panama"
+        method: "backwards_constant"
         position: 1
-        ratio_limit: 0.75
-        roll_method: "volume"
-        frequencies: ["daily"]
+        frequencies: ["15min", "daily"]
         start_date: "2003-01-01"
+        default_source: "inhouse_built"
+        base_contract_for_build: "@ES=102XC"
+        build_roll_type: "02X"
+        build_contract_position: 1
+        build_adjustment_type: "C"
+        build_output_symbol_suffix: "_d"
+        build_source_identifier: "inhouse_adj_const_2day_1pos_d"
 
   NQ:
     inherit: "equity_index_futures"
@@ -105,29 +132,50 @@ futures:
       start_year: 2003
       num_active_contracts: 2
     continuous_contracts:
-      - identifier: "@NQ=101XN"
+      - identifier: "@NQ=102XN"
         description: "NQ Continuous Contract (Unadjusted, TradeStation)"
         type: "continuous_future"
         method: "none"
         position: 1
-        frequencies: ["1min", "15min", "daily"]
+        frequencies: ["15min", "daily"]
         start_date: "2003-01-01"
+        default_source: "tradestation"
+      - identifier: "@NQ=102XN_d"
+        description: "NQ Continuous Contract (Unadjusted, In-house Built, 2-day Roll)"
+        type: "continuous_future"
+        method: "none"
+        position: 1
+        frequencies: ["15min", "daily"]
+        start_date: "2003-01-01"
+        default_source: "inhouse_built"
+        base_contract_for_build: "@NQ=102XN"
+        build_roll_type: "02X"
+        build_contract_position: 1
+        build_adjustment_type: "N"
+        build_output_symbol_suffix: "_d"
+        build_source_identifier: "inhouse_unadj_2day_1pos_d"
       - identifier: "@NQ=102XC"
-        description: "NQ Continuous Contract (Adjusted, Backwards Ratio, TradeStation)"
+        description: "NQ Continuous Contract (Adjusted, Backward Constant, TradeStation)"
         type: "continuous_future"
-        method: "backwards_ratio"
+        method: "backwards_constant"
         position: 1
-        frequencies: ["1min", "15min", "daily"]
+        frequencies: ["15min", "daily"]
         start_date: "2003-01-01"
-      - identifier: "@NQ=1P75V"
-        description: "NQ Continuous Contract (Panama Method, Volume-Based Rolls)"
+        default_source: "tradestation"
+      - identifier: "@NQ=102XC_d"
+        description: "NQ Continuous Contract (Adjusted, Backward Constant, In-house Built, 2-day Roll)"
         type: "continuous_future"
-        method: "panama"
+        method: "backwards_constant"
         position: 1
-        ratio_limit: 0.75
-        roll_method: "volume"
-        frequencies: ["daily"]
+        frequencies: ["15min", "daily"]
         start_date: "2003-01-01"
+        default_source: "inhouse_built"
+        base_contract_for_build: "@NQ=102XC"
+        build_roll_type: "02X"
+        build_contract_position: 1
+        build_adjustment_type: "C"
+        build_output_symbol_suffix: "_d"
+        build_source_identifier: "inhouse_adj_const_2day_1pos_d"
 
   CL:
     inherit: "energy_futures"
@@ -148,17 +196,52 @@ futures:
       patterns: ["F", "G", "H", "J", "K", "M", "N", "Q", "U", "V", "X", "Z"]
       start_year: 2005
       start_month: 6
-      num_active_contracts: 12
+      num_active_contracts: 6
     continuous_contracts:
-      - identifier: "@CL=1P75V"
-        description: "CL Continuous Contract (Panama Method, Volume-Based Rolls)"
+      - identifier: "@CL=102XN"
+        description: "CL Continuous Contract (Unadjusted, TradeStation)"
         type: "continuous_future"
-        method: "panama"
+        method: "none"
         position: 1
-        ratio_limit: 0.75
-        roll_method: "volume"
         frequencies: ["daily"]
         start_date: "2005-01-01"
+        default_source: "tradestation"
+      - identifier: "@CL=102XN_d"
+        description: "CL Continuous Contract (Unadjusted, In-house Built, 2-day Roll)"
+        type: "continuous_future"
+        method: "none"
+        position: 1
+        frequencies: ["daily"]
+        start_date: "2005-01-01"
+        default_source: "inhouse_built"
+        base_contract_for_build: "@CL=102XN"
+        build_roll_type: "02X"
+        build_contract_position: 1
+        build_adjustment_type: "N"
+        build_output_symbol_suffix: "_d"
+        build_source_identifier: "inhouse_unadj_2day_1pos_d"
+      - identifier: "@CL=102XC"
+        description: "CL Continuous Contract (Adjusted, Backward Constant, TradeStation)"
+        type: "continuous_future"
+        method: "backwards_constant"
+        position: 1
+        frequencies: ["daily"]
+        start_date: "2005-01-01"
+        default_source: "tradestation"
+      - identifier: "@CL=102XC_d"
+        description: "CL Continuous Contract (Adjusted, Backward Constant, In-house Built, 2-day Roll)"
+        type: "continuous_future"
+        method: "backwards_constant"
+        position: 1
+        frequencies: ["daily"]
+        start_date: "2005-01-01"
+        default_source: "inhouse_built"
+        base_contract_for_build: "@CL=102XC"
+        build_roll_type: "02X"
+        build_contract_position: 1
+        build_adjustment_type: "C"
+        build_output_symbol_suffix: "_d"
+        build_source_identifier: "inhouse_adj_const_2day_1pos_d"
 
   GC:
     inherit: "metal_futures"
@@ -180,15 +263,50 @@ futures:
       start_year: 2004
       num_active_contracts: 6
     continuous_contracts:
-      - identifier: "@GC=1P75V"
-        description: "GC Continuous Contract (Panama Method, Volume-Based Rolls)"
+      - identifier: "@GC=102XN"
+        description: "GC Continuous Contract (Unadjusted, TradeStation)"
         type: "continuous_future"
-        method: "panama"
+        method: "none"
         position: 1
-        ratio_limit: 0.75
-        roll_method: "volume"
         frequencies: ["daily"]
         start_date: "2004-01-01"
+        default_source: "tradestation"
+      - identifier: "@GC=102XN_d"
+        description: "GC Continuous Contract (Unadjusted, In-house Built, 2-day Roll)"
+        type: "continuous_future"
+        method: "none"
+        position: 1
+        frequencies: ["daily"]
+        start_date: "2004-01-01"
+        default_source: "inhouse_built"
+        base_contract_for_build: "@GC=102XN"
+        build_roll_type: "02X"
+        build_contract_position: 1
+        build_adjustment_type: "N"
+        build_output_symbol_suffix: "_d"
+        build_source_identifier: "inhouse_unadj_2day_1pos_d"
+      - identifier: "@GC=102XC"
+        description: "GC Continuous Contract (Adjusted, Backward Constant, TradeStation)"
+        type: "continuous_future"
+        method: "backwards_constant"
+        position: 1
+        frequencies: ["daily"]
+        start_date: "2004-01-01"
+        default_source: "tradestation"
+      - identifier: "@GC=102XC_d"
+        description: "GC Continuous Contract (Adjusted, Backward Constant, In-house Built, 2-day Roll)"
+        type: "continuous_future"
+        method: "backwards_constant"
+        position: 1
+        frequencies: ["daily"]
+        start_date: "2004-01-01"
+        default_source: "inhouse_built"
+        base_contract_for_build: "@GC=102XC"
+        build_roll_type: "02X"
+        build_contract_position: 1
+        build_adjustment_type: "C"
+        build_output_symbol_suffix: "_d"
+        build_source_identifier: "inhouse_adj_const_2day_1pos_d"
 
   VX:
     inherit: "vix_futures"
@@ -205,27 +323,53 @@ futures:
     settlement_type: "cash"
     contract_info:
       patterns: ["F", "G", "H", "J", "K", "M", "N", "Q", "U", "V", "X", "Z"]
-      start_year: 2004
+      start_year: 2006
       num_active_contracts: 9
-      exclude_contracts:
-        - "VXF04"
-        - "VXG04"
-        - "VXH04"
-        - "VXJ04"
-        - "VXZ04"
-        - "VXJ05"
-        - "VXN05"
-        - "VXU05"
     continuous_contracts:
-      - identifier: "@VX=1P75V"
-        description: "VX Continuous Contract (Panama Method, Volume-Based Rolls)"
+      - identifier: "@VX=102XN"
+        description: "VX Continuous Contract (Unadjusted, TradeStation)"
         type: "continuous_future"
-        method: "panama"
+        method: "none"
         position: 1
-        ratio_limit: 0.75
-        roll_method: "volume"
-        frequencies: ["daily"]
-        start_date: "2005-01-01"
+        frequencies: ["15min", "daily"]
+        start_date: "2006-01-01"
+        default_source: "tradestation"
+      - identifier: "@VX=102XN_d"
+        description: "VX Continuous Contract (Unadjusted, In-house Built, 2-day Roll)"
+        type: "continuous_future"
+        method: "none"
+        position: 1
+        frequencies: ["15min", "daily"]
+        start_date: "2006-01-01"
+        default_source: "inhouse_built"
+        base_contract_for_build: "@VX=102XN"
+        build_roll_type: "02X"
+        build_contract_position: 1
+        build_adjustment_type: "N"
+        build_output_symbol_suffix: "_d"
+        build_source_identifier: "inhouse_unadj_2day_1pos_d"
+      - identifier: "@VX=102XC"
+        description: "VX Continuous Contract (Adjusted, Backward Constant, TradeStation)"
+        type: "continuous_future"
+        method: "backwards_constant"
+        position: 1
+        frequencies: ["15min", "daily"]
+        start_date: "2006-01-01"
+        default_source: "tradestation"
+      - identifier: "@VX=102XC_d"
+        description: "VX Continuous Contract (Adjusted, Backward Constant, In-house Built, 2-day Roll)"
+        type: "continuous_future"
+        method: "backwards_constant"
+        position: 1
+        frequencies: ["15min", "daily"]
+        start_date: "2006-01-01"
+        default_source: "inhouse_built"
+        base_contract_for_build: "@VX=102XC"
+        build_roll_type: "02X"
+        build_contract_position: 1
+        build_adjustment_type: "C"
+        build_output_symbol_suffix: "_d"
+        build_source_identifier: "inhouse_adj_const_2day_1pos_d"
     continuous_contract_group:
       identifier_base: "@VX"
       month_codes: ["1", "2", "3", "4", "5", "6", "7", "8", "9"]
@@ -248,3 +392,8 @@ expiry_rules:
       offset: -30
       offset_units: "days"
       adjust_for_holiday: true
+
+# Exchange and Calendar Definitions (ensure these are complete and correct)
+# This section is illustrative; your actual definitions might be more detailed
+exchanges:
+  CME:

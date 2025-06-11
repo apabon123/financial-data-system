@@ -146,143 +146,45 @@ This cleaner:
 
 ## Data Update Process
 
-The data update process is designed to fetch the latest available data for configured instruments and generate derived data like continuous futures contracts.
+The data update process is designed to fetch the latest available data for configured instruments and generate derived data like continuous futures contracts. It is primarily managed through the `DB_inspect_enhanced.bat` interface, which calls the main Python orchestrator script `src/scripts/market_data/update_all_market_data_v2.py`.
 
 ### Triggering Updates
 
-The update process is initiated by running:
-
-```bash
-update_market_data.bat
-```
-
-This script executes the core Python orchestrator script: `src/scripts/market_data/update_all_market_data.py`.
+The update process is typically initiated via options within the `DB_inspect_enhanced.bat` menu.
+This batch file, in turn, executes the core Python orchestrator script: `src/scripts/market_data/update_all_market_data_v2.py`.
 
 ### Update Sequence
 
-The update process follows these steps:
+The `update_all_market_data_v2.py` script, guided by the `symbol_metadata` table, generally follows these steps:
 
-1. **Step 0: Update Symbol Metadata**
-   - Updates the `symbol_metadata` table from `config/market_symbols.yaml`
-   - Defines which symbols to process and their configurations
+1. **Step 0: Ensure Symbol Metadata is Current (Pre-requisite)**
+   - The `symbol_metadata` table should be up-to-date. This is typically handled by running the `src/scripts/database/populate_symbol_metadata.py` script (often an option in `DB_inspect_enhanced.bat`) whenever `config/market_symbols.yaml` changes.
+   - `symbol_metadata` defines which symbols to process, their data sources, target tables, intervals, and specific scripts for fetching or generation.
 
 2. **Step 1: Fetch/Update Individual Instruments**
-   - Updates data for individual futures, indices, and equities from TradeStation
-   - Handles active contract determination for futures
-   - Stores data in the `market_data` table
+   - Iterates through entries in `symbol_metadata` for individual instruments (e.g., specific futures contracts, equities, indices).
+   - Based on `symbol_metadata.data_source` and `symbol_metadata.historical_script_path` (or `update_script_path`), it calls appropriate fetchers (e.g., for TradeStation, CBOE data).
+   - Data is stored in tables like `market_data` or `market_data_cboe` as specified in `symbol_metadata.data_table`.
+   - Handles active contract determination for individual futures if applicable (logic might be within the called scripts).
 
-3. **Step 2: Update Raw CBOE VX Futures Data**
-   - Fetches daily data for active VIX futures contracts
-   - Updates the `market_data_cboe` table
-   - Maintains the `futures_roll_calendar`
-
-4. **Step 3: Update Continuous Contracts**
-   - Builds continuous contracts from underlying data
-   - Handles all TradeStation-sourced continuous contracts
-   - Stores results in the `continuous_contracts` table
+3. **Step 2: Update/Generate Continuous Contracts**
+   - Processes entries in `symbol_metadata` where `asset_type` is `continuous_future`.
+   - Calls `src/scripts/market_data/continuous_contract_loader.py` for these symbols.
+   - `continuous_contract_loader.py` behavior depends on the `source` and other fields from `symbol_metadata` for each continuous contract symbol:
+     - If `source` indicates an external provider (e.g., 'tradestation') that offers pre-formed continuous contracts, these are fetched and stored.
+     - If `source` is 'in_house' (or similar indicating local generation):
+       - For unadjusted series (e.g., where `symbol_metadata.additional_metadata` might indicate no adjustment or a simple roll), it may perform concatenation or a basic roll.
+       - For adjusted series (e.g., where `symbol_metadata.additional_metadata` indicates an adjustment method like 'panama'), it will invoke the appropriate generation logic (e.g., `PanamaContractBuilder` or similar) to calculate and store the adjusted continuous series.
+   - Results are stored in the `continuous_contracts` table.
 
 ### Key Data Tables
 
-- **`symbol_metadata`**: Central control table for update configuration
-- **`market_data`**: TradeStation-sourced individual instruments
-- **`market_data_cboe`**: Raw VIX futures data from CBOE
-- **`continuous_contracts`**: Generated continuous contract data
-- **`futures_roll_calendar`**: VIX contract roll information
+- **`symbol_metadata`**: Central control table defining all symbols, their properties, data sources, intervals, storage tables, and processing scripts. This table is critical for the entire update process.
+- **`market_data`**: Stores data for individual instruments, typically from sources like TradeStation.
+- **`market_data_cboe`**: Stores raw VIX futures and index data from CBOE.
 
 ## Usage Examples
 
 ### Using the Cleaning Pipeline
 
-```python
-from src.processors.cleaners.pipeline import DataCleaningPipeline
-from src.processors.cleaners.vx_zero_prices import VXZeroPricesCleaner
-from src.core.database import DatabaseConnector
-
-# Connect to database
-db = DatabaseConnector(db_path='data/financial_data.duckdb')
-
-# Create pipeline
-pipeline = DataCleaningPipeline(
-    name="market_data_cleaner",
-    db_connector=db
-)
-
-# Add cleaners
-pipeline.add_cleaner(VXZeroPricesCleaner(
-    db_connector=db,
-    config={'interpolation_method': 'linear'}
-))
-
-# Process a symbol
-success, summary = pipeline.process_symbol(
-    symbol='VXF23',
-    interval_unit='daily',
-    interval_value=1
-)
-
-# Check results
-if success:
-    print(f"Cleaned {summary['total_modifications']} data points")
 ```
-
-### Creating Custom Cleaners
-
-```python
-class PriceSpikeCleaner(DataCleanerBase):
-    def __init__(self, db_connector=None, enabled=True):
-        super().__init__(
-            name="price_spike_cleaner",
-            description="Fixes abnormal price spikes",
-            db_connector=db_connector,
-            fields_to_clean=['open', 'high', 'low', 'close'],
-            enabled=enabled,
-            priority=75,  # Run after zero price cleaner
-            config={'max_change_percent': 20.0}
-        )
-    
-    def clean(self, df):
-        result = df.copy()
-        
-        # Detect and fix price spikes
-        for field in self.fields_to_clean:
-            # Calculate percentage changes
-            pct_change = result[field].pct_change().abs()
-            
-            # Find spikes exceeding threshold
-            threshold = self.config.get('max_change_percent', 20.0) / 100
-            spikes = pct_change > threshold
-            
-            # Fix each spike
-            for idx in result.index[spikes]:
-                timestamp = result.loc[idx, 'timestamp']
-                symbol = result.loc[idx, 'symbol']
-                old_value = result.loc[idx, field]
-                
-                # Replace with interpolated value
-                new_value = (result.loc[idx-1, field] + result.loc[idx+1, field]) / 2
-                result.loc[idx, field] = new_value
-                
-                # Log the modification
-                self.log_modification(
-                    timestamp=timestamp,
-                    symbol=symbol,
-                    field=field,
-                    old_value=old_value,
-                    new_value=new_value,
-                    reason=f"Price spike exceeding {threshold*100}%",
-                    details=f"Changed from {old_value} to {new_value}"
-                )
-        
-        return result
-```
-
-## Configuration
-
-The system uses `config/market_symbols.yaml` to define:
-- Which symbols to process
-- Data sources for each symbol
-- Target database tables
-- Data frequencies
-- Specific parameters like expiry rules
-
-Refer to `docs/futures_configuration.md` for details on the configuration file structure. 

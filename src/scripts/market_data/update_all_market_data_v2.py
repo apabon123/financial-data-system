@@ -32,6 +32,7 @@ from src.processors.continuous.registry import get_registry
 from src.processors.cleaners.pipeline import DataCleaningPipeline
 from src.processors.cleaners.vx_zero_prices import VXZeroPricesCleaner
 from src.processors.continuous.panama import PanamaContractBuilder
+from src.processors.continuous.unadjusted import UnadjustedContractBuilder
 
 # Set up logging
 logging.basicConfig(
@@ -66,6 +67,7 @@ def parse_arguments():
     parser.add_argument("--skip-es-nq", action="store_true", help="Skip ES/NQ futures update")
     parser.add_argument("--skip-continuous", action="store_true", help="Skip continuous contract generation")
     parser.add_argument("--skip-cleaning", action="store_true", help="Skip data cleaning")
+    parser.add_argument("--skip-panama", action="store_true", help="Skip Panama continuous contract generation specifically")
     
     # Specific component options (These are now handled by YAML frequency configuration)
     # parser.add_argument("--update-active-es-15min", action="store_true", help="Update active ES 15min data")
@@ -149,99 +151,296 @@ def main():
                 processed_roots_for_raw_update.add(base_root_symbol)
                 continue
 
-            update_frequencies = root_cfg.get('update_frequencies', [])
+            # Get frequencies for the RAW generic symbol (e.g. @ES) from the root_cfg
+            update_frequencies = root_cfg.get('raw_data_update_frequencies', []) 
             if not update_frequencies:
-                logger.info(f"No 'update_frequencies' defined in config for {base_root_symbol}. Skipping its raw data update.")
+                logger.info(f"No 'raw_data_update_frequencies' defined in root_cfg for {base_root_symbol}. Skipping its raw data update.")
             else:
-                logger.info(f"Processing raw data updates for {base_root_symbol} across {len(update_frequencies)} frequencies.")
-                for freq_detail in update_frequencies:
-                    logger.info(f"Updating {base_root_symbol} for interval: {freq_detail.get('interval', 'N/A')} {freq_detail.get('unit', 'N/A')}")
-                    try:
-                        # Use the new generic method in Application class
-                        app.update_future_instrument_raw_data(
-                            symbol_root=base_root_symbol,
-                            interval_unit=freq_detail['unit'],
-                            interval_value=freq_detail['interval'], # Note: YAML uses 'interval', App method uses 'interval_value'
-                            force_full=args.full_update
-                            # fetch_mode, lookback_days, roll_proximity_threshold_days will use defaults in app method
-                        )
-                    except KeyError as ke:
-                        logger.error(f"Missing 'unit' or 'interval' in frequency detail for {base_root_symbol}: {freq_detail}. Error: {ke}", exc_info=True)
-                    except Exception as e:
-                        logger.error(f"Failed to update {base_root_symbol} for frequency {freq_detail}: {e}", exc_info=True)
+                logger.info(f"Processing raw data updates for generic continuous symbol based on {base_root_symbol} (e.g. @{base_root_symbol}) across {len(update_frequencies)} potential frequencies.")
+                
+                parsed_frequencies_for_raw = []
+                if isinstance(update_frequencies, list) and update_frequencies:
+                    if isinstance(update_frequencies[0], str): # e.g., ['15min', 'daily']
+                        for freq_name_str in update_frequencies:
+                            interval, unit = None, None
+                            if freq_name_str == 'daily': interval, unit = 1, 'daily'
+                            elif freq_name_str == '1min': interval, unit = 1, 'minute'
+                            elif freq_name_str.endswith('min'):
+                                try: interval = int(freq_name_str[:-3]); unit = 'minute'
+                                except ValueError: pass
+                            # Add more parsers if needed (e.g., '1hour')
+                            if interval and unit:
+                                parsed_frequencies_for_raw.append({'name': freq_name_str, 'interval': interval, 'unit': unit})
+                            elif freq_name_str: # Log only if non-empty and unparsed
+                                logger.warning(f"Could not parse frequency string '{freq_name_str}' in raw_data_update_frequencies for {base_root_symbol}.")
+                    elif isinstance(update_frequencies[0], dict): # Already in dict format
+                        parsed_frequencies_for_raw = update_frequencies
+                    else:
+                        logger.error(f"Unsupported format for raw_data_update_frequencies for {base_root_symbol}: {update_frequencies}")
+                
+                if not parsed_frequencies_for_raw:
+                    logger.info(f"No valid frequencies resolved for raw data update of {base_root_symbol}.")
+                else:
+                    for freq_detail in parsed_frequencies_for_raw: # Iterate over the parsed list of dicts
+                        logger.info(f"Updating generic @{base_root_symbol} for interval: {freq_detail.get('interval', 'N/A')} {freq_detail.get('unit', 'N/A')}")
+                        try:
+                            # Use the new generic method in Application class
+                            app.update_future_instrument_raw_data(
+                                symbol_root=base_root_symbol,
+                                interval_unit=freq_detail['unit'],
+                                interval_value=freq_detail['interval'], # Note: YAML uses 'interval', App method uses 'interval_value'
+                                force_full=args.full_update
+                                # fetch_mode, lookback_days, roll_proximity_threshold_days will use defaults in app method
+                            )
+                        except KeyError as ke:
+                            logger.error(f"Missing 'unit' or 'interval' in frequency detail for {base_root_symbol}: {freq_detail}. Error: {ke}", exc_info=True)
+                        except Exception as e:
+                            logger.error(f"Failed to update {base_root_symbol} for frequency {freq_detail}: {e}", exc_info=True)
             
             processed_roots_for_raw_update.add(base_root_symbol)
 
-        # Step 3: Generate continuous contracts with Panama method
-        if not args.skip_continuous:
-            logger.info("Generating continuous contracts with Panama method...")
-            
-            # Get symbols that need continuous contract generation
-            # root_symbol_configs is a list of dicts, one for each base (ES, NQ etc.)
-            root_symbol_configs = app.get_continuous_contract_symbols() 
-            
-            for root_cfg in root_symbol_configs: # e.g., root_cfg for 'ES'
-                base_root_symbol = root_cfg.get('root_symbol')
-                if not base_root_symbol:
-                    logger.warning(f"Skipping root_cfg due to missing 'root_symbol': {root_cfg}")
-                    continue
-                
-                logger.info(f"Processing Panama continuous contracts for root: {base_root_symbol}")
-
-                # Iterate through each specific continuous symbol to be generated for this root
-                specific_symbols_list = root_cfg.get('continuous_symbols_to_generate', [])
-
-                if not specific_symbols_list:
-                    logger.warning(f"No 'continuous_symbols_to_generate' found in config for {base_root_symbol}. Skipping Panama generation for it.")
-                    continue
-
-                for specific_symbol_detail in specific_symbols_list:
-                    target_continuous_symbol = specific_symbol_detail.get('symbol')
+        # Step 2c: Update Individual Active Futures Contracts (e.g. ESM25, ESU25 for ES)
+        logger.info("Updating data for active individual futures contracts (e.g., ESM25, ESU25)...")
+        all_futures_configs = app.config.get_section('futures') # Get all future configs
+        if all_futures_configs:
+            for item_cfg in all_futures_configs:
+                if item_cfg.get('asset_type') == 'future_group' and 'base_symbol' in item_cfg:
+                    base_symbol = item_cfg['base_symbol']
+                    logger.info(f"Processing individual active contracts for future_group: {base_symbol}")
                     
-                    if not target_continuous_symbol:
-                        logger.warning(f"Missing 'symbol' key in specific_symbol_detail for {base_root_symbol}. Details: {specific_symbol_detail}")
-                        continue
+                    # Check skip flags before processing
+                    should_skip_individual = False
+                    if base_symbol == 'VX': # VX is often handled as 'futures' in skip flags
+                        if args.skip_futures:
+                            logger.info(f"Skipping individual active contracts for {base_symbol} due to --skip-futures flag.")
+                            should_skip_individual = True
+                    elif base_symbol in ['ES', 'NQ']:
+                        if args.skip_es_nq:
+                            logger.info(f"Skipping individual active contracts for {base_symbol} due to --skip-es-nq flag.")
+                            should_skip_individual = True
+                    # Add other specific skip flags if needed, e.g. args.skip_cl_futures for 'CL'
 
-                    # Check if this specific symbol is meant for Panama adjustment
-                    if specific_symbol_detail.get('adjustment_method') != 'panama':
-                        logger.info(f"Skipping {target_continuous_symbol} as its adjustment method is not 'panama'.")
+                    if should_skip_individual:
                         continue
-                        
-                    logger.info(f"Generating Panama contract for: {target_continuous_symbol} (base: {base_root_symbol})")
-                    
-                    # Create a merged config for the builder:
-                    # Start with a copy of the root_cfg (general settings for ES, NQ)
-                    builder_config = root_cfg.copy() 
-                    # Update/add specifics from the symbol detail (e.g. adjustment_method)
-                    builder_config.update(specific_symbol_detail)
 
                     try:
-                        generator = PanamaContractBuilder(
-                            db=app.db,
-                            config=builder_config 
+                        app.update_individual_active_futures(
+                            symbol_root=base_symbol,
+                            item_config=item_cfg, # Pass the full config for this future_group
+                            force_full=args.full_update
                         )
-                        
-                        # Call the correct method: build_continuous_series
-                        # Default interval is daily/1, start/end are None (handles full range)
-                        generated_df = generator.build_continuous_series(
-                            root_symbol=base_root_symbol,
-                            continuous_symbol=target_continuous_symbol,
-                            force=args.full_update 
-                        )
-                        if generated_df is not None and not generated_df.empty:
-                            logger.info(f"Successfully generated/updated Panama series for {target_continuous_symbol}, {len(generated_df)} rows.")
-                        elif generated_df is not None and generated_df.empty:
-                            logger.info(f"Panama series generation for {target_continuous_symbol} returned empty DataFrame (might be up-to-date or no data).")
-                        else: # None returned
-                            logger.warning(f"Panama series generation for {target_continuous_symbol} returned None.")
-                    except Exception as e_gen:
-                        logger.error(f"Error generating Panama series for {target_continuous_symbol}: {e_gen}", exc_info=True)
-            
-            logger.info("Continuous contract generation completed")
+                    except Exception as e_ind:
+                        logger.error(f"Failed to update individual active contracts for {base_symbol}: {e_ind}", exc_info=True)
         else:
-            logger.info("Skipping continuous contract generation")
+            logger.info("No 'futures' configuration found, skipping individual active contract updates.")
         
-        # Step 4: Apply data cleaning pipeline
+        # Step 2d: Update/Generate All Continuous Contracts
+        logger.info("Processing all defined continuous future contracts (Step 2d)...")
+        # Get the new structure from app.get_continuous_contract_symbols()
+        all_root_product_configs = app.get_continuous_contract_symbols()
+
+        if not args.skip_continuous: # Global skip for all continuous types
+            if not all_root_product_configs:
+                logger.info("No root product configurations returned by app.get_continuous_contract_symbols(). Skipping Step 2d.")
+            else:
+                for root_product_cfg in all_root_product_configs: # Iterate through roots like ES, NQ
+                    root_s = root_product_cfg.get('root_symbol', 'UnknownRoot')
+                    logger.info(f"-- Processing continuous contracts for root: {root_s} --")
+                    
+                    # Skip specific roots if flags are set
+                    if root_s == 'VX' and args.skip_futures: 
+                        logger.info(f"Skipping continuous contracts for root {root_s} due to --skip-futures.")
+                        continue
+                    if root_s in ['ES', 'NQ'] and args.skip_es_nq:
+                        logger.info(f"Skipping continuous contracts for root {root_s} due to --skip-es-nq.")
+                        continue
+                    
+                    # --- MODIFIED DEBUG LOGGING ---
+                    temp_cc_list_for_debug = root_product_cfg.get('continuous_symbols_to_process', [])
+                    if root_s == 'ES':
+                        logger.debug(f"V2_DEBUG: ES root_product_cfg has continuous_symbols_to_process with len: {len(temp_cc_list_for_debug)}")
+                        logger.debug(f"V2_DEBUG_ID: ES root_product_cfg object id: {id(root_product_cfg)}")
+                        logger.debug(f"V2_DEBUG_ID: ES continuous_symbols_to_process from get() id: {id(temp_cc_list_for_debug)}")
+                        # --- ADDED KEY CHECK LOGGING ---
+                        key_exists = 'continuous_symbols_to_process' in root_product_cfg
+                        logger.debug(f"V2_DEBUG_KEY_CHECK: 'continuous_symbols_to_process' key exists in ES root_product_cfg: {key_exists}")
+                        if key_exists:
+                            logger.debug(f"V2_DEBUG_KEY_CHECK: ID of existing list if key found: {id(root_product_cfg['continuous_symbols_to_process'])}")
+                        # --- END ADDED KEY CHECK LOGGING ---
+                        if not temp_cc_list_for_debug:
+                             logger.debug(f"V2_DEBUG: ES root_product_cfg (full) when list is empty: {root_product_cfg}")
+                    # --- END MODIFIED DEBUG LOGGING ---
+                    continuous_contracts_list = temp_cc_list_for_debug 
+                    if not continuous_contracts_list:
+                        logger.info(f"No specific continuous contracts found under 'continuous_symbols_to_process' for root {root_s} in the processed config. Skipping specific cc processing for this root.")
+                        # continue # Don't skip the whole root, might have other definitions like groups
+
+                    # Initialize cc_method to a default value before the loop
+                    cc_method = None
+
+                    # --- Loop through specific continuous contracts defined directly under the root ---
+                    for cc_item in continuous_contracts_list: # This is one specific continuous contract dict
+                        cc_identifier = cc_item.get('identifier')
+                        if not cc_identifier:
+                            logger.warning(f"Continuous contract item for root {root_s} is missing 'identifier'. Skipping item: {cc_item}")
+                            continue
+
+                        cc_source = cc_item.get('default_source', root_product_cfg.get('default_source', 'unknown_source'))
+                        cc_method = cc_item.get('method', 'none') # 'none', 'panama', 'backwards_ratio', etc.
+                        cc_type = cc_item.get('type', 'continuous_future') # Default type
+
+                        logger.info(f"Processing continuous symbol: {cc_identifier} (Source: {cc_source}, Method: {cc_method}) for root {root_s}")
+
+                        # Get frequencies for this SPECIFIC continuous contract item
+                        cc_frequencies_config = cc_item.get('frequencies', []) # This is typically a list of strings like ["15min", "daily"]
+                        
+                        # Determine target table (can be defined in cc_item or root_product_cfg)
+                        if cc_source == 'inhouse_built':
+                            default_target_table = 'continuous_contracts'
+                        else:
+                            default_target_table = cc_item.get('default_raw_table', root_product_cfg.get('default_raw_table', 'continuous_contracts'))
+
+                        if cc_source == 'tradestation' and cc_method != 'panama': # Panama for TS is handled by a different mechanism
+                            if not cc_frequencies_config:
+                                logger.warning(f"No frequencies defined for TradeStation source continuous symbol {cc_identifier}. Skipping fetch.")
+                                continue
+                            
+                            logger.info(f"Fetching data for TradeStation continuous symbol: {cc_identifier} for {len(cc_frequencies_config)} frequencies.")
+                            
+                            for freq_entry_loop_var in cc_frequencies_config: # Renamed variable here
+                                logger.debug(f"Processing freq_entry_loop_var for {cc_identifier}: {freq_entry_loop_var}")
+                                logger.debug(f"Relevant defaults for {cc_identifier}: cc_source='{cc_source}', default_target_table='{default_target_table}'")
+                                
+                                # Prepare freq_entry with defaults if it's a dictionary
+                                current_freq_entry = freq_entry_loop_var
+                                if isinstance(freq_entry_loop_var, dict):
+                                    current_freq_entry = freq_entry_loop_var.copy()
+                                    if 'source' not in current_freq_entry:
+                                        current_freq_entry['source'] = cc_source
+                                    if 'raw_table' not in current_freq_entry:
+                                        current_freq_entry['raw_table'] = default_target_table
+                                
+                                logger.debug(f"Calling _parse_frequency_entry for {cc_identifier} with current_freq_entry: {current_freq_entry}")
+                                # Corrected call to _parse_frequency_entry
+                                parsed_freq_detail = app._parse_frequency_entry(
+                                    freq_entry=current_freq_entry, 
+                                    global_data_frequencies_map={}, 
+                                    symbol_identifier=cc_identifier
+                                )
+                                logger.debug(f"Returned parsed_freq_detail for {cc_identifier}: {parsed_freq_detail}")
+
+                                if not parsed_freq_detail or not parsed_freq_detail.get('unit') or not parsed_freq_detail.get('interval'):
+                                    logger.warning(f"Invalid frequency detail for {cc_identifier}: {freq_entry_loop_var}. Parsed as: {parsed_freq_detail}. Skipping this frequency.")
+                                    continue
+                                
+                                try:
+                                    logger.info(f"Calling app.fetch_specific_symbol_data for {cc_identifier}, Freq: {parsed_freq_detail.get('name')}")
+                                    app.fetch_specific_symbol_data(
+                                        symbol_to_fetch=cc_identifier,
+                                        interval_value=parsed_freq_detail['interval'],
+                                        interval_unit=parsed_freq_detail['unit'],
+                                        force_full=args.full_update
+                                    )
+                                except AttributeError as ae:
+                                    logger.error(f"Application object does not have method 'fetch_specific_symbol_data' or there was an issue. Error: {ae}", exc_info=True)
+                                    break 
+                                except Exception as e_ts_cc:
+                                    logger.error(f"Error updating TradeStation continuous contract {cc_identifier} for frequency {parsed_freq_detail.get('name')}: {e_ts_cc}", exc_info=True)
+                        
+                        elif cc_source == 'cboe': # Example: Direct CBOE downloads for some continuous (though less common for continuous)
+                            # Similar parsing and calling logic for CBOE specific continuous data if needed
+                            logger.info(f"CBOE source for continuous symbol {cc_identifier}. Processing not yet implemented in this loop.")
+                            pass
+
+                        elif cc_source == 'inhouse_built':
+                            if not cc_frequencies_config:
+                                logger.warning(f"No frequencies specified for in-house build of {cc_identifier}. Build will not be triggered based on frequencies here.")
+                                # Build might be triggered by other mechanisms or not frequency-specific.
+                            
+                            logger.info(f"Build process for in-house continuous contract: {cc_identifier}")
+                            # Logic for triggering in-house builds (e.g., from Panama or other methods)
+                            # This section might call a different app method, e.g., app.build_inhouse_continuous_contract
+                            
+                            # If build is frequency specific and uses the same frequency list:
+                            logger.info(f"Preparing to trigger build for {cc_identifier} for {len(cc_frequencies_config)} frequencies.")
+                            for freq_entry_loop_var in cc_frequencies_config: # Renamed variable here
+                                logger.debug(f"Processing freq_entry_loop_var for INHOUSE BUILD {cc_identifier}: {freq_entry_loop_var}")
+                                logger.debug(f"Relevant defaults for INHOUSE BUILD {cc_identifier}: cc_source='{cc_source}', default_target_table='{default_target_table}'")
+                                
+                                # Prepare freq_entry with defaults if it's a dictionary
+                                current_freq_entry = freq_entry_loop_var
+                                if isinstance(freq_entry_loop_var, dict):
+                                    current_freq_entry = freq_entry_loop_var.copy()
+                                    if 'source' not in current_freq_entry:
+                                        current_freq_entry['source'] = cc_source # Should be 'inhouse_built'
+                                    if 'raw_table' not in current_freq_entry:
+                                        current_freq_entry['raw_table'] = default_target_table # Target table for the built data
+
+                                logger.debug(f"Calling _parse_frequency_entry for INHOUSE BUILD {cc_identifier} with current_freq_entry: {current_freq_entry}")
+                                # Corrected call to _parse_frequency_entry
+                                parsed_freq_detail = app._parse_frequency_entry(
+                                    freq_entry=current_freq_entry, 
+                                    global_data_frequencies_map={}, 
+                                    symbol_identifier=cc_identifier
+                                )
+                                logger.debug(f"Returned parsed_freq_detail for INHOUSE BUILD {cc_identifier}: {parsed_freq_detail}")
+
+                                if not parsed_freq_detail or not parsed_freq_detail.get('unit') or not parsed_freq_detail.get('interval'):
+                                    logger.warning(f"Invalid frequency detail for built {cc_identifier}: {freq_entry_loop_var}. Skipping this frequency.")
+                                    continue
+                                try:
+                                    # Build the in-house continuous contract using UnadjustedContractBuilder
+                                    logger.info(f"Building in-house continuous contract for {cc_identifier} - Freq: {parsed_freq_detail.get('name')}")
+                                    
+                                    # Determine the root symbol (extract from cc_identifier)
+                                    root_symbol_for_build = cc_identifier.split('=')[0].lstrip('@') if '=' in cc_identifier else cc_identifier.lstrip('@')
+                                    
+                                    # Create builder configuration
+                                    builder_config = {
+                                        'roll_calendar_table': cc_item.get('roll_calendar_table', 'futures_roll_dates'),
+                                        'market_data_table': cc_item.get('market_data_table', 'market_data'),
+                                        'continuous_data_table': default_target_table
+                                    }
+                                    
+                                    # Create the builder directly
+                                    builder = UnadjustedContractBuilder(db=app.db, config=builder_config)
+                                    
+                                    # Build the continuous series
+                                    continuous_data = builder.build_continuous_series(
+                                        root_symbol=root_symbol_for_build,
+                                        continuous_symbol=cc_identifier,
+                                        interval_unit=parsed_freq_detail['unit'],
+                                        interval_value=parsed_freq_detail['interval'],
+                                        force=args.full_update
+                                    )
+                                    
+                                    # Store the continuous data
+                                    if not continuous_data.empty:
+                                        rows_stored = builder.store_continuous_data(cc_identifier, continuous_data)
+                                        logger.info(f"Successfully built and stored {rows_stored} rows for {cc_identifier}")
+                                    else:
+                                        logger.warning(f"No continuous data generated for {cc_identifier}")
+                                        
+                                except AttributeError as ae:
+                                    logger.error(f"Error with continuous contract builder: {ae}", exc_info=True)
+                                    break
+                                except Exception as e_build:
+                                    logger.error(f"Error building in-house continuous contract {cc_identifier} for frequency {parsed_freq_detail.get('name')}: {e_build}", exc_info=True)
+                        else:
+                            logger.warning(f"Source '{cc_source}' for continuous contract {cc_identifier} is not explicitly handled in Step 2d main loop.")
+
+                    # Panama method continuous contracts (often separate due to specific build logic)
+                    if root_s == 'VX' and cc_method == 'panama':
+                        logger.info(f"Skipping continuous contracts for {root_s} due to --skip-panama and method 'panama'.")
+                        continue
+                    if root_s in ['ES', 'NQ'] and cc_method == 'panama':
+                        logger.info(f"Skipping continuous contracts for {root_s} due to --skip-panama and method 'panama'.")
+                        continue
+
+        else: # args.skip_continuous is True
+            logger.info("Skipping all continuous contract updates/generation in Step 2d due to --skip-continuous flag.")
+
+        # Step 3: Apply data cleaning pipeline
         if not args.skip_cleaning:
             logger.info("Running data cleaning pipeline...")
 
@@ -324,7 +523,7 @@ def main():
         else:
             logger.info("Skipping data cleaning")
         
-        # Step 5: Verify data if requested
+        # Step 4: Verify data if requested
         if args.verify:
             logger.info("Verifying data...")
             

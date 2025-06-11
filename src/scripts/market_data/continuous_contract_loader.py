@@ -11,13 +11,21 @@ from dotenv import load_dotenv
 import pandas_market_calendars as mcal
 from src.scripts.market_data.fetch_market_data import MarketDataFetcher, get_trading_calendar
 import re
-from typing import Optional, List
+from typing import Optional, List, Any
 
 # Load environment variables
 load_dotenv(os.path.join(os.path.dirname(__file__), 'config', '.env'))
 
 # Add the project root directory to the Python path
 project_root = str(Path(__file__).resolve().parent.parent.parent.parent)
+
+# --- ADDED: Define DEFAULT_DB_PATH consistently ---
+DATA_DIR = os.getenv('DATA_DIR', os.path.join(project_root, 'data'))
+DEFAULT_DB_PATH = os.path.join(DATA_DIR, 'financial_data.duckdb')
+# Ensure DATA_DIR exists if we are about to use DEFAULT_DB_PATH for a default write
+if not os.path.exists(DATA_DIR):
+    os.makedirs(DATA_DIR)
+# --- END ADDED --- 
 
 # Configure logging
 logging.basicConfig(
@@ -505,7 +513,7 @@ def load_continuous_data(fetcher: MarketDataFetcher, symbol_root: str, config: d
              # Define columns to insert/update dynamically based on df_to_save
              insert_columns = list(df_to_save.columns) 
              insert_columns_str = ", ".join([f'\"{col}\"' for col in insert_columns]) # Quote column names
-             pk_columns = ['symbol', 'timestamp', 'interval_value', 'interval_unit']
+             pk_columns = ['timestamp', 'symbol', 'interval_value', 'interval_unit']
              update_columns = [col for col in insert_columns if col not in pk_columns]
              update_setters_str = ", ".join([f'\"{col}\" = EXCLUDED.\"{col}\"' for col in update_columns])
 
@@ -562,212 +570,166 @@ def load_continuous_data(fetcher: MarketDataFetcher, symbol_root: str, config: d
         logger.error(f"Error processing {specific_symbol}: {str(e)}", exc_info=True)
         return
 
-def main(args_list: Optional[List[str]] = None):
-    DEFAULT_DB_PATH = os.path.join(project_root, "data", "financial_data.duckdb")
-    DEFAULT_CONFIG_PATH = os.path.join(project_root, "config", "market_symbols.yaml")
-
-    parser = argparse.ArgumentParser(description="Load and build continuous futures contracts from TradeStation data.")
-    parser.add_argument(
-        "symbol",
-        help="The continuous contract symbol to process (e.g., @ES, @VX=101XN, ES for generic @ES)."
-    )
-    parser.add_argument(
-        "--force",
-        action="store_true",
-        help="Force re-fetch of all historical data for underlying contracts."
-    )
-    parser.add_argument(
-        "--db-path",
-        default=DEFAULT_DB_PATH,
-        help=f"Path to the DuckDB database file (default: {DEFAULT_DB_PATH})."
-    )
-    parser.add_argument(
-        "--config-path",
-        default=DEFAULT_CONFIG_PATH,
-        help=f"Path to the market symbols YAML configuration file (default: {DEFAULT_CONFIG_PATH})."
-    )
-    # Add interval arguments, defaulting to daily
-    parser.add_argument("--interval-value", type=int, default=1, help="Interval value (default: 1).")
-    parser.add_argument("--interval-unit", type=str, default='daily', choices=['daily', 'minute', 'hour'], help="Interval unit (default: 'daily').")
-
-    # New arguments for fetch control
-    parser.add_argument(
-        "--fetch-mode",
-        type=str,
-        default='auto',
-        choices=['auto', 'latest', 'full'],
-        help="Fetch mode: 'auto' (default, intelligent roll handling), 'latest' (fetch recent N days), 'full' (fetch all history)."
-    )
-    parser.add_argument(
-        "--lookback-days",
-        type=int,
-        default=90,
-        help="Number of days to look back when fetch_mode is 'latest' or 'auto' (and not near roll for adjusted). Default: 90."
-    )
-    parser.add_argument(
-        "--roll-proximity-threshold-days",
-        type=int,
-        default=7,
-        help="Days before expiry to trigger full series rebuild for adjusted contracts in 'auto' mode (default: 7)"
-    )
-
-    if args_list is not None:
-        args = parser.parse_args(args_list)
+def verify_data_source(symbol: str, config: dict, fetcher: MarketDataFetcher) -> bool:
+    """
+    Verify that the data source is valid for the given symbol.
+    
+    Args:
+        symbol: The symbol to verify
+        config: The configuration dictionary
+        fetcher: MarketDataFetcher instance
+        
+    Returns:
+        bool: True if the data source is valid, False otherwise
+    """
+    logger.info(f"Verifying data source for: '{symbol}' (config root: '{config.get('root_symbol', 'Unknown')}', parameterized: {bool(config.get('parameterized', False))})")
+    
+    # For generic symbols (e.g., @ES), verify via root symbol YAML configuration
+    if symbol.startswith('@') and not '=' in symbol:
+        root_symbol = symbol[1:]  # Remove @ prefix
+        logger.info(f"Generic symbol '{symbol}'. Verifying via root symbol '{root_symbol}' YAML configuration.")
+        
+        # First check market_symbols.yaml
+        futures_config = next(
+            (f for f in config.get('futures', []) if f.get('base_symbol') == root_symbol),
+            None
+        )
+        
+        if futures_config:
+            source = futures_config.get('default_source', 'not_found_in_yaml')
+            asset_type = futures_config.get('asset_type', 'not_found_in_yaml')
+            
+            # Check if it's a TradeStation-sourced future
+            if source == 'tradestation' and asset_type == 'future_group':
+                logger.info(f"Confirmed {symbol} is a TradeStation-sourced future via market_symbols.yaml")
+                return True
+            else:
+                logger.warning(f"Root symbol '{root_symbol}' YAML configuration (found source: '{source}', found asset_type: '{asset_type}') does not definitively indicate it's a TradeStation-sourced future suitable for generic continuous contract generation by this loader.")
+        
+        # If not found in market_symbols.yaml, check futures.yaml
+        if hasattr(fetcher, 'futures_config') and fetcher.futures_config:
+            futures_yaml_config = fetcher.futures_config.get('futures', {}).get(root_symbol)
+            if futures_yaml_config:
+                source = futures_yaml_config.get('default_source', 'not_found_in_yaml')
+                asset_type = futures_yaml_config.get('asset_class', 'not_found_in_yaml')
+                
+                # Check if it's a TradeStation-sourced future
+                if source == 'tradestation' and asset_type in ['equity_index', 'volatility', 'energy', 'metals']:
+                    logger.info(f"Confirmed {symbol} is a TradeStation-sourced future via futures.yaml")
+                    return True
+                else:
+                    logger.warning(f"Root symbol '{root_symbol}' futures.yaml configuration (found source: '{source}', found asset_type: '{asset_type}') does not definitively indicate it's a TradeStation-sourced future suitable for generic continuous contract generation by this loader.")
+        
+        logger.error(f"Final check: Could not confirm generic symbol '{symbol}' (root: '{root_symbol}') is TradeStation-sourced via YAML config.")
+        return False
+    
+    # For specific symbols (e.g., @ES=102XN), verify via continuous_contracts section
+    elif '=' in symbol:
+        root_symbol = symbol.split('=')[0][1:]  # Remove @ prefix and get root
+        logger.info(f"Specific continuous symbol '{symbol}'. Verifying via root symbol '{root_symbol}' continuous_contracts configuration.")
+        
+        # Check futures.yaml for continuous contract configuration
+        if hasattr(fetcher, 'futures_config') and fetcher.futures_config:
+            futures_yaml_config = fetcher.futures_config.get('futures', {}).get(root_symbol)
+            if futures_yaml_config:
+                continuous_contracts = futures_yaml_config.get('continuous_contracts', [])
+                for cc in continuous_contracts:
+                    if cc.get('identifier') == symbol:
+                        source = cc.get('default_source', 'not_found_in_yaml')
+                        if source == 'tradestation':
+                            logger.info(f"Confirmed {symbol} is a valid TradeStation-sourced continuous contract via futures.yaml")
+                            return True
+                        else:
+                            logger.warning(f"Continuous contract '{symbol}' found in futures.yaml but source '{source}' is not 'tradestation'")
+                            return False
+        
+        logger.error(f"Could not find continuous contract configuration for '{symbol}' in futures.yaml")
+        return False
+    
+    # For individual contract symbols (e.g., ESM24), verify via contract_info section
     else:
+        root_symbol = ''.join([c for c in symbol if not c.isdigit()])  # Extract root symbol
+        logger.info(f"Individual contract symbol '{symbol}'. Verifying via root symbol '{root_symbol}' contract_info configuration.")
+        
+        # Check futures.yaml for contract configuration
+        if hasattr(fetcher, 'futures_config') and fetcher.futures_config:
+            futures_yaml_config = fetcher.futures_config.get('futures', {}).get(root_symbol)
+            if futures_yaml_config:
+                contract_info = futures_yaml_config.get('contract_info', {})
+                if contract_info:
+                    patterns = contract_info.get('patterns', [])
+                    if patterns:
+                        # Extract month code from symbol (e.g., 'M' from 'ESM24')
+                        month_code = symbol[len(root_symbol):-2]
+                        if month_code in patterns:
+                            logger.info(f"Confirmed {symbol} is a valid contract for root '{root_symbol}' via futures.yaml")
+                            return True
+                        else:
+                            logger.warning(f"Month code '{month_code}' from '{symbol}' not found in patterns {patterns} for root '{root_symbol}'")
+                            return False
+        
+        logger.error(f"Could not find contract configuration for '{symbol}' in futures.yaml")
+        return False
+
+def main(args_list: Optional[List[str]] = None, existing_conn: Optional[Any] = None):
+    """Main function to update continuous contract data."""
+    parser = argparse.ArgumentParser(description="Update continuous contract data")
+    parser.add_argument("--symbol", required=True, help="Symbol to update (e.g., @ES, @ES=102XN)")
+    parser.add_argument("--db-path", default=DEFAULT_DB_PATH, help="Path to database file")
+    parser.add_argument("--config-path", default=os.path.join(project_root, "config", "market_symbols.yaml"), help="Path to config file")
+    parser.add_argument("--interval-unit", default="daily", choices=["minute", "daily"], help="Interval unit")
+    parser.add_argument("--interval-value", type=int, default=1, help="Interval value")
+    parser.add_argument("--force", action="store_true", help="Force full update")
+    parser.add_argument("--fetch-mode", default="auto", choices=["auto", "full", "incremental"], help="Fetch mode")
+    parser.add_argument("--lookback-days", type=int, default=90, help="Days to look back for updates")
+    parser.add_argument("--roll-proximity-threshold-days", type=int, default=7, help="Days before roll to start using next contract")
+    
+    # Parse arguments
+    if args_list is None:
         args = parser.parse_args()
-
-    logger.info(f"Continuous Contract Loader started for: {args.symbol}")
-    logger.info(f"Using DB Path: {args.db_path}, Config Path: {args.config_path}") # DEBUG DB PATH
-
-    # Setup database table
-    # setup_continuous_db() # Removed setup call - should be handled by main orchestrator
+    else:
+        args = parser.parse_args(args_list)
+    
+    # Initialize MarketDataFetcher
+    if existing_conn:
+        logger.info("continuous_contract_loader.main using existing database connection.")
+        fetcher = MarketDataFetcher(
+            # db_path parameter is not strictly needed if existing_conn is provided and used by MarketDataFetcher
+            db_path=args.db_path, # Keep for now, MarketDataFetcher might use it as a fallback or for logging
+            config_path=args.config_path,
+            existing_conn=existing_conn # Pass the existing connection
+        )
+    else:
+        logger.info("continuous_contract_loader.main creating new database connection.")
+        fetcher = MarketDataFetcher(
+            db_path=args.db_path,
+            config_path=args.config_path
+        )
     
     # Load market symbols configuration
-    try:
-        config = load_market_symbols_config()
-    except Exception as e:
-        logger.error(f"Failed to load market symbols configuration: {e}")
-        sys.exit(1)
+    config = load_market_symbols_config()
     
-    # Initialize the fetcher and authenticate with TradeStation
-    config_file_path = args.config_path # Define path used by load_config
+    # Process the symbol
+    logger.info(f"Processing continuous contract: {args.symbol}")
     
-    fetcher = None
-    try:
-        # Pass the config_path, not the loaded config dictionary
-        fetcher = MarketDataFetcher(
-            config_path=config_file_path, 
-            db_path=args.db_path # This db_path is from args
-        )
-        logger.info(f"DEBUG_LOADER: MarketDataFetcher initialized with db_path: {fetcher.db_path}") # Log the path fetcher is using
-        # Authenticate the fetcher's agent
-        if not fetcher.ts_agent or not fetcher.ts_agent.authenticate():
-            logger.error("Failed to initialize or authenticate TradeStation fetcher")
-            sys.exit(1)
-    except Exception as e:
-        logger.error(f"Failed to initialize or authenticate TradeStation fetcher: {e}", exc_info=True)
-        sys.exit(1) 
-
-    # Determine the actual symbol to process and the root for config lookup
-    user_input_symbol = args.symbol
-    actual_symbol_to_process = ""
-    root_symbol_for_config = ""
-
-    if '=' in user_input_symbol: # Parameterized like @VX=101XN
-        actual_symbol_to_process = user_input_symbol
-        match = re.match(r"^(@[A-Z]{1,3})", user_input_symbol)
-        if match:
-            root_symbol_for_config = match.group(1).lstrip('@')
-        else:
-            logger.error(f"Invalid parameterized continuous symbol format: {user_input_symbol}")
-            sys.exit(1)
-    elif user_input_symbol.startswith('@'): # Generic like @ES
-        actual_symbol_to_process = user_input_symbol
-        root_symbol_for_config = user_input_symbol.lstrip('@')
-    else: # Base like ES, implies @ES
-        actual_symbol_to_process = "@" + user_input_symbol
-        root_symbol_for_config = user_input_symbol
-
-    logger.info(f"Processing continuous contract: {actual_symbol_to_process} (config root: {root_symbol_for_config})")
-
-    # Metadata Check to confirm data_source is 'tradestation'
-    metadata_source = ''
-    metadata_found = False
-    is_parameterized_symbol = '=' in actual_symbol_to_process # e.g., @ES=101XN
-
-    try:
-        logger.info(f"Verifying data source for: '{actual_symbol_to_process}' (config root: '{root_symbol_for_config}', parameterized: {is_parameterized_symbol})")
-
-        if is_parameterized_symbol:
-            # Specific parameterized symbol like @ES=101XN
-            # These MUST have a direct entry in symbol_metadata with asset_type 'continuous_future'
-            # and data_source 'tradestation' if this script is to handle them.
-            query_for_specific = '''
-                SELECT data_source FROM symbol_metadata
-                WHERE base_symbol = ? AND asset_type = 'continuous_future'
-                LIMIT 1
-            '''
-            params = [actual_symbol_to_process]
-            logger.debug(f"Querying specific metadata with params {params}")
-            result = fetcher.conn.execute(query_for_specific, params).fetchone()
-            if result:
-                metadata_source = result[0]
-                metadata_found = True
-                logger.info(f"Found direct metadata for specific symbol {actual_symbol_to_process}. Source: {metadata_source}")
-            else:
-                # For parameterized symbols, missing metadata is a critical issue for this loader's logic.
-                logger.error(f"No 'continuous_future' metadata entry found for specific parameterized symbol: {actual_symbol_to_process}. This symbol should be defined in symbol_metadata if it's to be loaded as a continuous contract by this script.")
-                # sys.exit(1) # Decided to let the final check handle exit
-
-        else:
-            # Generic symbol like @ES or @NQ (default TradeStation continuous contract)
-            # We don't expect a direct 'continuous_future' metadata entry for '@ES' itself.
-            # We verify based on the root symbol's configuration in the YAML file.
-            logger.info(f"Generic symbol '{actual_symbol_to_process}'. Verifying via root symbol '{root_symbol_for_config}' YAML configuration.")
-            root_cfg = fetcher._get_symbol_config(root_symbol_for_config) # e.g., 'ES' or 'NQ'
-            if root_cfg:
-                configured_source = root_cfg.get('data_source', 'NOT_FOUND_IN_YAML').lower()
-                configured_asset_type = root_cfg.get('asset_type', 'NOT_FOUND_IN_YAML').lower()
-                # Check for explicit continuous settings or if it's a future_group meant for continuous
-                is_configurable_for_continuous = (
-                    'continuous_contracts' in root_cfg or
-                    'panama_settings' in root_cfg or # Panama implies custom continuous
-                    configured_asset_type == 'future_group' # Future groups often have continuous versions
-                )
-
-                logger.debug(f"Root YAML config for '{root_symbol_for_config}': source='{configured_source}', asset_type='{configured_asset_type}', is_configurable_for_continuous={is_configurable_for_continuous}")
-
-                if configured_source == 'tradestation' and (configured_asset_type in ['future', 'future_group'] or is_configurable_for_continuous) :
-                    metadata_source = 'tradestation' # Inferred from root config
-                    metadata_found = True # Considered "found" for logic flow
-                    logger.info(f"Root symbol '{root_symbol_for_config}' YAML config indicates TradeStation source for continuous futures for generic symbol '{actual_symbol_to_process}'.")
-                else:
-                    logger.warning(f"Root symbol '{root_symbol_for_config}' YAML configuration (found source: '{configured_source}', found asset_type: '{configured_asset_type}') does not definitively indicate it's a TradeStation-sourced future suitable for generic continuous contract generation by this loader.")
-            else:
-                 logger.warning(f"No YAML configuration found for root symbol '{root_symbol_for_config}'. Cannot verify source for generic symbol '{actual_symbol_to_process}'.")
-
-        # Final Decision Point
-        if metadata_found and metadata_source.lower() == 'tradestation':
-            logger.info(f"Data source for '{actual_symbol_to_process}' confirmed as 'tradestation'. Proceeding.")
-        else:
-            if not metadata_found and is_parameterized_symbol:
-                 # This case was logged as an error above, reinforcing exit.
-                 logger.error(f"Final check: Parameterized symbol '{actual_symbol_to_process}' must have a 'continuous_future' metadata entry with 'tradestation' source. Not found or not tradestation.")
-            elif not metadata_found and not is_parameterized_symbol:
-                 logger.error(f"Final check: Could not confirm generic symbol '{actual_symbol_to_process}' (root: '{root_symbol_for_config}') is TradeStation-sourced via YAML config.")
-            elif metadata_found and metadata_source.lower() != 'tradestation':
-                 logger.error(f"Final check: Source for '{actual_symbol_to_process}' found as '{metadata_source}', but this loader only handles 'tradestation'.")
-            else: # Catch-all for unhandled logic paths, though should be covered
-                 logger.error(f"Final check: Unable to confirm '{actual_symbol_to_process}' as a valid TradeStation continuous contract for this loader.")
-            sys.exit(1)
-
-    except Exception as e:
-        logger.error(f"CRITICAL ERROR during metadata source verification for {actual_symbol_to_process}: {e}", exc_info=True)
-
-    logger.info(f"Metadata source verified. Proceeding to load data for {actual_symbol_to_process}...")
-
+    # Verify data source
+    if not verify_data_source(args.symbol, config, fetcher):
+        logger.error(f"Data source verification failed for {args.symbol}")
+        return
+    
+    # Load continuous data
     load_continuous_data(
         fetcher=fetcher,
-        symbol_root=root_symbol_for_config, 
+        symbol_root=args.symbol[1:].split('=')[0] if '=' in args.symbol else args.symbol[1:],
         config=config,
         force=args.force,
         interval_value=args.interval_value,
         interval_unit=args.interval_unit,
-        specific_symbol=actual_symbol_to_process,
+        specific_symbol=args.symbol,
         fetch_mode=args.fetch_mode,
         lookback_days=args.lookback_days,
         roll_proximity_threshold_days=args.roll_proximity_threshold_days
     )
-
-    # Close fetcher connection if opened
-    if fetcher and hasattr(fetcher, 'conn') and fetcher.conn: # Check if fetcher manages its own conn
-         try:
-             fetcher.conn.close()
-             logger.info("Fetcher database connection closed.")
-         except Exception as e:
-             logger.warning(f"Error closing fetcher connection: {e}")
-
-    logger.info(f"Continuous contract loading finished for {args.symbol}.")
 
 if __name__ == '__main__':
     main() 

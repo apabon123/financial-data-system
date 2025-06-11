@@ -25,12 +25,12 @@ The Financial Data System uses a modular, YAML-based configuration system that p
 
 ```
 config/
-├── market_symbols.yaml   # Legacy configuration (for backward compatibility)
-├── schemas/             # JSON Schema validation files
+├── market_symbols.yaml   # Main symbol configuration (processed by populate_symbol_metadata.py)
+├── schemas/             # JSON Schema validation files (primarily for new structure)
 │   ├── exchanges.json
 │   ├── futures.json
 │   └── ...
-└── yaml/                # New structured YAML files
+└── yaml/                # New structured YAML files (aspirational/future use)
     ├── exchanges.yaml
     ├── futures.yaml
     ├── indices.yaml
@@ -46,6 +46,107 @@ config/
 ```
 
 ## Core Configuration Files
+
+While the system is designed to move towards a new structured YAML configuration (within the `config/yaml/` directory), the primary configuration file currently processed by key scripts like `src/scripts/database/populate_symbol_metadata.py` is `config/market_symbols.yaml`. This file defines all instruments the system manages.
+
+### `config/market_symbols.yaml` (Active Primary Configuration)
+
+This YAML file is central to defining symbols, their properties, data sources, and how their metadata is stored in the `symbol_metadata` table. The `populate_symbol_metadata.py` script reads this file directly.
+
+**Overall Structure:**
+
+```yaml
+settings:
+  default_start_date: '2000-01-01' # Optional: Fallback start date if not in symbol config
+
+indices:
+  - symbol: $VIX.X
+    base_symbol: $VIX.X  # Often same as symbol for indices/equities
+    description: CBOE Volatility Index
+    exchange: CBOE
+    type: index            # Used to determine asset_type in symbol_metadata
+    source: cboe           # Preferred data source
+    frequencies: [daily]   # Or [ { unit: daily, interval: 1, source: cboe, raw_table: market_data_cboe } ]
+    start_date: '1990-01-02'
+    # ... other specific fields for VIX ...
+
+futures:
+  - symbol: ES
+    base_symbol: ES
+    description: E-mini S&P 500 Futures (active month)
+    exchange: CME
+    type: future
+    default_source: tradestation # Can be overridden by specific frequency
+    frequencies: ['1min', '15min', 'daily']
+    start_date: '2003-01-01'
+    historical_contracts:
+      patterns: [H, M, U, Z]
+      start_year: 2003
+    # ... other future-specific fields ...
+
+  - continuous_group: # Defines a group of related continuous future contracts
+      identifier_base: "@VX"         # e.g., "@VX", "@ES"
+      description_template: "{nth_month} VIX Continuous Future"
+      exchange: CBOE
+      type: continuous_future
+      source: in_house         # Or 'tradestation' if applicable
+      month_codes: ["1", "2", "3", "4", "5", "6", "7", "8"] # Corresponds to Nth month
+      settings_code: "01XN"         # Suffix for symbol, e.g. "01XN" for @VX=101XN, "02XC" for @ES=102XC
+      frequencies: [daily]          # Frequencies apply to all generated symbols
+      start_date: '2006-01-01'      # Start date for the whole group
+      # Base properties for all generated symbols in this group
+      # These will be part of the `additional_metadata` for each generated symbol
+
+equities:
+  - symbol: SPY
+    base_symbol: SPY
+    description: SPDR S&P 500 ETF Trust
+    exchange: NYSE
+    type: equity
+    source: tradestation
+    frequencies: [daily, '1min']
+    start_date: '1993-01-29'
+    # ... other equity-specific fields ...
+
+# ... other categories like forex, crypto ...
+```
+
+**Key Fields Interpreted by `populate_symbol_metadata.py`:**
+
+*   **Top-level Categories**: `indices`, `futures`, `equities`, etc. The script iterates through these.
+*   **Common Item Fields (for each entry in a category list):**
+    *   `symbol`: (Required) The primary unique identifier for the instrument (e.g., `$VIX.X`, `ES`, `SPY`, or for continuous groups, this is constructed, e.g. `@VX=101XN`). This populates `symbol_metadata.symbol`.
+    *   `base_symbol`: The root symbol (e.g., `ES`, `VX`). If not provided, defaults to `symbol`. Populates `symbol_metadata.base_symbol`.
+    *   `description`: Human-readable description. Populates `symbol_metadata.description`.
+    *   `exchange`: Trading exchange. Populates `symbol_metadata.exchange`.
+    *   `type`: Asset type (e.g., `future`, `continuous_future`, `index`, `equity`). Populates `symbol_metadata.asset_type`.
+    *   `source` / `default_source`: Preferred data source (e.g., `tradestation`, `cboe`, `in_house`, `polygon`). Used by `determine_metadata_for_interval` to set `symbol_metadata.data_source`.
+    *   `frequencies`: A list defining the data intervals. Can be:
+        *   A list of strings (e.g., `['1min', '15min', 'daily']`). `parse_frequency` helper is used.
+        *   A list of dictionaries, each specifying `unit`, `interval`, and optionally `source`, `raw_table`, etc. to override defaults for that specific frequency.
+        This list determines how many rows are created in `symbol_metadata` for this base item (one per frequency).
+    *   `start_date`: (Important) The earliest date for historical data for this symbol. Populates `symbol_metadata.start_date`. If missing, the script may use `settings.default_start_date`.
+    *   Other fields: Any other fields in the item's configuration (e.g., `historical_contracts`, `target_table`, `historical_script_path`, `update_script_path`) are used by `determine_metadata_for_interval` or stored in the `symbol_metadata.additional_metadata` JSON column.
+
+*   **`continuous_group` specific fields:**
+    *   `identifier_base`: The prefix for generated symbols (e.g., `@VX`).
+    *   `month_codes`: A list of strings (e.g., `["1", "2"]`) representing the Nth month for continuous contracts. Each code generates a unique symbol (e.g., `@VX=1...`, `@VX=2...`).
+    *   `settings_code`: A suffix appended to the generated symbol (e.g., `01XN` leads to `@VX=101XN`).
+    *   `description_template`: A template string like `"{nth_month} VIX Continuous Future"` used to generate descriptions. `{nth_month}` is replaced (e.g., "1st", "2nd").
+    *   The `frequencies`, `start_date`, `source`, `type`, `exchange` defined within the `continuous_group` apply to all symbols generated from that group.
+    *   The entire `continuous_group` block (minus the generation-specific keys like `identifier_base`, `month_codes`) forms the basis of the `item_config` that gets stored in `additional_metadata` for each generated continuous symbol.
+
+**Relationship to `symbol_metadata` Table:**
+
+The `config/market_symbols.yaml` file is the direct input for the `src/scripts/database/populate_symbol_metadata.py` script. This script processes each symbol and `continuous_group` defined in the YAML, and for each frequency specified, it creates or updates an entry in the `symbol_metadata` table. The `symbol_metadata` table then acts as the central registry that other data loading and processing scripts (like `update_all_market_data_v2.py`) use to understand how to handle each instrument at each interval.
+
+The `additional_metadata` column in `symbol_metadata` stores the full YAML configuration snippet for the specific symbol/interval as a JSON string, providing a complete record of its original definition.
+
+### `config/yaml/*.yaml` (New Structured Configuration - Aspirational/Future Use)
+
+The files within `config/yaml/` (e.g., `exchanges.yaml`, `futures.yaml`, `indices.yaml`) represent a newer, more structured approach to configuration. While defined in this guide, key operational scripts like `populate_symbol_metadata.py` and `update_all_market_data_v2.py` **currently rely on `config/market_symbols.yaml`**.
+
+Future development may transition these scripts to use this new structured format. For now, ensure `config/market_symbols.yaml` is maintained accurately for current system operation.
 
 ### exchanges.yaml
 

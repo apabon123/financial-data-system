@@ -66,8 +66,16 @@ class UnadjustedContractBuilder(ContinuousContractBuilder):
             # Set default end date if not provided
             if end_date is None:
                 end_date = datetime.now().strftime('%Y-%m-%d')
-                
-            # Determine if we're updating or creating
+            
+            # Skip if start date is after end date
+            if start_date and end_date:
+                start_ts = self._normalize_date(start_date)
+                end_ts = self._normalize_date(end_date)
+                if start_ts > end_ts:
+                    logger.warning(f"Start date {start_date} is after end date {end_date}")
+                    return pd.DataFrame()
+            
+            # Get existing data to determine if we need to build or append
             existing_data = self.get_existing_continuous_data(
                 continuous_symbol, interval_unit, interval_value
             )
@@ -77,10 +85,12 @@ class UnadjustedContractBuilder(ContinuousContractBuilder):
                 last_date = existing_data['timestamp'].max().strftime('%Y-%m-%d')
                 
                 # Update start_date to the day after the last date
-                start_date = (pd.Timestamp(last_date) + pd.Timedelta(days=1)).strftime('%Y-%m-%d')
+                start_date = (self._normalize_date(last_date) + pd.Timedelta(days=1)).strftime('%Y-%m-%d')
                 
                 # Skip if we're already up to date
-                if pd.Timestamp(start_date) > pd.Timestamp(end_date):
+                start_ts = self._normalize_date(start_date)
+                end_ts = self._normalize_date(end_date)
+                if start_ts > end_ts:
                     logger.info(f"Continuous data for {continuous_symbol} is already up to date")
                     return existing_data
                     
@@ -111,7 +121,7 @@ class UnadjustedContractBuilder(ContinuousContractBuilder):
             
             # If we didn't find any rollovers, we may need to look further back
             # to find the contract we should be starting with
-            if not rollovers and start_date > '2000-01-01':
+            if not rollovers and self._normalize_date(start_date) > self._normalize_date('2000-01-01'):
                 logger.info(f"No roll dates found in date range, looking for earlier rollovers")
                 earlier_rollovers = self.get_roll_dates(root_symbol, '2000-01-01', start_date)
                 if earlier_rollovers:
@@ -172,10 +182,11 @@ class UnadjustedContractBuilder(ContinuousContractBuilder):
                     active_contract = rollovers[0].from_contract
                     
                     # Check if we need to get earlier rollovers to find the active contract at start_date
-                    if pd.Timestamp(start_date) >= rollovers[0].date:
+                    start_ts = self._normalize_date(start_date)
+                    if start_ts >= rollovers[0].date:
                         # Find the rollover that precedes our start date
                         for i, rollover in enumerate(rollovers):
-                            if pd.Timestamp(start_date) < rollover.date:
+                            if start_ts < rollover.date:
                                 active_contract = rollovers[i-1].to_contract if i > 0 else rollover.from_contract
                                 break
                             elif i == len(rollovers) - 1:
@@ -191,7 +202,12 @@ class UnadjustedContractBuilder(ContinuousContractBuilder):
                         segment_end = rollover.date.strftime('%Y-%m-%d')
                         
                         # Only process segments that overlap with our date range
-                        if pd.Timestamp(segment_end) >= pd.Timestamp(start_date) and pd.Timestamp(segment_start) <= pd.Timestamp(end_date):
+                        segment_end_ts = self._normalize_date(segment_end)
+                        segment_start_ts = self._normalize_date(segment_start)
+                        start_ts = self._normalize_date(start_date)
+                        end_ts = self._normalize_date(end_date)
+                        
+                        if segment_end_ts >= start_ts and segment_start_ts <= end_ts:
                             segment_contract = rollover.from_contract
                             
                             # Load contract data for this segment
@@ -208,7 +224,10 @@ class UnadjustedContractBuilder(ContinuousContractBuilder):
                         final_start = rollovers[-1].date.strftime('%Y-%m-%d')
                         final_contract = rollovers[-1].to_contract
                         
-                        if pd.Timestamp(final_start) <= pd.Timestamp(end_date):
+                        final_start_ts = self._normalize_date(final_start)
+                        end_ts = self._normalize_date(end_date)
+                        
+                        if final_start_ts <= end_ts:
                             # Load contract data for the final segment
                             final_data = self.load_contract_data(
                                 final_contract, final_start, end_date, interval_unit, interval_value
@@ -226,20 +245,27 @@ class UnadjustedContractBuilder(ContinuousContractBuilder):
             # If we have existing data, append the new data
             if not existing_data.empty and not force:
                 # Filter out any overlap with existing data
-                new_data = continuous_data[
-                    continuous_data['timestamp'] > existing_data['timestamp'].max()
-                ]
-                
-                if not new_data.empty:
-                    logger.info(f"Appending {len(new_data)} new rows to existing {len(existing_data)} rows")
-                    continuous_data = pd.concat([existing_data, new_data], ignore_index=True)
+                if not continuous_data.empty:
+                    new_data = continuous_data[
+                        continuous_data['timestamp'] > existing_data['timestamp'].max()
+                    ]
+                    
+                    if not new_data.empty:
+                        logger.info(f"Appending {len(new_data)} new rows to existing {len(existing_data)} rows")
+                        continuous_data = pd.concat([existing_data, new_data], ignore_index=True)
+                    else:
+                        logger.info(f"No new data to append")
+                        continuous_data = existing_data
                 else:
-                    logger.info(f"No new data to append")
+                    logger.info(f"No new continuous data generated, using existing data")
                     continuous_data = existing_data
             
             # Store the continuous data
             if not continuous_data.empty:
                 self.store_continuous_data(continuous_symbol, continuous_data)
+                logger.info(f"Successfully stored {len(continuous_data)} rows for {continuous_symbol}")
+            else:
+                logger.warning(f"No continuous data generated for {continuous_symbol} - nothing to store")
                 
             return continuous_data
             
@@ -284,13 +310,20 @@ class UnadjustedContractBuilder(ContinuousContractBuilder):
                 # Use the roll date as the cutoff
                 roll_date = rollovers[i-1].date
                 
+                # Ensure timestamps in segment are normalized for comparison
+                segment_copy = segment.copy()
+                segment_copy['timestamp'] = segment_copy['timestamp'].apply(self._normalize_date)
+                
                 # Filter to only include rows on or after the roll date
-                filtered_segment = segment[segment['timestamp'] >= roll_date].copy()
+                filtered_segment = segment_copy[segment_copy['timestamp'] >= roll_date].copy()
                 
                 if not filtered_segment.empty:
                     result_segments.append(filtered_segment)
             else:
-                result_segments.append(segment.copy())
+                # Ensure timestamps are normalized even for the first segment
+                segment_copy = segment.copy()
+                segment_copy['timestamp'] = segment_copy['timestamp'].apply(self._normalize_date)
+                result_segments.append(segment_copy)
         
         if not result_segments:
             logger.warning(f"No valid segments after filtering for {continuous_symbol}")

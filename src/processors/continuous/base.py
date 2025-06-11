@@ -32,7 +32,7 @@ class ContractRollover:
             from_price: Price of the outgoing contract (None if not known)
             to_price: Price of the incoming contract (None if not known)
         """
-        self.date = date
+        self.date = pd.Timestamp(date)  # Ensure it's always a Timestamp
         self.from_contract = from_contract
         self.to_contract = to_contract
         self.from_price = from_price
@@ -76,6 +76,47 @@ class ContinuousContractBuilder(ABC):
         # Initialize a list to track roll dates during generation
         self.roll_dates = []
     
+    @staticmethod
+    def _normalize_date(date_input: Union[str, pd.Timestamp, datetime, date, None]) -> Optional[pd.Timestamp]:
+        """
+        Normalize various date inputs to pd.Timestamp for consistent comparisons.
+        
+        Args:
+            date_input: Date in various formats
+            
+        Returns:
+            pd.Timestamp or None if input is None
+        """
+        if date_input is None:
+            return None
+        
+        if isinstance(date_input, str):
+            return pd.Timestamp(date_input)
+        elif isinstance(date_input, (datetime, date)):
+            return pd.Timestamp(date_input)
+        elif isinstance(date_input, pd.Timestamp):
+            return date_input
+        else:
+            # Try to convert anything else
+            return pd.Timestamp(date_input)
+    
+    @staticmethod
+    def _date_to_string(date_input: Union[str, pd.Timestamp, datetime, date, None]) -> Optional[str]:
+        """
+        Convert various date inputs to string format (YYYY-MM-DD) for database queries.
+        
+        Args:
+            date_input: Date in various formats
+            
+        Returns:
+            Date string in YYYY-MM-DD format or None if input is None
+        """
+        if date_input is None:
+            return None
+            
+        normalized = ContinuousContractBuilder._normalize_date(date_input)
+        return normalized.strftime('%Y-%m-%d') if normalized is not None else None
+    
     @abstractmethod
     def build_continuous_series(self, root_symbol: str, continuous_symbol: str,
                                interval_unit: str = 'daily', interval_value: int = 1,
@@ -104,7 +145,13 @@ class ContinuousContractBuilder(ABC):
     def get_roll_dates(self, root_symbol: str, start_date: str = None, 
                       end_date: str = None) -> List[ContractRollover]:
         """
-        Get roll dates for the symbol in the given date range.
+        Get roll dates for a specific root symbol within or affecting a date range.
+        
+        This method finds all roll dates that are relevant for building continuous
+        contracts in the specified period, including:
+        1. The most recent roll before the start date (to determine active contract)
+        2. All rolls within the date range
+        3. Optionally the first roll after the end date (for context)
         
         Args:
             root_symbol: The root symbol (e.g., ES, VX)
@@ -118,33 +165,83 @@ class ContinuousContractBuilder(ABC):
             ContinuousContractError: If roll dates cannot be determined
         """
         try:
-            # Process date parameters
-            if start_date is None:
-                start_clause = ""
-                start_params = []
+            # Normalize date parameters to strings for database queries
+            start_date_str = self._date_to_string(start_date)
+            end_date_str = self._date_to_string(end_date)
+            
+            # Build query to get relevant roll dates
+            # We need to get rolls that affect the requested period, including the next roll for proper transitions
+            if start_date_str is None and end_date_str is None:
+                # No date filtering - get all rolls
+                date_filter = ""
+                params = [root_symbol]
+            elif start_date_str is None:
+                # Only end date specified - get all rolls up to end date plus next roll for transitions
+                date_filter = """
+                AND (r.RollDate <= ? OR r.RollDate = (
+                    SELECT MIN(RollDate) 
+                    FROM {roll_table} r2 
+                    WHERE r2.SymbolRoot = r.SymbolRoot 
+                    AND r2.RollDate > ?
+                ))
+                """.format(roll_table=self.roll_calendar_table)
+                params = [root_symbol, end_date_str, end_date_str]
+            elif end_date_str is None:
+                # Only start date specified - get last roll before start + all rolls after start
+                date_filter = """
+                AND (r.RollDate >= ? OR r.RollDate = (
+                    SELECT MAX(RollDate) 
+                    FROM {roll_table} r2 
+                    WHERE r2.SymbolRoot = r.SymbolRoot 
+                    AND r2.RollDate < ?
+                ))
+                """.format(roll_table=self.roll_calendar_table)
+                params = [root_symbol, start_date_str, start_date_str]
             else:
-                start_clause = "AND r.RollDate >= ?"
-                start_params = [start_date]
-                
-            if end_date is None:
-                end_clause = ""
-                end_params = []
-            else:
-                end_clause = "AND r.RollDate <= ?"
-                end_params = [end_date]
+                # Both dates specified - get last roll before start + rolls within range + next roll after end
+                date_filter = """
+                AND (
+                    (r.RollDate >= ? AND r.RollDate <= ?) OR 
+                    r.RollDate = (
+                        SELECT MAX(RollDate) 
+                        FROM {roll_table} r2 
+                        WHERE r2.SymbolRoot = r.SymbolRoot 
+                        AND r2.RollDate < ?
+                    ) OR
+                    r.RollDate = (
+                        SELECT MIN(RollDate) 
+                        FROM {roll_table} r2 
+                        WHERE r2.SymbolRoot = r.SymbolRoot 
+                        AND r2.RollDate > ?
+                    )
+                )
+                """.format(roll_table=self.roll_calendar_table)
+                params = [root_symbol, start_date_str, end_date_str, start_date_str, end_date_str]
                 
             # Query roll dates from the database
             query = f"""
-            WITH OrderedRolls AS (
+            WITH FilteredRolls AS (
                 SELECT
-                    r.RollDate AS roll_date,
-                    r.Contract AS from_contract_symbol,
-                    LEAD(r.Contract, 1) OVER (PARTITION BY r.SymbolRoot ORDER BY r.RollDate) AS to_contract_symbol,
-                    r.SymbolRoot
+                    r.SymbolRoot,
+                    r.Contract,
+                    r.RollDate,
+                    r.RollType,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY r.SymbolRoot, r.Contract, r.RollDate 
+                        ORDER BY CASE WHEN r.RollType = 'volume' THEN 1 ELSE 2 END, r.RollType
+                    ) as rn
                 FROM {self.roll_calendar_table} r
                 WHERE r.SymbolRoot = ?
-                  {start_clause}
-                  {end_clause}
+                  {date_filter}
+            ),
+            OrderedRolls AS (
+                SELECT
+                    r.RollDate AS roll_date,
+                    CONCAT(r.SymbolRoot, r.Contract) AS from_contract_symbol,
+                    CONCAT(r.SymbolRoot, LEAD(r.Contract, 1) OVER (PARTITION BY r.SymbolRoot ORDER BY r.RollDate)) AS to_contract_symbol,
+                    r.SymbolRoot
+                FROM FilteredRolls r
+                WHERE r.rn = 1  -- Only take the first (preferred) roll for each date/contract
             )
             SELECT
                 o.roll_date,
@@ -165,18 +262,17 @@ class ContinuousContractBuilder(ABC):
             ORDER BY o.roll_date
             """
             
-            params = [root_symbol] + start_params + end_params
             df = self.db.query_to_df(query, params)
             
             if df.empty:
                 logger.warning(f"No roll dates found for {root_symbol} in the specified range")
                 return []
                 
-            # Convert to ContractRollover objects
+            # Convert to ContractRollover objects with proper date normalization
             rollovers = []
             for _, row in df.iterrows():
                 rollover = ContractRollover(
-                    date=pd.Timestamp(row['roll_date']),
+                    date=self._normalize_date(row['roll_date']),
                     from_contract=row['from_contract'],
                     to_contract=row['to_contract'],
                     from_price=row['from_price'],
@@ -210,20 +306,24 @@ class ContinuousContractBuilder(ABC):
             ContinuousContractError: If data cannot be loaded
         """
         try:
+            # Normalize date parameters to strings for database queries
+            start_date_str = self._date_to_string(start_date)
+            end_date_str = self._date_to_string(end_date)
+            
             # Process date parameters
-            if start_date is None:
+            if start_date_str is None:
                 start_clause = ""
                 start_params = []
             else:
                 start_clause = "AND timestamp::DATE >= ?"
-                start_params = [start_date]
+                start_params = [start_date_str]
                 
-            if end_date is None:
+            if end_date_str is None:
                 end_clause = ""
                 end_params = []
             else:
                 end_clause = "AND timestamp::DATE <= ?"
-                end_params = [end_date]
+                end_params = [end_date_str]
                 
             # Query contract data from the database
             query = f"""
@@ -255,8 +355,8 @@ class ContinuousContractBuilder(ABC):
                 logger.warning(f"No data found for {symbol} in the specified range")
                 return pd.DataFrame()
                 
-            # Ensure timestamp is datetime
-            df['timestamp'] = pd.to_datetime(df['timestamp'])
+            # Ensure timestamp is datetime with proper normalization
+            df['timestamp'] = df['timestamp'].apply(self._normalize_date)
             
             # Ensure numeric columns are numeric
             numeric_cols = ['open', 'high', 'low', 'close', 'volume', 'open_interest']
@@ -278,7 +378,7 @@ class ContinuousContractBuilder(ABC):
         
         Args:
             root_symbol: The root symbol (e.g., ES, VX)
-            date_str: Date string (YYYY-MM-DD)
+            date_str: Date string (YYYY-MM-DD) or any date format
             interval_unit: Time interval unit
             interval_value: Time interval value
             
@@ -289,6 +389,9 @@ class ContinuousContractBuilder(ABC):
             ContinuousContractError: If contract chain cannot be determined
         """
         try:
+            # Normalize date parameter to string for database query
+            date_str_normalized = self._date_to_string(date_str)
+            
             # Query contracts with data on the given date, ordered by expiration
             query = f"""
             WITH contracts AS (
@@ -322,21 +425,21 @@ class ContinuousContractBuilder(ABC):
             ORDER BY c.expiry_date
             """
             
-            params = [interval_unit, interval_value, date_str, root_symbol, 
+            params = [interval_unit, interval_value, date_str_normalized, root_symbol, 
                      interval_unit, interval_value]
             df = self.db.query_to_df(query, params)
             
             if df.empty:
-                logger.warning(f"No active contracts found for {root_symbol} on {date_str}")
+                logger.warning(f"No active contracts found for {root_symbol} on {date_str_normalized}")
                 return []
                 
-            # Convert to list of dictionaries
+            # Convert to list of dictionaries with proper date normalization
             contracts = []
             for _, row in df.iterrows():
                 contract = {
                     'symbol': row['symbol'],
-                    'date': row['date'],
-                    'expiry_date': row['expiry_date'],
+                    'date': self._normalize_date(row['date']),
+                    'expiry_date': self._normalize_date(row['expiry_date']),
                     'open': row['open'],
                     'high': row['high'],
                     'low': row['low'],
@@ -468,39 +571,75 @@ class ContinuousContractBuilder(ABC):
             ContinuousContractError: If data cannot be loaded
         """
         try:
+            # Try to check if columns exist (DuckDB specific approach)
+            try:
+                column_check = self.db.query_to_df(f"DESCRIBE {self.continuous_data_table}")
+                available_columns = set(column_check['column_name'].values)
+            except:
+                # Fallback: assume all columns exist and handle error gracefully
+                available_columns = {'timestamp', 'symbol', 'underlying_symbol', 'open', 'high', 'low', 'close', 
+                                   'volume', 'open_interest', 'source', 'built_by', 'interval_unit', 
+                                   'interval_value', 'adjusted', 'quality'}
+            
+            # Build the SELECT clause conditionally based on available columns
+            select_clauses = [
+                "timestamp",
+                "symbol",
+                "underlying_symbol" if "underlying_symbol" in available_columns else "symbol as underlying_symbol",
+                "open",
+                "high", 
+                "low",
+                "close",
+                "volume",
+                "open_interest"
+            ]
+            
+            # Add optional columns with defaults if they don't exist
+            if "source" in available_columns:
+                select_clauses.append("source")
+            else:
+                select_clauses.append("'unknown' as source")
+                
+            if "built_by" in available_columns:
+                select_clauses.append("built_by")
+            else:
+                select_clauses.append("'legacy' as built_by")
+                
+            select_clauses.extend(["interval_unit", "interval_value"])
+            
+            if "adjusted" in available_columns:
+                select_clauses.append("adjusted")
+            else:
+                select_clauses.append("false as adjusted")
+                
+            if "quality" in available_columns:
+                select_clauses.append("quality")
+            else:
+                select_clauses.append("'unknown' as quality")
+                
+            # Normalize date parameters to strings for database queries
+            start_date_str = self._date_to_string(start_date)
+            end_date_str = self._date_to_string(end_date)
+            
             # Process date parameters
-            if start_date is None:
+            if start_date_str is None:
                 start_clause = ""
                 start_params = []
             else:
                 start_clause = "AND timestamp::DATE >= ?"
-                start_params = [start_date]
+                start_params = [start_date_str]
                 
-            if end_date is None:
+            if end_date_str is None:
                 end_clause = ""
                 end_params = []
             else:
                 end_clause = "AND timestamp::DATE <= ?"
-                end_params = [end_date]
+                end_params = [end_date_str]
                 
             # Query continuous data from the database
             query = f"""
             SELECT 
-                timestamp,
-                symbol,
-                underlying_symbol,
-                open,
-                high,
-                low,
-                close,
-                volume,
-                open_interest,
-                source,
-                built_by,
-                interval_unit,
-                interval_value,
-                adjusted,
-                quality
+                {', '.join(select_clauses)}
             FROM {self.continuous_data_table}
             WHERE symbol = ?
             AND interval_unit = ?
@@ -517,8 +656,8 @@ class ContinuousContractBuilder(ABC):
                 logger.info(f"No existing data found for {continuous_symbol} in the specified range")
                 return pd.DataFrame()
                 
-            # Ensure timestamp is datetime
-            df['timestamp'] = pd.to_datetime(df['timestamp'])
+            # Ensure timestamp is datetime with proper normalization
+            df['timestamp'] = df['timestamp'].apply(self._normalize_date)
             
             # Ensure numeric columns are numeric
             numeric_cols = ['open', 'high', 'low', 'close', 'volume', 'open_interest']
@@ -537,7 +676,7 @@ class ContinuousContractBuilder(ABC):
         Parse a continuous contract symbol into its components.
         
         Args:
-            continuous_symbol: Continuous contract symbol (e.g., @ES=102XC)
+            continuous_symbol: Continuous contract symbol (e.g., @ES=102XC, @ES=102XN_d)
             
         Returns:
             Dictionary with parsed components
@@ -549,6 +688,7 @@ class ContinuousContractBuilder(ABC):
             # Example formats:
             # @ES=102XC: Adjusted (C), roll 2 days before expiry (X)
             # @VX=101XN: Unadjusted (N), roll 1 day before expiry (X)
+            # @ES=102XN_d: Unadjusted (N), with custom suffix (_d)
             
             # Check if symbol starts with @
             if not continuous_symbol.startswith('@'):
@@ -561,6 +701,14 @@ class ContinuousContractBuilder(ABC):
                 
             root_symbol = parts[0][1:]  # Remove @ prefix
             settings = parts[1]
+            
+            # Handle custom suffixes like '_d' by extracting and storing them
+            custom_suffix = ""
+            if '_' in settings:
+                # Split on the first underscore to separate the standard part from custom suffix
+                settings_parts = settings.split('_', 1)
+                settings = settings_parts[0]  # Standard part (e.g., "102XN")
+                custom_suffix = "_" + settings_parts[1]  # Custom suffix (e.g., "_d")
             
             # Parse settings
             if len(settings) < 3:
@@ -595,7 +743,8 @@ class ContinuousContractBuilder(ABC):
                 'month_number': month_number,
                 'roll_days': roll_days,
                 'roll_type': roll_type,
-                'adjustment': adjustment
+                'adjustment': adjustment,
+                'custom_suffix': custom_suffix  # Store any custom suffix for reference
             }
             
         except Exception as e:

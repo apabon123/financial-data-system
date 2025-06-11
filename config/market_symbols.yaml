@@ -11,20 +11,22 @@ indices:
       - name: daily # Uses defaults
         interval: 1
         unit: daily
-    start_date: '2005-01-01'
+    start_date: '2005-01-01' # Product/data start
     calendar: CFE
 
 
 futures:
   - base_symbol: ES
-    data_source: tradestation
+    symbol: "@ES" # Symbol for fetching generic continuous data from TradeStation
     asset_type: future_group
-    default_source: tradestation
-    default_raw_table: market_data
+    default_source: tradestation # Source for @ES data
+    default_raw_table: market_data # Table for @ES data
     calendar: CME_Equity
-    description: E-mini S&P 500 Futures
+    description: E-mini S&P 500 Futures (Defaults)
     exchange: CME
-    frequencies: [1min, 15min, daily]
+    frequencies: [15min, daily] # Frequencies for @ES data
+    # Default Product Specifications (can be overridden in futures.yaml)
+    start_date: '2003-01-01' # Product start date
     historical_contracts:
       patterns: [H, M, U, Z]
       start_year: 2003
@@ -33,7 +35,6 @@ futures:
       day_type: friday
       day_number: 3
       adjust_for_holiday: true
-    start_date: '2003-01-01'
     contract_specs:
       multiplier: 50
       point_value: 50.00
@@ -42,14 +43,16 @@ futures:
       settlement_type: cash
 
   - base_symbol: NQ
-    data_source: tradestation
+    symbol: "@NQ"
     asset_type: future_group
     default_source: tradestation
     default_raw_table: market_data
     calendar: CME_Equity
-    description: E-mini NASDAQ-100 Futures
+    description: E-mini NASDAQ-100 Futures (Defaults)
     exchange: CME
-    frequencies: [1min, 15min, daily] # Reverted to simple list
+    frequencies: [15min, daily]
+    # Default Product Specifications
+    start_date: '2003-01-01'
     historical_contracts:
       patterns: [H, M, U, Z]
       start_year: 2003
@@ -58,34 +61,52 @@ futures:
       day_type: friday
       day_number: 3
       adjust_for_holiday: true
-    start_date: '2003-01-01'
+    contract_specs:
+      multiplier: 20 # NQ specific
+      point_value: 20.00 # NQ specific
+      tick_size: 0.25
+      tick_value: 5.00 # NQ specific (0.25 * 20)
+      settlement_type: cash
 
   - base_symbol: CL
+    symbol: "@CL"
+    asset_type: future_group
     default_source: tradestation
     default_raw_table: market_data
     calendar: CMEGlobex_CL
-    description: Crude Oil Futures
+    description: Crude Oil Futures (Defaults)
     exchange: NYMEX
-    frequencies: [1min, 15min, daily] # Reverted to simple list
+    frequencies: [15min, daily]
+    # Default Product Specifications
+    start_date: '2005-01-01'
     historical_contracts:
       patterns: [F, G, H, J, K, M, N, Q, U, V, X, Z]
       start_year: 2005
       start_month: 6
-    num_active_contracts: 12
+    num_active_contracts: 6
     expiry_rule:
       day_type: business_day
       days_before: 3
       reference_day: 25
       adjust_for_holiday: true
-    start_date: '2005-01-01'
+    contract_specs:
+      multiplier: 1000
+      point_value: 1000.00
+      tick_size: 0.01
+      tick_value: 10.00
+      settlement_type: physical
 
   - base_symbol: GC
+    symbol: "@GC"
+    asset_type: future_group
     default_source: tradestation
     default_raw_table: market_data
     calendar: CMEGlobex_GC
-    description: Gold Futures
+    description: Gold Futures (Defaults)
     exchange: COMEX
-    frequencies: [daily] # Reverted to simple list
+    frequencies: [daily]
+    # Default Product Specifications
+    start_date: '2004-01-01'
     historical_contracts:
       patterns: [G, J, M, Q, V, Z]
       start_year: 2004
@@ -95,99 +116,52 @@ futures:
       days_before: 3
       reference_point: last_business_day
       adjust_for_holiday: true
-    start_date: '2004-01-01'
+    contract_specs:
+      multiplier: 100
+      point_value: 100.00
+      tick_size: 0.10
+      tick_value: 10.00
+      settlement_type: physical
 
   - base_symbol: VX
-    data_source: tradestation
+    symbol: "@VX"
     asset_type: future_group
-    default_source: tradestation
-    default_raw_table: market_data
+    default_source: tradestation # Source for @VX data
+    default_raw_table: market_data # Table for @VX data
     calendar: CFE
-    description: CBOE Volatility Index Futures
+    description: CBOE Volatility Index Futures (Defaults)
     exchange: CBOE
-    frequencies:
+    frequencies: # Frequencies for @VX data
       - name: daily
         interval: 1
         unit: daily
       - name: 15min
         interval: 15
         unit: minute
+    # Default Product Specifications
+    start_date: '2004-01-01' # Product start
     historical_contracts:
       patterns: [F, G, H, J, K, M, N, Q, U, V, X, Z]
       start_year: 2004
-      exclude_contracts:
-        - VXF04
-        - VXG04
-        - VXH04
-        - VXJ04
-        - VXZ04
-        - VXJ05
-        - VXN05
-        - VXU05
+      exclude_contracts: # From futures.yaml VX block
+        - "VXF04"
+        - "VXG04"
+        - "VXH04"
+        - "VXJ04"
+        - "VXZ04"
+        - "VXJ05"
+        - "VXN05"
+        - "VXU05"
     num_active_contracts: 9
     expiry_rule:
-      day_type: wednesday
-      special_rule: VX_expiry
-    start_date: '2005-01-01'
-
-  - symbol: "@VX=101XN"
-    type: continuous_future
-    description: "VX Continuous Contract (Unadjusted, TradeStation)"
-    default_source: tradestation
-    exchange: CFE
-    calendar: CFE
-    frequencies: [daily, 15min]
-    start_date: '2005-01-01'
-
-  # REPLACED: 9 individual @VX=...XN entries with a continuous_group
-  - continuous_group:
-      identifier_base: "@VX"
-      month_codes: ["1", "2", "3", "4", "5", "6", "7", "8", "9"]
-      settings_code: "01XN"
-      description_template: "TradeStation Continuous VIX Future ({nth_month} month)"
-      exchange: CFE
-      type: continuous_future
-      default_source: tradestation
-      default_raw_table: market_data
-      frequencies: [daily]
-      start_date: '2005-01-01'
-      calendar: CFE
-
-  - symbol: "@ES=102XC"
-    type: continuous_future
-    description: "ES Continuous Contract (Adjusted, Backwards Ratio, TradeStation)"
-    default_source: tradestation
-    exchange: CME
-    calendar: CME_Equity
-    frequencies: [1min,15min, daily]
-    start_date: '2003-01-01'
-
-  - symbol: "@ES=101XN"
-    type: continuous_future
-    description: "ES Continuous Contract (Unadjusted, TradeStation)"
-    default_source: tradestation
-    exchange: CME
-    calendar: CME_Equity
-    frequencies: [1min, 15min, daily]
-    start_date: '2003-01-01'
-
-  - symbol: "@NQ=102XC"
-    type: continuous_future
-    description: "NQ Continuous Contract (Adjusted, Backwards Ratio, TradeStation)"
-    default_source: tradestation
-    exchange: CME
-    calendar: CME_Equity
-    frequencies: [1min, 15min, daily]
-    start_date: '2003-01-01'
-
-  - symbol: "@NQ=101XN"
-    type: continuous_future
-    description: "NQ Continuous Contract (Unadjusted, TradeStation)"
-    default_source: tradestation
-    exchange: CME
-    calendar: CME_Equity
-    frequencies: [1min, 15min, daily]
-    start_date: '2003-01-01'
+      day_type: wednesday # Specific to VIX
+      special_rule: VX_expiry # Specific to VIX
+    contract_specs:
+      multiplier: 1000 # VIX specific
+      point_value: 1000.00 # VIX specific
+      tick_size: 0.05 # VIX specific template
+      tick_value: 50.00 # VIX specific template (0.05 * 1000)
+      settlement_type: cash
 
 equities:
   - symbol: SPY
@@ -197,7 +171,7 @@ equities:
     type: ETF
     default_source: tradestation
     default_raw_table: market_data
-    frequencies: [1min, 15min, daily] # Reverted to simple list
+    frequencies: [1min, 15min, daily]
     start_date: '2001-01-01'
 
   - symbol: QQQ
@@ -207,7 +181,7 @@ equities:
     type: ETF
     default_source: tradestation
     default_raw_table: market_data
-    frequencies: [1min, 15min, daily] # Reverted to simple list
+    frequencies: [1min, 15min, daily]
     start_date: '2001-01-01'
 
   - symbol: AAPL
@@ -217,7 +191,7 @@ equities:
     type: Stock
     default_source: tradestation
     default_raw_table: market_data
-    frequencies: [daily] # Reverted to simple list
+    frequencies: [daily]
     start_date: '2001-01-01'
 
   - symbol: GS
@@ -227,7 +201,7 @@ equities:
     type: Stock
     default_source: tradestation
     default_raw_table: market_data
-    frequencies: [daily] # Reverted to simple list
+    frequencies: [daily]
     start_date: '2001-01-01'
 
 

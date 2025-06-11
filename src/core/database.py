@@ -46,7 +46,10 @@ class Database:
         self.conn = None
         
         # Initialize schema paths
-        self.schema_dir = Path(__file__).parent.parent.parent / 'sql' / 'schema'
+        project_root_for_schema = Path(__file__).parent.parent.parent # Should be financial-data-system
+        self.schema_dir = project_root_for_schema / 'src' / 'sql' / 'schema'
+        logger.debug(f"Schema directory set to: {self.schema_dir}")
+
         self.schema_files = {
             'init': self.schema_dir / 'init_schema.sql',
             'views': self.schema_dir / 'create_views.sql',
@@ -238,31 +241,77 @@ class Database:
             
         try:
             # Run the main schema initialization script
-            if self.schema_files['init'].exists():
-                with open(self.schema_files['init'], 'r') as f:
-                    schema_sql = f.read()
-                self.execute(schema_sql)
-                logger.info("Schema initialization completed successfully")
+            init_script_path = self.schema_files['init']
+            if init_script_path.exists():
+                logger.info(f"Starting schema initialization from: {init_script_path}")
+                with open(init_script_path, 'r') as f:
+                    schema_sql_raw = f.read()
+                
+                # Remove -- style comments line by line
+                lines = schema_sql_raw.splitlines()
+                cleaned_lines = []
+                for line in lines:
+                    stripped_line = line.split('--', 1)[0].strip()
+                    if stripped_line: # Only add if line is not empty after stripping comments
+                        cleaned_lines.append(stripped_line)
+                
+                schema_sql_cleaned = " ".join(cleaned_lines) # Join lines to reform statements that might span multiple lines
+                                                            # Using space as separator, ensure statements are well-formed
+                                                            # or that original SQL was mostly one statement per line or used newlines
+                                                            # appropriately for multiline statements before comment stripping.
+                
+                # Split into statements
+                # This split assumes that after removing comments and joining lines,
+                # semicolons are reliable statement terminators.
+                statements = [s.strip() for s in schema_sql_cleaned.split(';') if s.strip()]
+                
+                logger.info(f"Found {len(statements)} statements in {init_script_path} after cleaning comments.")
+                for i, statement in enumerate(statements):
+                    if not statement.strip():
+                        continue
+                    logger.debug(f"Executing schema statement {i+1}/{len(statements)}: {statement[:100]}...") # Log first 100 chars
+                    try:
+                        self.execute(statement)
+                        logger.debug(f"Successfully executed statement {i+1}")
+                    except duckdb.Error as stmt_e:
+                        logger.error(f"Error executing schema statement {i+1}/{len(statements)}: {stmt_e}")
+                        logger.error(f"Failed statement: {statement}")
+                        # Optionally, re-raise or collect errors. For now, let's log and continue.
+                        # raise DatabaseError(f"Schema initialization failed on statement: {statement} - {stmt_e}")
+                logger.info(f"Schema initialization from {init_script_path} attempted for all statements.")
             else:
-                logger.warning(f"Schema file not found: {self.schema_files['init']}")
+                logger.warning(f"Schema file not found: {init_script_path}")
                 
             # Create views
-            if self.schema_files['views'].exists():
-                with open(self.schema_files['views'], 'r') as f:
+            views_script_path = self.schema_files['views']
+            if views_script_path.exists():
+                logger.info(f"Creating views from: {views_script_path}")
+                with open(views_script_path, 'r') as f:
                     views_sql = f.read()
+                # Assuming views and indices scripts might also benefit from statement-by-statement execution
+                # For simplicity, keeping them as is for now unless issues arise.
                 self.execute(views_sql)
                 logger.info("Views creation completed successfully")
+            else:
+                logger.info(f"Views script not found or not configured: {views_script_path}")
                 
             # Create indices
-            if self.schema_files['indices'].exists():
-                with open(self.schema_files['indices'], 'r') as f:
+            indices_script_path = self.schema_files['indices']
+            if indices_script_path.exists():
+                logger.info(f"Creating indices from: {indices_script_path}")
+                with open(indices_script_path, 'r') as f:
                     indices_sql = f.read()
                 self.execute(indices_sql)
                 logger.info("Indices creation completed successfully")
+            else:
+                logger.info(f"Indices script not found or not configured: {indices_script_path}")
                 
         except duckdb.Error as e:
             logger.error(f"Schema initialization failed: {e}")
             raise DatabaseError(f"Schema initialization failed: {e}")
+        except Exception as e_gen:
+            logger.error(f"An unexpected error occurred during schema initialization: {e_gen}")
+            raise DatabaseError(f"Unexpected error during schema initialization: {e_gen}")
     
     def create_backup(self, backup_dir: Union[str, Path], retention_days: int = 30) -> Path:
         """
